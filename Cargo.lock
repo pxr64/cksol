@@ -859,7 +859,9 @@ dependencies = [
  "solana-keypair",
  "solana-native-token",
  "solana-signature",
+ "solana-system-interface 3.1.0",
  "solana-system-transaction",
+ "solana-transaction",
  "tokio",
 ]
 
