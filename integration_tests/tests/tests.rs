@@ -185,7 +185,7 @@ mod lifecycle {
                 process_deposit_required_cycles: Setup::DEFAULT_PROCESS_DEPOSIT_REQUIRED_CYCLES,
                 balance: 0,
                 minter_address: Some(MINTER_ADDRESS.to_string()),
-                nonce_accounts: vec![],
+                nonce_accounts: vec![Setup::DEFAULT_NONCE_ACCOUNT.to_string()],
             }
         );
 
@@ -232,7 +232,7 @@ mod lifecycle {
                 process_deposit_required_cycles: NEW_PROCESS_DEPOSIT_REQUIRED_CYCLES,
                 balance: 0,
                 minter_address: Some(MINTER_ADDRESS.to_string()),
-                nonce_accounts: vec![],
+                nonce_accounts: vec![Setup::DEFAULT_NONCE_ACCOUNT.to_string()],
             }
         );
 
