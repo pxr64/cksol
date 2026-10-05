@@ -285,6 +285,10 @@ impl State {
         &self.nonce_pool
     }
 
+    pub fn nonce_pool_addresses(&self) -> BTreeSet<Address> {
+        self.nonce_pool.addresses().copied().collect()
+    }
+
     pub fn deposit_status(&self, deposit_id: &DepositId) -> Option<DepositStatus> {
         if self.quarantined_deposits.contains_key(deposit_id) {
             return Some(DepositStatus::Quarantined((*deposit_id).into()));
