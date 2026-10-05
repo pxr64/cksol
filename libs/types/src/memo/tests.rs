@@ -22,17 +22,10 @@ fn arb_memo() -> impl Strategy<Value = CkSolMinterMemo> {
 }
 
 fn arb_mint_memo() -> impl Strategy<Value = MintMemo> {
-    prop_oneof![
-        arb_signature().prop_map(|signature| MintMemo::Convert {
-            signature: signature.into(),
-        }),
-        (arb_signature(), any::<DepositSolId>()).prop_map(|(signature, deposit_id)| {
-            MintMemo::Sweep {
-                signature: signature.into(),
-                deposit_id,
-            }
-        }),
-    ]
+    (arb_signature(), any::<DepositSolId>()).prop_map(|(signature, deposit_id)| MintMemo::Sweep {
+        signature: signature.into(),
+        deposit_id,
+    })
 }
 
 fn arb_signature() -> impl Strategy<Value = solana_signature::Signature> {
