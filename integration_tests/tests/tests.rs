@@ -5,8 +5,8 @@ use cksol_int_tests::{
     CkSolMinter, Setup, SetupBuilder,
     fixtures::{
         DEFAULT_CALLER_ACCOUNT, DEFAULT_CALLER_DEPOSIT_ADDRESS, DEPOSIT_AMOUNT,
-        EXPECTED_MINT_AMOUNT, MockBuilder, RENT_EXEMPTION_THRESHOLD, SharedMockHttpOutcalls,
-        default_process_deposit_args, deposit_transaction_signature,
+        EXPECTED_MINT_AMOUNT, MINTER_ADDRESS, MockBuilder, RENT_EXEMPTION_THRESHOLD,
+        SharedMockHttpOutcalls, default_process_deposit_args, deposit_transaction_signature,
     },
 };
 use cksol_types::{
@@ -184,6 +184,8 @@ mod lifecycle {
                 withdrawal_fee: Setup::DEFAULT_WITHDRAWAL_FEE,
                 process_deposit_required_cycles: Setup::DEFAULT_PROCESS_DEPOSIT_REQUIRED_CYCLES,
                 balance: 0,
+                minter_address: Some(MINTER_ADDRESS.to_string()),
+                nonce_accounts: vec![],
             }
         );
 
@@ -227,6 +229,8 @@ mod lifecycle {
                 withdrawal_fee: NEW_WITHDRAWAL_FEE,
                 process_deposit_required_cycles: NEW_PROCESS_DEPOSIT_REQUIRED_CYCLES,
                 balance: 0,
+                minter_address: Some(MINTER_ADDRESS.to_string()),
+                nonce_accounts: vec![],
             }
         );
 
