@@ -209,6 +209,8 @@ mod lifecycle {
                 withdrawal_fee: Some(NEW_WITHDRAWAL_FEE),
                 process_deposit_required_cycles: Some(NEW_PROCESS_DEPOSIT_REQUIRED_CYCLES as u64),
                 deposit_consolidation_fee: None,
+                nonce_accounts_to_add: None,
+                nonce_accounts_to_remove: None,
             })
             .await
             .expect("upgrade failed");

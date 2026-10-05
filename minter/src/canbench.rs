@@ -37,6 +37,7 @@ fn init_args() -> InitArgs {
         process_deposit_required_cycles: 1_000_000_000_000,
         solana_network: SolanaNetwork::Mainnet,
         deposit_consolidation_fee: 10_000_000_000,
+        nonce_accounts: vec![],
     }
 }
 

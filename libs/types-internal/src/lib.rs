@@ -63,6 +63,9 @@ pub struct InitArgs {
     /// Extra cycles charged per `process_deposit` call to offset the cost of consolidation transactions.
     #[cfg_attr(feature = "event", n(9))]
     pub deposit_consolidation_fee: u64,
+    /// The base58 addresses of the durable nonce accounts reserved for withdrawal transactions.
+    #[cfg_attr(feature = "event", n(11))]
+    pub nonce_accounts: Vec<String>,
 }
 
 /// The upgrade args for the ckSOL minter canister.
@@ -93,6 +96,12 @@ pub struct UpgradeArgs {
     /// New extra cycles charged per `process_deposit` call to offset consolidation costs.
     #[cfg_attr(feature = "event", n(6))]
     pub deposit_consolidation_fee: Option<u64>,
+    /// The base58 addresses of durable nonce accounts to add to the withdrawal pool.
+    #[cfg_attr(feature = "event", n(8))]
+    pub nonce_accounts_to_add: Option<Vec<String>>,
+    /// The base58 addresses of durable nonce accounts to remove from the withdrawal pool.
+    #[cfg_attr(feature = "event", n(9))]
+    pub nonce_accounts_to_remove: Option<Vec<String>>,
 }
 
 /// The Solana network to connect to via the SOL RPC canister.

@@ -71,6 +71,7 @@ pub fn valid_init_args() -> InitArgs {
         process_deposit_required_cycles: PROCESS_DEPOSIT_REQUIRED_CYCLES as u64,
         solana_network: SolanaNetwork::Mainnet,
         deposit_consolidation_fee: DEPOSIT_CONSOLIDATION_FEE as u64,
+        nonce_accounts: vec![],
     }
 }
 
@@ -901,7 +902,7 @@ pub mod arb {
             any::<u64>(),
             any::<u64>(),
             arb_solana_network(),
-            any::<u64>(),
+            (any::<u64>(), arb_nonce_accounts()),
         )
             .prop_map(
                 |(
@@ -915,7 +916,7 @@ pub mod arb {
                     withdrawal_fee,
                     process_deposit_required_cycles,
                     solana_network,
-                    deposit_consolidation_fee,
+                    (deposit_consolidation_fee, nonce_accounts),
                 )| {
                     InitArgs {
                         sol_rpc_canister_id,
@@ -929,9 +930,14 @@ pub mod arb {
                         process_deposit_required_cycles,
                         solana_network,
                         deposit_consolidation_fee,
+                        nonce_accounts,
                     }
                 },
             )
+    }
+
+    fn arb_nonce_accounts() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(arb_address().prop_map(|address| address.to_string()), 0..5)
     }
 
     pub fn arb_upgrade_args() -> impl Strategy<Value = UpgradeArgs> {
@@ -944,6 +950,8 @@ pub mod arb {
             prop::option::of(any::<u64>()),
             prop::option::of(any::<u64>()),
             prop::option::of(any::<u64>()),
+            prop::option::of(arb_nonce_accounts()),
+            prop::option::of(arb_nonce_accounts()),
         )
             .prop_map(
                 |(
@@ -955,6 +963,8 @@ pub mod arb {
                     withdrawal_fee,
                     process_deposit_required_cycles,
                     deposit_consolidation_fee,
+                    nonce_accounts_to_add,
+                    nonce_accounts_to_remove,
                 )| UpgradeArgs {
                     sol_rpc_canister_id,
                     manual_deposit_fee,
@@ -964,6 +974,8 @@ pub mod arb {
                     withdrawal_fee,
                     process_deposit_required_cycles,
                     deposit_consolidation_fee,
+                    nonce_accounts_to_add,
+                    nonce_accounts_to_remove,
                 },
             )
     }
