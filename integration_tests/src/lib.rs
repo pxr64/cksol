@@ -684,6 +684,7 @@ fn cksol_minter_init_args(
 ) -> MinterArg {
     use cksol_types_internal::{Ed25519KeyName, InitArgs, MinterArg, SolanaNetwork};
     MinterArg::Init(InitArgs {
+        ledger_suite_orchestrator_id: None,
         sol_rpc_canister_id,
         ledger_canister_id,
         automated_deposit_fee: Setup::DEFAULT_AUTOMATED_DEPOSIT_FEE,

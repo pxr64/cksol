@@ -58,6 +58,7 @@ pub fn ledger_canister_id() -> Principal {
 
 pub fn valid_init_args() -> InitArgs {
     InitArgs {
+        ledger_suite_orchestrator_id: None,
         sol_rpc_canister_id: sol_rpc_canister_id(),
         ledger_canister_id: ledger_canister_id(),
         automated_deposit_fee: AUTOMATED_DEPOSIT_FEE,
@@ -872,6 +873,7 @@ pub mod arb {
                     deposit_consolidation_fee,
                 )| {
                     InitArgs {
+                        ledger_suite_orchestrator_id: None,
                         sol_rpc_canister_id,
                         ledger_canister_id,
                         automated_deposit_fee,
@@ -907,6 +909,7 @@ pub mod arb {
                     deposit_sol_required_cycles,
                     deposit_consolidation_fee,
                 )| UpgradeArgs {
+                    ledger_suite_orchestrator_id: None,
                     sol_rpc_canister_id,
                     automated_deposit_fee,
                     minimum_withdrawal_amount,

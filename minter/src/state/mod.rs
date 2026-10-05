@@ -10,7 +10,7 @@ use crate::{
     utils::insertion_ordered_map::InsertionOrderedMap,
 };
 use candid::Principal;
-use cksol_types::{DepositSolId, TxFinalizedStatus, WithdrawalStatus};
+use cksol_types::{AddSplTokenError, DepositSolId, TxFinalizedStatus, WithdrawalStatus};
 use cksol_types_internal::SolanaNetwork;
 use cksol_types_internal::{Ed25519KeyName, InitArgs, UpgradeArgs};
 use ic_canister_runtime::Runtime;
@@ -32,6 +32,9 @@ mod tests;
 pub mod audit;
 mod deposits;
 pub mod event;
+mod spl;
+
+pub use spl::SupportedSplToken;
 
 pub use deposits::{
     DepositBalance, Deposits, MintedSweep, PendingMint, QueuedDeposit, SettledSweep, Sweep,
@@ -93,6 +96,7 @@ pub struct State {
     minter_public_key: Option<SchnorrPublicKey>,
     master_key_name: Ed25519KeyName,
     ledger_canister_id: Principal,
+    ledger_suite_orchestrator_id: Option<Principal>,
     sol_rpc_canister_id: Principal,
     solana_network: SolanaNetwork,
     automated_deposit_fee: Lamport,
@@ -104,6 +108,7 @@ pub struct State {
     pending_deposit_sol_request_guards: BTreeSet<Account>,
     pending_withdrawal_request_guards: BTreeSet<Account>,
     deposits: Deposits,
+    supported_spl_tokens: BTreeMap<cksol_types::Address, SupportedSplToken>,
     pending_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingWithdrawalRequest>,
     sent_withdrawal_requests: BTreeMap<LedgerBurnIndex, SentWithdrawalRequest>,
     successful_withdrawal_requests: BTreeMap<LedgerBurnIndex, SentWithdrawalRequest>,
@@ -117,6 +122,43 @@ pub struct State {
 }
 
 impl State {
+    pub fn ledger_suite_orchestrator_id(&self) -> Option<Principal> {
+        self.ledger_suite_orchestrator_id
+    }
+
+    pub fn supported_spl_token(&self, mint: &cksol_types::Address) -> Option<&SupportedSplToken> {
+        self.supported_spl_tokens.get(mint)
+    }
+
+    pub fn validate_spl_token_registration(
+        &self,
+        token: &SupportedSplToken,
+    ) -> Result<(), AddSplTokenError> {
+        if self.supported_spl_tokens.contains_key(&token.mint) {
+            return Err(AddSplTokenError::AlreadySupported {
+                mint: token.mint.clone(),
+            });
+        }
+        if token.ledger_id == self.ledger_canister_id
+            || self
+                .supported_spl_tokens
+                .values()
+                .any(|t| t.ledger_id == token.ledger_id)
+        {
+            return Err(AddSplTokenError::LedgerAlreadyUsed {
+                ledger_id: token.ledger_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn process_added_spl_token(&mut self, token: &SupportedSplToken) {
+        self.validate_spl_token_registration(token)
+            .expect("BUG: invalid SPL token registration event");
+        self.supported_spl_tokens
+            .insert(token.mint.clone(), token.clone());
+    }
+
     pub fn minter_public_key(&self) -> Option<&SchnorrPublicKey> {
         self.minter_public_key.as_ref()
     }
@@ -272,6 +314,13 @@ impl State {
     }
 
     fn validate(&self) -> Result<(), InvalidStateError> {
+        if matches!(self.ledger_suite_orchestrator_id, Some(id)
+            if id == Principal::anonymous() || id == Principal::management_canister())
+        {
+            return Err(InvalidStateError::InvalidCanisterId(
+                "ERROR: ledger suite orchestrator must be a non-anonymous, non-management principal".to_string(),
+            ));
+        }
         let canister_ids: BTreeSet<_> = [self.sol_rpc_canister_id, self.ledger_canister_id]
             .into_iter()
             .collect();
@@ -328,6 +377,7 @@ impl State {
     fn upgrade(
         &mut self,
         UpgradeArgs {
+            ledger_suite_orchestrator_id,
             sol_rpc_canister_id,
             automated_deposit_fee,
             minimum_withdrawal_amount,
@@ -337,6 +387,9 @@ impl State {
             deposit_consolidation_fee,
         }: UpgradeArgs,
     ) -> Result<(), InvalidStateError> {
+        if let Some(id) = ledger_suite_orchestrator_id {
+            self.ledger_suite_orchestrator_id = Some(id);
+        }
         if let Some(sol_rpc_canister_id) = sol_rpc_canister_id {
             self.sol_rpc_canister_id = sol_rpc_canister_id;
         }
@@ -679,6 +732,7 @@ impl TryFrom<InitArgs> for State {
 
     fn try_from(
         InitArgs {
+            ledger_suite_orchestrator_id,
             sol_rpc_canister_id,
             ledger_canister_id,
             automated_deposit_fee,
@@ -696,6 +750,7 @@ impl TryFrom<InitArgs> for State {
             master_key_name,
             ledger_canister_id,
             sol_rpc_canister_id,
+            ledger_suite_orchestrator_id,
             solana_network,
             automated_deposit_fee,
             withdrawal_fee,
@@ -706,6 +761,7 @@ impl TryFrom<InitArgs> for State {
             pending_deposit_sol_request_guards: BTreeSet::new(),
             pending_withdrawal_request_guards: BTreeSet::new(),
             deposits: Deposits::default(),
+            supported_spl_tokens: BTreeMap::new(),
             pending_withdrawal_requests: BTreeMap::new(),
             sent_withdrawal_requests: BTreeMap::new(),
             successful_withdrawal_requests: BTreeMap::new(),

@@ -34,8 +34,85 @@ proptest! {
     }
 }
 
+mod spl_orchestrator_configuration {
+    use super::*;
+
+    #[test]
+    fn should_reject_anonymous_and_management_orchestrators_on_init_and_upgrade() {
+        for id in [Principal::anonymous(), Principal::management_canister()] {
+            assert_matches!(
+                State::try_from(InitArgs {
+                    ledger_suite_orchestrator_id: Some(id),
+                    ..valid_init_args()
+                }),
+                Err(InvalidStateError::InvalidCanisterId(_))
+            );
+            let mut state = State::try_from(valid_init_args()).unwrap();
+            assert_matches!(
+                state.upgrade(UpgradeArgs {
+                    ledger_suite_orchestrator_id: Some(id),
+                    ..UpgradeArgs::default()
+                }),
+                Err(InvalidStateError::InvalidCanisterId(_))
+            );
+        }
+    }
+
+    // Simulate the pre-orchestrator CBOR layout by removing the last array field.
+    // Existing field indices must stay unchanged and old events must remain readable.
+    fn without_last_field(bytes: &[u8]) -> Vec<u8> {
+        let mut decoder = minicbor::Decoder::new(bytes);
+        let len = decoder.array().unwrap().unwrap();
+        assert!(len < 24);
+        for _ in 0..len - 1 {
+            decoder.skip().unwrap();
+        }
+        let mut legacy = bytes[..decoder.position()].to_vec();
+        legacy[0] = 0x80 + (len as u8 - 1);
+        legacy
+    }
+
+    #[test]
+    fn should_decode_legacy_lifecycle_events_without_an_orchestrator_field() {
+        let mut init = InitArgs {
+            ledger_suite_orchestrator_id: Some(Principal::from_slice(&[42])),
+            ..valid_init_args()
+        };
+        let encoded = minicbor::to_vec(&init).unwrap();
+        let decoded: InitArgs = minicbor::decode(&without_last_field(&encoded)).unwrap();
+        init.ledger_suite_orchestrator_id = None;
+        assert_eq!(decoded, init);
+        let mut upgrade = UpgradeArgs {
+            ledger_suite_orchestrator_id: Some(Principal::from_slice(&[42])),
+            ..UpgradeArgs::default()
+        };
+        let encoded = minicbor::to_vec(&upgrade).unwrap();
+        let decoded: UpgradeArgs = minicbor::decode(&without_last_field(&encoded)).unwrap();
+        upgrade.ledger_suite_orchestrator_id = None;
+        assert_eq!(decoded, upgrade);
+    }
+
+    #[test]
+    fn should_preserve_orchestrator_in_cbor_lifecycle_args() {
+        let id = Principal::from_slice(&[42, 10]);
+        let init = InitArgs {
+            ledger_suite_orchestrator_id: Some(id),
+            ..valid_init_args()
+        };
+        let decoded: InitArgs = minicbor::decode(&minicbor::to_vec(&init).unwrap()).unwrap();
+        assert_eq!(decoded, init);
+        let upgrade = UpgradeArgs {
+            ledger_suite_orchestrator_id: Some(id),
+            ..UpgradeArgs::default()
+        };
+        let decoded: UpgradeArgs = minicbor::decode(&minicbor::to_vec(&upgrade).unwrap()).unwrap();
+        assert_eq!(decoded, upgrade);
+    }
+}
+
 mod cache_minter_public_key {
     use super::*;
+
     use ic_ed25519::{PocketIcMasterPublicKeyId, PublicKey};
 
     #[test]
@@ -607,6 +684,7 @@ mod state_from_init_args {
         assert_eq!(
             state,
             State {
+                ledger_suite_orchestrator_id: None,
                 minter_public_key: None,
                 master_key_name: Ed25519KeyName::MainnetProdKey1,
                 ledger_canister_id: ledger_canister_id(),
@@ -621,6 +699,7 @@ mod state_from_init_args {
                 pending_deposit_sol_request_guards: BTreeSet::new(),
                 pending_withdrawal_request_guards: BTreeSet::new(),
                 deposits: Deposits::default(),
+                supported_spl_tokens: BTreeMap::new(),
                 pending_withdrawal_requests: BTreeMap::new(),
                 sent_withdrawal_requests: BTreeMap::new(),
                 successful_withdrawal_requests: BTreeMap::new(),

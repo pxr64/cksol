@@ -29,6 +29,7 @@ const INDEX_OFFSET_RESUBMIT: usize = 50_000;
 
 fn init_args() -> InitArgs {
     InitArgs {
+        ledger_suite_orchestrator_id: None,
         sol_rpc_canister_id: Principal::from_slice(&[1_u8; 20]),
         ledger_canister_id: Principal::from_slice(&[2_u8; 20]),
         automated_deposit_fee: 10_000_000,

@@ -13,6 +13,7 @@ mod rpc;
 pub mod runtime;
 mod signer;
 mod sol_transfer;
+pub mod spl;
 pub mod state;
 pub mod storage;
 pub mod utils;

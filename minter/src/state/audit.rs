@@ -85,6 +85,7 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
         EventType::QuarantinedPendingMint { deposit_id } => {
             state.process_quarantined_pending_mint(*deposit_id);
         }
+        EventType::AddedSplToken(token) => state.process_added_spl_token(token),
     }
 }
 

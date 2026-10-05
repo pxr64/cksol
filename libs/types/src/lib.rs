@@ -150,6 +150,47 @@ pub enum DepositSolError {
     },
 }
 
+/// Configuration supplied when registering an SPL token.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
+pub struct AddSplTokenArgs {
+    /// The Solana mint address.
+    pub mint: Address,
+    /// The program owning the mint: classic SPL Token or Token-2022.
+    /// Token-2022 mints with extensions are not supported.
+    pub token_program: Address,
+    /// Token decimals, checked against the finalized mint account.
+    pub decimals: u8,
+    /// The IC ledger to credit for this token.
+    pub ledger_id: Principal,
+    /// The minimum deposit in the token's smallest units.
+    pub minimum_deposit_amount: u64,
+    /// Whether deposits should initially be paused.
+    pub paused: bool,
+}
+
+/// An error while registering a supported SPL token.
+#[derive(Debug, Clone, PartialEq, CandidType, Deserialize, Error)]
+pub enum AddSplTokenError {
+    /// The mint is already registered. Existing configurations are never overwritten.
+    #[error("SPL token is already registered: {mint}")]
+    AlreadySupported {
+        /// The requested mint address.
+        mint: Address,
+    },
+    /// The ledger is already assigned to SOL or another SPL mint.
+    #[error("Ledger is already assigned to a token: {ledger_id}")]
+    LedgerAlreadyUsed {
+        /// The requested ledger canister ID.
+        ledger_id: Principal,
+    },
+    /// The configuration or finalized mint account is invalid.
+    #[error("Invalid SPL token: {0}")]
+    InvalidToken(String),
+    /// The mint account could not be read consistently. Registration can be retried.
+    #[error("Token registration is temporarily unavailable: {0}")]
+    TemporarilyUnavailable(String),
+}
+
 /// Insufficient cycles attached by the caller to complete the call.
 #[derive(Debug, Clone, PartialEq, CandidType, Deserialize, Error)]
 #[error("Insufficient cycles attached, expected {expected} but got {received}")]

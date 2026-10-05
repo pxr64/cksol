@@ -36,7 +36,7 @@ impl VersionedMessage {
     }
 }
 
-mod cbor;
+pub(super) mod cbor;
 
 #[derive(Eq, PartialEq, Debug, Decode, Encode)]
 pub struct Event {
@@ -50,6 +50,9 @@ pub struct Event {
 
 #[derive(Clone, Eq, PartialEq, Debug, Decode, Encode)]
 pub enum EventType {
+    /// A validated SPL token was registered with its IC ledger.
+    #[n(13)]
+    AddedSplToken(#[n(0)] crate::state::SupportedSplToken),
     /// The minter initialization event.
     /// Must be the first event in the log.
     #[n(0)]

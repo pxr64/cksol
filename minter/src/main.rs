@@ -15,9 +15,9 @@ use cksol_minter::{
     withdraw::{WITHDRAWAL_PROCESSING_DELAY, process_pending_withdrawals},
 };
 use cksol_types::{
-    Address, DepositSolArgs, DepositSolError, DepositSolId, DepositSolStatus,
-    GetDepositAddressArgs, MinterInfo, WithdrawalArgs, WithdrawalError, WithdrawalOk,
-    WithdrawalStatus, WithdrawalStatusArgs,
+    AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
+    DepositSolStatus, GetDepositAddressArgs, MinterInfo, WithdrawalArgs, WithdrawalError,
+    WithdrawalOk, WithdrawalStatus, WithdrawalStatusArgs,
 };
 use cksol_types_internal::{MinterArg, log::Priority};
 use ic_http_types::{HttpRequest, HttpResponse, HttpResponseBuilder};
@@ -76,6 +76,13 @@ async fn deposit_sol(args: DepositSolArgs) -> Result<DepositSolId, DepositSolErr
 #[ic_cdk::query]
 fn deposit_status(deposit_id: DepositSolId) -> DepositSolStatus {
     cksol_minter::deposit::sweep::deposit_status(deposit_id)
+}
+
+#[ic_cdk::update]
+async fn add_spl_token(args: AddSplTokenArgs) -> Result<(), AddSplTokenError> {
+    cksol_minter::utils::assert_ledger_suite_orchestrator(ic_cdk::api::msg_caller())
+        .unwrap_or_else(|error| ic_cdk::trap(error));
+    cksol_minter::spl::add_spl_token(&IcCanisterRuntime::new(), args).await
 }
 
 #[ic_cdk::update]
@@ -224,6 +231,14 @@ fn get_events(
             EventType::QuarantinedPendingMint { deposit_id } => {
                 event::EventType::QuarantinedPendingMint { deposit_id }
             }
+            EventType::AddedSplToken(token) => event::EventType::AddedSplToken {
+                mint: token.mint,
+                token_program: token.token_program,
+                decimals: token.decimals,
+                ledger_id: token.ledger_id,
+                minimum_deposit_amount: token.minimum_deposit_amount,
+                paused: token.paused,
+            },
         }
     }
 

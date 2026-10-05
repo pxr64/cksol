@@ -211,6 +211,7 @@ mod lifecycle {
                 withdrawal_fee: Some(NEW_WITHDRAWAL_FEE),
                 deposit_sol_required_cycles: Some(NEW_DEPOSIT_SOL_REQUIRED_CYCLES as u64),
                 deposit_consolidation_fee: None,
+                ledger_suite_orchestrator_id: None,
             })
             .await
             .expect("upgrade failed");

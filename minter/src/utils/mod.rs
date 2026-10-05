@@ -1,3 +1,4 @@
+use crate::state::read_state;
 use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 
@@ -12,6 +13,17 @@ pub fn assert_non_anonymous_account(account: &Account) {
         Principal::anonymous(),
         "the owner must be non-anonymous"
     );
+}
+
+pub fn assert_ledger_suite_orchestrator(caller: Principal) -> Result<(), String> {
+    let orchestrator = read_state(|state| state.ledger_suite_orchestrator_id())
+        .ok_or_else(|| "SPL token registration is not activated".to_string())?;
+    if caller == Principal::anonymous() || caller != orchestrator {
+        return Err(format!(
+            "Only the ledger suite orchestrator {orchestrator} can register SPL tokens"
+        ));
+    }
+    Ok(())
 }
 
 pub fn assert_valid_deposit_owner(account: &Account, minter_id: Principal) {

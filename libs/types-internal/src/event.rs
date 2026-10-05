@@ -1,7 +1,7 @@
 //! Candid-compatible event types for the ckSOL minter.
 
 use crate::{InitArgs, UpgradeArgs};
-use candid::CandidType;
+use candid::{CandidType, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use serde::Deserialize;
 use sol_rpc_types::{Lamport, Pubkey as Address, Signature};
@@ -130,6 +130,21 @@ pub enum EventType {
     QuarantinedPendingMint {
         /// The identifier of the deposit whose pending mint was quarantined.
         deposit_id: u64,
+    },
+    /// A validated SPL token was registered with its IC ledger.
+    AddedSplToken {
+        /// The Solana mint address.
+        mint: Address,
+        /// The program owning the mint.
+        token_program: Address,
+        /// The number of token decimals.
+        decimals: u8,
+        /// The IC ledger assigned to the mint.
+        ledger_id: Principal,
+        /// The minimum deposit in the token's smallest units.
+        minimum_deposit_amount: u64,
+        /// Whether deposits are initially paused.
+        paused: bool,
     },
 }
 
