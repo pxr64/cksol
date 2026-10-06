@@ -5,7 +5,7 @@ use crate::{
     rpc::BlockHeight,
     state::DepositBalance,
 };
-use cksol_types::DepositSolId;
+use cksol_types::{DepositSolId, DepositSplId};
 use cksol_types_internal::{InitArgs, UpgradeArgs};
 use derive_more::From;
 use ic_stable_structures::{Storable, storable::Bound};
@@ -190,6 +190,20 @@ pub enum EventType {
     /// Index 14 is reserved for the `MinterPublicKeyFetched` event of main.
     #[n(15)]
     AddedSplToken(#[n(0)] crate::state::SupportedSplToken),
+    /// An SPL token-account balance was accepted for a future sweep.
+    #[n(16)]
+    QueuedSplDeposit {
+        #[n(0)]
+        deposit_id: DepositSplId,
+        #[n(1)]
+        account: Account,
+        #[cbor(n(2), with = "cbor::address")]
+        mint: Address,
+        #[cbor(n(3), with = "cbor::address")]
+        address: Address,
+        #[n(4)]
+        balance: u64,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

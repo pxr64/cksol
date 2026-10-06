@@ -5,9 +5,12 @@ use crate::{
     guard::deposit_spl_guard,
     rpc::get_spl_token_balance,
     runtime::CanisterRuntime,
+    state::{audit::process_event, event::EventType, mutate_state, read_state},
     utils::{assert_valid_deposit_owner, assert_valid_deposit_token},
 };
+use canlog::log;
 use cksol_types::{DepositSplError, DepositSplId};
+use cksol_types_internal::log::Priority;
 use icrc_ledger_types::icrc1::account::Account;
 use solana_address::Address;
 
@@ -23,8 +26,14 @@ pub async fn deposit_spl<R: CanisterRuntime>(
     assert_valid_deposit_owner(&account, runtime.canister_self());
     let mint = Address::from(mint);
     let _guard = deposit_spl_guard(account, mint)?;
+    // A pause stops new deposits only, so an in-flight deposit stays reachable.
+    if let Some(deposit_id) = read_state(|state| state.spl_deposits().in_flight_id(&account, &mint))
+    {
+        return Ok(deposit_id);
+    }
     let token = assert_valid_deposit_token(&mint)?;
-    check_caller_available_cycles(runtime, GET_ACCOUNT_INFO_CYCLES)?;
+    let deposit_consolidation_fee = read_state(|state| state.deposit_consolidation_fee());
+    check_caller_available_cycles(runtime, GET_ACCOUNT_INFO_CYCLES + deposit_consolidation_fee)?;
 
     let master_key = lazy_get_schnorr_master_key(runtime).await;
     let owner = account_address(&master_key, &account);
@@ -37,15 +46,31 @@ pub async fn deposit_spl<R: CanisterRuntime>(
         runtime,
         RpcCallCharge {
             attached_cycles: GET_ACCOUNT_INFO_CYCLES,
-            // No sweep fee is charged until SPL deposits can be queued.
-            fee_on_success: 0,
+            fee_on_success: deposit_consolidation_fee,
         },
         &result,
     );
-    result?;
-    Err(DepositSplError::TemporarilyUnavailable(
-        "SPL deposits are not implemented yet".to_string(),
-    ))
+    let balance = result?;
+    let deposit_id = mutate_state(|state| {
+        let deposit_id = state.spl_deposits().next_id();
+        process_event(
+            state,
+            EventType::QueuedSplDeposit {
+                deposit_id,
+                account,
+                mint,
+                address,
+                balance,
+            },
+            runtime,
+        );
+        deposit_id
+    });
+    log!(
+        Priority::Info,
+        "Queued SPL deposit {deposit_id} for account {account:?}: {balance} units of mint {mint} sweepable from {address}"
+    );
+    Ok(deposit_id)
 }
 
 fn balance_above_minimum(

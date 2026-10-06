@@ -10,7 +10,9 @@ use crate::{
     utils::insertion_ordered_map::InsertionOrderedMap,
 };
 use candid::Principal;
-use cksol_types::{AddSplTokenError, DepositSolId, TxFinalizedStatus, WithdrawalStatus};
+use cksol_types::{
+    AddSplTokenError, DepositSolId, DepositSplId, TxFinalizedStatus, WithdrawalStatus,
+};
 use cksol_types_internal::SolanaNetwork;
 use cksol_types_internal::{Ed25519KeyName, InitArgs, UpgradeArgs};
 use ic_canister_runtime::Runtime;
@@ -33,8 +35,10 @@ pub mod audit;
 mod deposits;
 pub mod event;
 mod spl;
+mod spl_deposits;
 
 pub use spl::{SupportedSplToken, TokenProgram};
+pub use spl_deposits::{QueuedSplDeposit, SplDeposits};
 
 pub use deposits::{
     DepositBalance, Deposits, MintedSweep, PendingMint, QueuedDeposit, SettledSweep, Sweep,
@@ -109,6 +113,7 @@ pub struct State {
     pending_deposit_spl_request_guards: BTreeSet<(Account, Address)>,
     pending_withdrawal_request_guards: BTreeSet<Account>,
     deposits: Deposits,
+    spl_deposits: SplDeposits,
     supported_spl_tokens: BTreeMap<Address, SupportedSplToken>,
     pending_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingWithdrawalRequest>,
     sent_withdrawal_requests: BTreeMap<LedgerBurnIndex, SentWithdrawalRequest>,
@@ -222,6 +227,10 @@ impl State {
 
     pub fn deposits(&self) -> &Deposits {
         &self.deposits
+    }
+
+    pub fn spl_deposits(&self) -> &SplDeposits {
+        &self.spl_deposits
     }
 
     pub fn sent_withdrawal_requests(&self) -> &BTreeMap<LedgerBurnIndex, SentWithdrawalRequest> {
@@ -429,6 +438,29 @@ impl State {
             deposit_id,
             QueuedDeposit {
                 account: *account,
+                address: *address,
+                balance,
+            },
+        );
+    }
+
+    fn process_queued_spl_deposit(
+        &mut self,
+        deposit_id: DepositSplId,
+        account: &Account,
+        mint: &Address,
+        address: &Address,
+        balance: u64,
+    ) {
+        assert!(
+            self.supported_spl_tokens.contains_key(mint),
+            "Attempted to queue an unsupported SPL mint {mint}"
+        );
+        self.spl_deposits.queue(
+            deposit_id,
+            QueuedSplDeposit {
+                account: *account,
+                mint: *mint,
                 address: *address,
                 balance,
             },
@@ -766,6 +798,7 @@ impl TryFrom<InitArgs> for State {
             pending_deposit_spl_request_guards: BTreeSet::new(),
             pending_withdrawal_request_guards: BTreeSet::new(),
             deposits: Deposits::default(),
+            spl_deposits: SplDeposits::default(),
             supported_spl_tokens: BTreeMap::new(),
             pending_withdrawal_requests: BTreeMap::new(),
             sent_withdrawal_requests: BTreeMap::new(),

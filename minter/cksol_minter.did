@@ -469,6 +469,15 @@ type EventType = variant {
         // The balance of the deposit address when the deposit was queued.
         balance: Lamport;
     };
+    // An SPL token-account balance was accepted for a future sweep.
+    QueuedSplDeposit: record {
+        deposit_id: DepositSplId;
+        account: Account;
+        mint: Address;
+        address: Address;
+        // The token-account balance when the deposit was queued, in the mint's smallest units.
+        balance: nat64;
+    };
     // The minter read the amount that the finalized sweep transaction moved to
     // its main account and enqueued a pending mint for each deposit of that sweep.
     CreditedSweep : record {
@@ -558,8 +567,10 @@ service : (MinterArg) -> {
     // The resolved owner must be a non-anonymous principal.
     deposit_sol: (DepositSolArgs) -> (DepositSolResult);
 
-    // Reads and validates the finalized token balance, charging the RPC cost.
-    // Queueing is not implemented yet, so valid balances return TemporarilyUnavailable.
+    // Queues the finalized SPL balance for a future token sweep and returns its deposit ID.
+    // New deposits pay the RPC cost and consolidation fee in cycles. Repeated requests for
+    // an in-flight account and mint return the existing ID without a charge, also when the
+    // token is paused. SPL sweeping and minting are not implemented yet.
     deposit_spl: (DepositSplArgs) -> (DepositSplResult);
 
     // Registers an SPL token and its IC ledger. Only the configured orchestrator can

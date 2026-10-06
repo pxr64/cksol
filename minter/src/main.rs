@@ -238,6 +238,19 @@ fn get_events(
             EventType::QuarantinedPendingMint { deposit_id } => {
                 event::EventType::QuarantinedPendingMint { deposit_id }
             }
+            EventType::QueuedSplDeposit {
+                deposit_id,
+                account,
+                mint,
+                address,
+                balance,
+            } => event::EventType::QueuedSplDeposit {
+                deposit_id,
+                account,
+                mint: mint.into(),
+                address: address.into(),
+                balance,
+            },
             EventType::AddedSplToken(token) => event::EventType::AddedSplToken {
                 mint: token.mint.into(),
                 token_program: token.token_program.id().into(),

@@ -722,6 +722,7 @@ mod state_from_init_args {
                 pending_deposit_spl_request_guards: BTreeSet::new(),
                 pending_withdrawal_request_guards: BTreeSet::new(),
                 deposits: Deposits::default(),
+                spl_deposits: SplDeposits::default(),
                 supported_spl_tokens: BTreeMap::new(),
                 pending_withdrawal_requests: BTreeMap::new(),
                 sent_withdrawal_requests: BTreeMap::new(),

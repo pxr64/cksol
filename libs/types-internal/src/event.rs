@@ -131,6 +131,19 @@ pub enum EventType {
         /// The identifier of the deposit whose pending mint was quarantined.
         deposit_id: u64,
     },
+    /// An SPL token-account balance was accepted for a future sweep.
+    QueuedSplDeposit {
+        /// The identifier of the queued SPL deposit.
+        deposit_id: u64,
+        /// The IC account to credit after the sweep.
+        account: Account,
+        /// The SPL mint identifying the token.
+        mint: Address,
+        /// The source token-account address.
+        address: Address,
+        /// The token-account balance when the deposit was queued, in the mint's smallest units.
+        balance: u64,
+    },
     /// A validated SPL token was registered with its IC ledger.
     AddedSplToken {
         /// The Solana mint address.
