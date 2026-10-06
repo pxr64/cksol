@@ -6,6 +6,7 @@ use ic_cdk_management_canister::{SchnorrAlgorithm, SchnorrKeyId, SchnorrPublicKe
 use ic_ed25519::{DerivationIndex, DerivationPath as IcDerivationPath, PublicKey};
 use icrc_ledger_types::icrc1::account::Account;
 use solana_address::Address;
+use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 
 #[cfg(test)]
 mod tests;
@@ -36,6 +37,24 @@ pub fn account_address(master_key: &SchnorrPublicKey, account: &Account) -> Addr
     derive_public_key_from_account(master_key, account)
         .serialize_raw()
         .into()
+}
+
+/// The associated token account for an IC account's derived Solana deposit owner.
+/// Deriving the address does not create the token account on Solana.
+pub fn spl_deposit_address(
+    master_key: &SchnorrPublicKey,
+    account: &Account,
+    mint: &Address,
+    token_program: &Address,
+) -> Address {
+    let owner = account_address(master_key, account);
+    get_associated_token_address_with_program_id(
+        &owner.to_bytes().into(),
+        &mint.to_bytes().into(),
+        &token_program.to_bytes().into(),
+    )
+    .to_bytes()
+    .into()
 }
 
 pub async fn lazy_get_schnorr_master_key<R: CanisterRuntime>(runtime: &R) -> SchnorrPublicKey {

@@ -1,7 +1,7 @@
 use crate::{
     address::{
         account_address, derive_public_key_from_account, get_deposit_address,
-        lazy_get_schnorr_master_key, minter_address,
+        lazy_get_schnorr_master_key, minter_address, spl_deposit_address,
     },
     state::{SchnorrPublicKey, read_state},
     test_fixtures::{
@@ -163,5 +163,86 @@ fn test_key_result() -> SchnorrPublicKeyResult {
     SchnorrPublicKeyResult {
         public_key: key.public_key.serialize_raw().to_vec(),
         chain_code: key.chain_code.to_vec(),
+    }
+}
+
+mod spl_deposit_address_tests {
+    use super::*;
+
+    fn mint() -> Address {
+        [2; 32].into()
+    }
+
+    fn token_program() -> Address {
+        spl_token_interface::id().to_bytes().into()
+    }
+
+    fn token_2022_program() -> Address {
+        spl_token_2022_interface::id().to_bytes().into()
+    }
+
+    #[test]
+    fn should_match_known_associated_token_addresses() {
+        let master_key = test_key();
+        let account = account(1);
+        // Fixed vectors for the derived owner ALA4bv2qnUr5H81zcZM3FnEzMeEvh4ErZU3nbqHnghFK,
+        // mint [2; 32], and each token program. Checked independently against the PDA seeds.
+        assert_eq!(
+            spl_deposit_address(&master_key, &account, &mint(), &token_program()),
+            "EEpHwkSW9e3qA4mSAU9FHUpXev2exT7cofkumm4NYLe6"
+                .parse::<Address>()
+                .unwrap(),
+        );
+        assert_eq!(
+            spl_deposit_address(&master_key, &account, &mint(), &token_2022_program()),
+            "8hXgbo4LFeHBHZn26thexNAYbUkpHGxwo7a9CuG2x8Aq"
+                .parse::<Address>()
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn should_treat_default_and_zero_subaccounts_as_the_same_deposit() {
+        let explicit_zero = Account {
+            subaccount: Some([0; 32]),
+            ..account(1)
+        };
+        assert_eq!(
+            spl_deposit_address(&test_key(), &account(1), &mint(), &token_program()),
+            spl_deposit_address(&test_key(), &explicit_zero, &mint(), &token_program()),
+        );
+    }
+
+    #[test]
+    fn should_derive_different_addresses_for_different_accounts() {
+        let first = spl_deposit_address(&test_key(), &account(1), &mint(), &token_program());
+        for other in [
+            account(2),
+            Account {
+                subaccount: Some([1; 32]),
+                ..account(1)
+            },
+        ] {
+            assert_ne!(
+                first,
+                spl_deposit_address(&test_key(), &other, &mint(), &token_program())
+            );
+        }
+    }
+
+    #[test]
+    fn should_derive_different_addresses_for_different_mints() {
+        assert_ne!(
+            spl_deposit_address(&test_key(), &account(1), &mint(), &token_program()),
+            spl_deposit_address(&test_key(), &account(1), &[3; 32].into(), &token_program()),
+        );
+    }
+
+    #[test]
+    fn should_derive_different_addresses_for_different_token_programs() {
+        assert_ne!(
+            spl_deposit_address(&test_key(), &account(1), &mint(), &token_program()),
+            spl_deposit_address(&test_key(), &account(1), &mint(), &token_2022_program()),
+        );
     }
 }
