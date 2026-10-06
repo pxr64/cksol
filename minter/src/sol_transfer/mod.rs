@@ -1,9 +1,12 @@
 use crate::{
-    address::{DerivationPath, lazy_get_schnorr_master_key, minter_address},
+    address::{
+        DerivationPath, account_address, lazy_get_schnorr_master_key, minter_address,
+        spl_deposit_address,
+    },
     constants::FEE_PER_SIGNATURE,
     runtime::CanisterRuntime,
     signer::{SchnorrSigner, sign_bytes},
-    state::{Sweep, event::Signer},
+    state::{QueuedSplDeposit, SupportedSplToken, Sweep, event::Signer},
 };
 use derive_more::From;
 use ic_cdk_management_canister::SignCallError;
@@ -36,6 +39,95 @@ pub enum CreateTransferError {
     TransactionTooLarge { max: usize, got: usize },
     #[error("signing failed: {0}")]
     SigningFailed(SignCallError),
+}
+
+/// Builds a checked transfer of the queued token balance to the minter's
+/// associated token account. The destination account must already exist.
+pub fn create_spl_sweep_instruction(
+    deposit: &QueuedSplDeposit,
+    token: &SupportedSplToken,
+    deposit_owner: &Address,
+    minter: &Address,
+) -> Instruction {
+    assert_eq!(deposit.mint, token.mint, "BUG: SPL sweep mint mismatch");
+    let token_program = token.token_program.id();
+    let destination = spl_deposit_address(minter, &token.mint, &token_program);
+    spl_token_2022_interface::instruction::transfer_checked(
+        &token_program.to_bytes().into(),
+        &deposit.address.to_bytes().into(),
+        &token.mint.to_bytes().into(),
+        &destination.to_bytes().into(),
+        &deposit_owner.to_bytes().into(),
+        &[],
+        deposit.balance,
+        token.decimals,
+    )
+    .expect("BUG: supported SPL token program must accept transfer_checked")
+}
+
+/// Builds a single-deposit SPL sweep message. The minter funds destination
+/// account creation and transaction fees; the deposit owner authorizes the transfer.
+pub fn create_spl_sweep_message(
+    deposit: &QueuedSplDeposit,
+    token: &SupportedSplToken,
+    deposit_owner: &Address,
+    minter: &Address,
+    recent_blockhash: Hash,
+) -> Message {
+    let create_destination =
+        spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(
+            &minter.to_bytes().into(),
+            &minter.to_bytes().into(),
+            &token.mint.to_bytes().into(),
+            &token.token_program.id().to_bytes().into(),
+        );
+    let transfer = create_spl_sweep_instruction(deposit, token, deposit_owner, minter);
+    Message::new_with_blockhash(
+        &[create_destination, transfer],
+        Some(minter),
+        &recent_blockhash,
+    )
+}
+
+/// Signs a single-deposit SPL sweep with the minter and deposit owner.
+/// Returns the signed transaction and its signers in signature order.
+pub async fn sign_spl_sweep_transaction<R: CanisterRuntime>(
+    runtime: &R,
+    deposit: &QueuedSplDeposit,
+    token: &SupportedSplToken,
+    recent_blockhash: Hash,
+) -> Result<(Transaction, Vec<Signer>), CreateTransferError> {
+    let master_key = lazy_get_schnorr_master_key(runtime).await;
+    let minter = minter_address(&master_key);
+    let deposit_owner = account_address(&master_key, &deposit.account);
+    let mut transaction = Transaction::new_unsigned(create_spl_sweep_message(
+        deposit,
+        token,
+        &deposit_owner,
+        &minter,
+        recent_blockhash,
+    ));
+    let signers: Vec<Signer> = transaction
+        .message
+        .signer_keys()
+        .iter()
+        .map(|key| {
+            if **key == minter {
+                Signer::Minter
+            } else if **key == deposit_owner {
+                Signer::Account(deposit.account)
+            } else {
+                panic!("BUG: unexpected SPL sweep signer {key}")
+            }
+        })
+        .collect();
+    sign_transaction(
+        &mut transaction,
+        signers.iter().map(Signer::derivation_path),
+        &runtime.signer(),
+    )
+    .await?;
+    Ok((transaction, signers))
 }
 
 /// Signs the transaction of a planned sweep with the deposit addresses it transfers from.

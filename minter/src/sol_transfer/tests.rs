@@ -37,6 +37,219 @@ fn transfer_amount_from_instruction(instruction: &solana_transaction::CompiledIn
     u64::from_le_bytes(instruction.data[4..12].try_into().unwrap())
 }
 
+mod spl_sweep_tests {
+    use super::*;
+    use crate::state::TokenProgram;
+    use solana_transaction::AccountMeta;
+
+    fn queued_spl_deposit(token_program: TokenProgram) -> (QueuedSplDeposit, SupportedSplToken) {
+        let account = Account {
+            owner: Principal::from_slice(&[5]),
+            subaccount: None,
+        };
+        let token = SupportedSplToken {
+            mint: Address::from([3; 32]),
+            token_program,
+            decimals: 6,
+            ledger_id: Principal::from_slice(&[4]),
+            minimum_deposit_amount: 100,
+            paused: false,
+        };
+        let deposit = QueuedSplDeposit {
+            account,
+            mint: token.mint,
+            address: spl_deposit_address(
+                &derive_address(&account),
+                &token.mint,
+                &token_program.id(),
+            ),
+            balance: 1_000_000,
+        };
+        (deposit, token)
+    }
+
+    #[tokio::test]
+    async fn should_sign_spl_sweep_with_minter_and_deposit_owner() {
+        setup();
+        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            let (deposit, token) = queued_spl_deposit(token_program);
+            let blockhash = Hash::new_from_array([0xBB; 32]);
+            let runtime = TestCanisterRuntime::new()
+                .add_signer(sign_as_minter())
+                .add_signer(sign_for(&deposit.account));
+
+            let (transaction, signers) =
+                sign_spl_sweep_transaction(&runtime, &deposit, &token, blockhash)
+                    .await
+                    .expect("signing should succeed");
+
+            assert_eq!(
+                signers,
+                vec![Signer::Minter, Signer::Account(deposit.account)]
+            );
+            assert_eq!(
+                transaction.signatures,
+                vec![minter_signature(), account_signature(&deposit.account)]
+            );
+            assert_eq!(
+                transaction.message,
+                create_spl_sweep_message(
+                    &deposit,
+                    &token,
+                    &derive_address(&deposit.account),
+                    &MINTER_ADDRESS,
+                    blockhash,
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_fail_when_spl_sweep_signing_is_rejected() {
+        setup();
+        for minter_fails in [true, false] {
+            let (deposit, token) = queued_spl_deposit(TokenProgram::Classic);
+            let error = SignCallError::CallFailed(
+                CallRejected::with_rejection(4, "signing service unavailable".to_string()).into(),
+            );
+            let runtime = if minter_fails {
+                TestCanisterRuntime::new().add_signer(sign_as_minter().expect([Err(error)]))
+            } else {
+                TestCanisterRuntime::new()
+                    .add_signer(sign_as_minter())
+                    .add_signer(sign_for(&deposit.account).expect([Err(error)]))
+            };
+
+            let result = sign_spl_sweep_transaction(
+                &runtime,
+                &deposit,
+                &token,
+                Hash::new_from_array([0xBB; 32]),
+            )
+            .await;
+
+            assert_matches!(result, Err(CreateTransferError::SigningFailed(_)));
+        }
+    }
+
+    #[test]
+    fn should_build_spl_sweep_message_with_minter_as_fee_payer() {
+        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            let owner = Address::from([1; 32]);
+            let minter = Address::from([2; 32]);
+            let token = SupportedSplToken {
+                mint: Address::from([3; 32]),
+                token_program,
+                decimals: 6,
+                ledger_id: Principal::from_slice(&[4]),
+                minimum_deposit_amount: 100,
+                paused: false,
+            };
+            let deposit = QueuedSplDeposit {
+                account: Account {
+                    owner: Principal::from_slice(&[5]),
+                    subaccount: None,
+                },
+                mint: token.mint,
+                address: spl_deposit_address(&owner, &token.mint, &token_program.id()),
+                balance: 1_000_000,
+            };
+            let blockhash = Hash::new_from_array([0xBB; 32]);
+
+            let message = create_spl_sweep_message(&deposit, &token, &owner, &minter, blockhash);
+
+            assert_eq!(message.account_keys[0], minter);
+            assert_eq!(message.signer_keys(), vec![&minter, &owner]);
+            assert_eq!(message.recent_blockhash, blockhash);
+            assert_eq!(message.instructions.len(), 2);
+
+            let create_destination =
+                spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(
+                    &minter.to_bytes().into(),
+                    &minter.to_bytes().into(),
+                    &token.mint.to_bytes().into(),
+                    &token_program.id().to_bytes().into(),
+                );
+            let transfer = create_spl_sweep_instruction(&deposit, &token, &owner, &minter);
+            for (compiled, instruction) in message
+                .instructions
+                .iter()
+                .zip([create_destination, transfer])
+            {
+                assert_eq!(
+                    message.account_keys[compiled.program_id_index as usize],
+                    instruction.program_id
+                );
+                assert_eq!(compiled.data, instruction.data);
+                assert_eq!(
+                    compiled
+                        .accounts
+                        .iter()
+                        .map(|index| message.account_keys[*index as usize])
+                        .collect::<Vec<_>>(),
+                    instruction
+                        .accounts
+                        .iter()
+                        .map(|account| account.pubkey)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_build_checked_spl_sweep_transfer() {
+        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            let owner = Address::from([1; 32]);
+            let minter = Address::from([2; 32]);
+            let mint = Address::from([3; 32]);
+            let token = SupportedSplToken {
+                mint,
+                token_program,
+                decimals: 6,
+                ledger_id: Principal::from_slice(&[4]),
+                minimum_deposit_amount: 100,
+                paused: false,
+            };
+            let source = spl_deposit_address(&owner, &mint, &token_program.id());
+            let destination = spl_deposit_address(&minter, &mint, &token_program.id());
+            for balance in [100, 1_000_000, u64::MAX] {
+                let deposit = QueuedSplDeposit {
+                    account: Account {
+                        owner: Principal::from_slice(&[5]),
+                        subaccount: None,
+                    },
+                    mint,
+                    address: source,
+                    balance,
+                };
+                let instruction = create_spl_sweep_instruction(&deposit, &token, &owner, &minter);
+
+                assert_eq!(instruction.program_id, token_program.id());
+                assert_eq!(
+                    instruction.accounts,
+                    vec![
+                        AccountMeta::new(source, false),
+                        AccountMeta::new_readonly(mint, false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new_readonly(owner, true),
+                    ]
+                );
+                assert_matches!(
+                    spl_token_2022_interface::instruction::TokenInstruction::unpack(
+                        &instruction.data
+                    )
+                    .unwrap(),
+                    spl_token_2022_interface::instruction::TokenInstruction::TransferChecked {
+                        amount,
+                        decimals: 6,
+                    } if amount == balance
+                );
+            }
+        }
+    }
+}
+
 mod sweep_tests {
     use super::*;
     use crate::test_fixtures::{planned_sweep, queued_deposit_of};
