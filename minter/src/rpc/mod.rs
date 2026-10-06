@@ -1,7 +1,7 @@
 use crate::{
     constants::{
         GET_BALANCE_CYCLES, GET_RECENT_BLOCK_MAX_TRIES, GET_SIGNATURE_STATUSES_CYCLES,
-        GET_TRANSACTION_CYCLES, MAX_HTTP_OUTCALL_RESPONSE_BYTES,
+        GET_SPL_TOKEN_BALANCE_CYCLES, GET_TRANSACTION_CYCLES, MAX_HTTP_OUTCALL_RESPONSE_BYTES,
     },
     runtime::CanisterRuntime,
     state::read_state,
@@ -11,13 +11,24 @@ use derive_more::From;
 use ic_canister_runtime::IcError;
 use minicbor::{Decode, Encode};
 use sol_rpc_types::{
-    CommitmentLevel, GetTransactionEncoding, Lamport, MultiRpcResult, RpcError, Slot,
+    CommitmentLevel, GetAccountInfoEncoding, GetAccountInfoParams, GetTransactionEncoding, Lamport,
+    MultiRpcResult, RpcError, Slot,
 };
+use solana_account_decoder_client_types::UiAccount;
 use solana_address::Address;
 use solana_hash::Hash;
+use solana_program_pack::Pack;
 use solana_signature::Signature;
 use solana_transaction::Transaction;
 use solana_transaction_status_client_types::EncodedConfirmedTransactionWithStatusMeta;
+use spl_token_2022_interface::{
+    extension::{
+        BaseStateWithExtensions, ExtensionType, StateWithExtensions,
+        immutable_owner::ImmutableOwner, memo_transfer::MemoTransfer,
+    },
+    state::Account as Token2022Account,
+};
+use spl_token_interface::state::Account as TokenAccount;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -53,6 +64,34 @@ pub enum GetTransactionError {
     InconsistentRpcResults,
 }
 
+#[derive(Debug, PartialEq, Error, From)]
+pub enum GetBalanceError {
+    #[error("Error while calling SOL RPC canister: {0}")]
+    IcError(IcError),
+    #[error("RPC error while fetching balance: {0}")]
+    RpcError(RpcError),
+    #[error("Inconsistent RPC results for balance")]
+    InconsistentRpcResults,
+}
+
+impl From<GetBalanceError> for DepositSolError {
+    fn from(error: GetBalanceError) -> Self {
+        DepositSolError::TemporarilyUnavailable(error.to_string())
+    }
+}
+
+#[derive(Debug, PartialEq, Error, From)]
+pub enum GetSplTokenBalanceError {
+    #[error("Error while calling SOL RPC canister: {0}")]
+    IcError(IcError),
+    #[error("RPC error while fetching SPL token balance: {0}")]
+    RpcError(RpcError),
+    #[error("Inconsistent RPC results for SPL token balance")]
+    InconsistentRpcResults,
+    #[error("Invalid SPL token account: {0}")]
+    InvalidTokenAccount(String),
+}
+
 pub async fn get_balance<R: CanisterRuntime>(
     runtime: &R,
     address: Address,
@@ -70,19 +109,117 @@ pub async fn get_balance<R: CanisterRuntime>(
     }
 }
 
-#[derive(Debug, PartialEq, Error, From)]
-pub enum GetBalanceError {
-    #[error("Error while calling SOL RPC canister: {0}")]
-    IcError(IcError),
-    #[error("RPC error while fetching balance: {0}")]
-    RpcError(RpcError),
-    #[error("Inconsistent RPC results for balance")]
-    InconsistentRpcResults,
+/// Reads the finalized amount in a token account, in the mint's smallest units.
+/// A missing account has a zero balance. Existing accounts must match the expected
+/// token program, mint, and token-account owner, and must not be frozen.
+pub async fn get_spl_token_balance<R: CanisterRuntime>(
+    runtime: &R,
+    address: Address,
+    owner: Address,
+    mint: Address,
+    token_program: Address,
+) -> Result<u64, GetSplTokenBalanceError> {
+    let is_token_2022 = token_program.to_bytes() == spl_token_2022_interface::id().to_bytes();
+    if !is_token_2022 && token_program.to_bytes() != spl_token_interface::id().to_bytes() {
+        return Err(GetSplTokenBalanceError::InvalidTokenAccount(
+            "Unsupported token program".to_string(),
+        ));
+    }
+    let Some(account) = get_token_account(runtime, address).await? else {
+        return Ok(0);
+    };
+    if account.executable || account.owner != token_program.to_string() {
+        return Err(GetSplTokenBalanceError::InvalidTokenAccount(
+            "Token account must be non-executable and owned by the expected token program"
+                .to_string(),
+        ));
+    }
+    let data = account.data.decode().ok_or_else(|| {
+        GetSplTokenBalanceError::InvalidTokenAccount("Cannot decode token account data".to_string())
+    })?;
+    let account = if is_token_2022 {
+        parse_token_2022_account(&data)?
+    } else {
+        let account = TokenAccount::unpack(&data)
+            .map_err(|error| GetSplTokenBalanceError::InvalidTokenAccount(error.to_string()))?;
+        ParsedTokenAccount {
+            owner: account.owner.to_bytes().into(),
+            mint: account.mint.to_bytes().into(),
+            amount: account.amount,
+            frozen: account.is_frozen(),
+        }
+    };
+    if account.owner != owner || account.mint != mint {
+        return Err(GetSplTokenBalanceError::InvalidTokenAccount(
+            "Token account mint or owner does not match the expected deposit".to_string(),
+        ));
+    }
+    if account.frozen {
+        return Err(GetSplTokenBalanceError::InvalidTokenAccount(
+            "Token account is frozen".to_string(),
+        ));
+    }
+    Ok(account.amount)
 }
 
-impl From<GetBalanceError> for DepositSolError {
-    fn from(error: GetBalanceError) -> Self {
-        DepositSolError::TemporarilyUnavailable(error.to_string())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParsedTokenAccount {
+    owner: Address,
+    mint: Address,
+    /// The amount in the mint's smallest units.
+    amount: u64,
+    frozen: bool,
+}
+
+fn parse_token_2022_account(data: &[u8]) -> Result<ParsedTokenAccount, GetSplTokenBalanceError> {
+    let account = StateWithExtensions::<Token2022Account>::unpack(data)
+        .map_err(|error| GetSplTokenBalanceError::InvalidTokenAccount(error.to_string()))?;
+    for extension in account
+        .get_extension_types()
+        .map_err(|error| GetSplTokenBalanceError::InvalidTokenAccount(error.to_string()))?
+    {
+        match extension {
+            ExtensionType::ImmutableOwner => {
+                account.get_extension::<ImmutableOwner>().map_err(|error| {
+                    GetSplTokenBalanceError::InvalidTokenAccount(error.to_string())
+                })?;
+            }
+            ExtensionType::MemoTransfer => {
+                account.get_extension::<MemoTransfer>().map_err(|error| {
+                    GetSplTokenBalanceError::InvalidTokenAccount(error.to_string())
+                })?;
+            }
+            _ => {
+                return Err(GetSplTokenBalanceError::InvalidTokenAccount(
+                    "Unsupported Token-2022 token account extension".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(ParsedTokenAccount {
+        owner: account.base.owner.to_bytes().into(),
+        mint: account.base.mint.to_bytes().into(),
+        amount: account.base.amount,
+        frozen: account.base.is_frozen(),
+    })
+}
+
+async fn get_token_account<R: CanisterRuntime>(
+    runtime: &R,
+    address: Address,
+) -> Result<Option<UiAccount>, GetSplTokenBalanceError> {
+    let result = read_state(|state| state.sol_rpc_client(runtime.inter_canister_call_runtime()))
+        .get_account_info(GetAccountInfoParams::from_pubkey(address))
+        .with_encoding(GetAccountInfoEncoding::Base64)
+        .with_commitment(CommitmentLevel::Finalized)
+        .with_response_size_estimate(2_048)
+        .with_cycles(GET_SPL_TOKEN_BALANCE_CYCLES)
+        .try_send()
+        .await;
+    match result? {
+        MultiRpcResult::Consistent(Ok(account)) => Ok(account),
+        MultiRpcResult::Consistent(Err(error)) => Err(GetSplTokenBalanceError::RpcError(error)),
+        MultiRpcResult::Inconsistent(_) => Err(GetSplTokenBalanceError::InconsistentRpcResults),
     }
 }
 

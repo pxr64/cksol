@@ -312,3 +312,290 @@ mod get_recent_block_tests {
         solana_hash::Hash::from([0x42; 32]).into()
     }
 }
+
+mod get_spl_token_balance_tests {
+    use super::*;
+    use crate::rpc::{GetSplTokenBalanceError, get_spl_token_balance};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use sol_rpc_types::{AccountData, AccountEncoding, AccountInfo};
+    use solana_address::Address;
+    use solana_program_pack::Pack;
+    use spl_token_2022_interface::{
+        extension::{
+            BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+            immutable_owner::ImmutableOwner, memo_transfer::MemoTransfer,
+            transfer_fee::TransferFeeAmount,
+        },
+        state::Account as Token2022Account,
+    };
+    use spl_token_interface::state::{Account as TokenAccount, AccountState};
+
+    type MultiRpcResult = sol_rpc_types::MultiRpcResult<Option<AccountInfo>>;
+
+    fn owner() -> Address {
+        [1; 32].into()
+    }
+
+    fn mint() -> Address {
+        [2; 32].into()
+    }
+
+    fn token_program() -> Address {
+        spl_token_interface::id().to_bytes().into()
+    }
+
+    fn token_2022_program() -> Address {
+        spl_token_2022_interface::id().to_bytes().into()
+    }
+
+    fn token_account(amount: u64) -> TokenAccount {
+        TokenAccount {
+            mint: mint().to_bytes().into(),
+            owner: owner().to_bytes().into(),
+            amount,
+            state: AccountState::Initialized,
+            ..TokenAccount::default()
+        }
+    }
+
+    fn account_info(data: &[u8], program: Address) -> AccountInfo {
+        AccountInfo {
+            lamports: 2_000_000,
+            data: AccountData::Binary(STANDARD.encode(data), AccountEncoding::Base64),
+            owner: program.to_string(),
+            executable: false,
+            rent_epoch: 0,
+            space: data.len() as u64,
+        }
+    }
+
+    fn packed_account(account: TokenAccount, program: Address) -> AccountInfo {
+        let mut data = vec![0; TokenAccount::LEN];
+        TokenAccount::pack(account, &mut data).unwrap();
+        account_info(&data, program)
+    }
+
+    fn account_with_extensions(extensions: &[ExtensionType], memo_required: bool) -> AccountInfo {
+        let mut data = vec![
+            0;
+            ExtensionType::try_calculate_account_len::<Token2022Account>(extensions)
+                .unwrap()
+        ];
+        let mut account =
+            StateWithExtensionsMut::<Token2022Account>::unpack_uninitialized(&mut data).unwrap();
+        for extension in extensions {
+            match extension {
+                ExtensionType::ImmutableOwner => {
+                    account.init_extension::<ImmutableOwner>(false).unwrap();
+                }
+                ExtensionType::MemoTransfer => {
+                    account
+                        .init_extension::<MemoTransfer>(false)
+                        .unwrap()
+                        .require_incoming_transfer_memos = memo_required.into();
+                }
+                ExtensionType::TransferFeeAmount => {
+                    account.init_extension::<TransferFeeAmount>(false).unwrap();
+                }
+                _ => panic!("unsupported test extension"),
+            }
+        }
+        account.base = Token2022Account {
+            mint: mint().to_bytes().into(),
+            owner: owner().to_bytes().into(),
+            amount: 42,
+            state: spl_token_2022_interface::state::AccountState::Initialized,
+            ..Token2022Account::default()
+        };
+        account.pack_base();
+        account.init_account_type().unwrap();
+        account_info(&data, token_2022_program())
+    }
+
+    async fn balance(
+        runtime: &TestCanisterRuntime,
+        program: Address,
+    ) -> Result<u64, GetSplTokenBalanceError> {
+        get_spl_token_balance(runtime, DEPOSIT_ADDRESS, owner(), mint(), program).await
+    }
+
+    #[tokio::test]
+    async fn should_return_raw_balance_for_both_token_programs() {
+        init_state();
+        for program in [token_program(), token_2022_program()] {
+            for amount in [0, 42, u64::MAX] {
+                let account = packed_account(token_account(amount), program);
+                let runtime = TestCanisterRuntime::new()
+                    .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
+
+                let result = balance(&runtime, program).await;
+
+                assert_eq!(result, Ok(amount));
+                assert_eq!(runtime.sent_update_calls()[0].method, "getAccountInfo");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn should_return_balance_from_token_2022_associated_account() {
+        init_state();
+        let account = account_with_extensions(&[ExtensionType::ImmutableOwner], false);
+        let runtime = TestCanisterRuntime::new()
+            .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
+
+        let result = balance(&runtime, token_2022_program()).await;
+
+        assert_eq!(result, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn should_return_balance_from_memo_transfer_account() {
+        init_state();
+        for memo_required in [false, true] {
+            for extensions in [
+                vec![ExtensionType::MemoTransfer],
+                vec![ExtensionType::ImmutableOwner, ExtensionType::MemoTransfer],
+            ] {
+                let account = account_with_extensions(&extensions, memo_required);
+                let runtime = TestCanisterRuntime::new()
+                    .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
+
+                let result = balance(&runtime, token_2022_program()).await;
+
+                assert_eq!(result, Ok(42));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn should_return_zero_if_account_does_not_exist() {
+        init_state();
+        for program in [token_program(), token_2022_program()] {
+            let runtime =
+                TestCanisterRuntime::new().add_stub_response(MultiRpcResult::Consistent(Ok(None)));
+
+            let result = balance(&runtime, program).await;
+
+            assert_eq!(result, Ok(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn should_fail_if_call_fails_or_results_are_wrong() {
+        init_state();
+        let rpc_error = RpcError::ValidationError("Error 1".to_string());
+        for (runtime, expected) in [
+            (
+                TestCanisterRuntime::new().add_stub_error(IcError::CallPerformFailed),
+                GetSplTokenBalanceError::IcError(IcError::CallPerformFailed),
+            ),
+            (
+                TestCanisterRuntime::new()
+                    .add_stub_response(MultiRpcResult::Consistent(Err(rpc_error.clone()))),
+                GetSplTokenBalanceError::RpcError(rpc_error),
+            ),
+            (
+                TestCanisterRuntime::new().add_stub_response(MultiRpcResult::Inconsistent(vec![])),
+                GetSplTokenBalanceError::InconsistentRpcResults,
+            ),
+        ] {
+            let result = balance(&runtime, token_program()).await;
+
+            assert_eq!(result, Err(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn should_reject_wrong_program_owner_mint_and_frozen_accounts() {
+        init_state();
+        for program in [token_program(), token_2022_program()] {
+            let mut executable = packed_account(token_account(42), program);
+            executable.executable = true;
+            let cases = [
+                packed_account(token_account(42), Address::default()),
+                executable,
+                packed_account(
+                    TokenAccount {
+                        owner: [3; 32].into(),
+                        ..token_account(42)
+                    },
+                    program,
+                ),
+                packed_account(
+                    TokenAccount {
+                        mint: [3; 32].into(),
+                        ..token_account(42)
+                    },
+                    program,
+                ),
+                packed_account(
+                    TokenAccount {
+                        state: AccountState::Frozen,
+                        ..token_account(42)
+                    },
+                    program,
+                ),
+            ];
+            for account in cases {
+                let runtime = TestCanisterRuntime::new()
+                    .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
+
+                let result = balance(&runtime, program).await;
+
+                assert_matches!(result, Err(GetSplTokenBalanceError::InvalidTokenAccount(_)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn should_reject_invalid_or_uninitialized_account_data() {
+        init_state();
+        for program in [token_program(), token_2022_program()] {
+            let mut invalid_encoding = packed_account(token_account(42), program);
+            invalid_encoding.data =
+                AccountData::Binary("invalid base64".to_string(), AccountEncoding::Base64);
+            let cases = [
+                invalid_encoding,
+                account_info(&[], program),
+                account_info(&[0; 82], program),
+                packed_account(TokenAccount::default(), program),
+            ];
+            for account in cases {
+                let runtime = TestCanisterRuntime::new()
+                    .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
+
+                let result = balance(&runtime, program).await;
+
+                assert_matches!(result, Err(GetSplTokenBalanceError::InvalidTokenAccount(_)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn should_reject_other_token_2022_account_extensions() {
+        init_state();
+        let account = account_with_extensions(&[ExtensionType::TransferFeeAmount], false);
+        let runtime = TestCanisterRuntime::new()
+            .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
+
+        let result = balance(&runtime, token_2022_program()).await;
+
+        assert_eq!(
+            result,
+            Err(GetSplTokenBalanceError::InvalidTokenAccount(
+                "Unsupported Token-2022 token account extension".to_string(),
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_unsupported_program_without_rpc_call() {
+        init_state();
+        let runtime = TestCanisterRuntime::new();
+
+        let result = balance(&runtime, Address::default()).await;
+
+        assert_matches!(result, Err(GetSplTokenBalanceError::InvalidTokenAccount(_)));
+        assert!(runtime.sent_update_calls().is_empty());
+    }
+}
