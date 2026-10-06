@@ -61,7 +61,7 @@ pub struct InitArgs {
     #[cfg_attr(feature = "event", n(9))]
     pub deposit_consolidation_fee: u64,
     /// The only principal allowed to register SPL tokens. If absent, registration is disabled.
-    #[cfg_attr(feature = "event", n(10), cbor(with = "icrc_cbor::principal::option"))]
+    #[cfg_attr(feature = "event", n(11), cbor(with = "icrc_cbor::principal::option"))]
     pub ledger_suite_orchestrator_id: Option<Principal>,
 }
 
@@ -92,7 +92,7 @@ pub struct UpgradeArgs {
     pub deposit_consolidation_fee: Option<u64>,
     /// Sets or replaces the principal allowed to register SPL tokens.
     /// If absent, the existing configuration is preserved.
-    #[cfg_attr(feature = "event", n(7), cbor(with = "icrc_cbor::principal::option"))]
+    #[cfg_attr(feature = "event", n(8), cbor(with = "icrc_cbor::principal::option"))]
     pub ledger_suite_orchestrator_id: Option<Principal>,
 }
 

@@ -1,29 +1,6 @@
 #[cfg(test)]
 mod tests;
 
-pub mod rpc_address {
-    use cksol_types::Address;
-    use minicbor::{
-        decode::{Decoder, Error},
-        encode::{Encoder, Write},
-    };
-
-    pub fn decode<Ctx>(d: &mut Decoder<'_>, _ctx: &mut Ctx) -> Result<Address, Error> {
-        solana_address::Address::try_from(d.bytes()?)
-            .map(Into::into)
-            .map_err(|e| Error::message(e.to_string()))
-    }
-
-    pub fn encode<Ctx, W: Write>(
-        v: &Address,
-        e: &mut Encoder<W>,
-        _ctx: &mut Ctx,
-    ) -> Result<(), minicbor::encode::Error<W::Error>> {
-        e.bytes(v.as_ref())?;
-        Ok(())
-    }
-}
-
 pub mod id {
     use minicbor::{
         Decode, Encode,

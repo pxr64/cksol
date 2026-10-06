@@ -10,7 +10,7 @@ use assert_matches::assert_matches;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use cksol_types::DepositSplError;
 use ic_stable_structures::Storable;
-use sol_rpc_types::{AccountData, AccountEncoding, AccountInfo};
+use sol_rpc_types::{AccountData, AccountEncoding, AccountInfo, MultiRpcResult};
 use spl_token_2022_interface::extension::{
     BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
     mint_close_authority::MintCloseAuthority,
@@ -21,7 +21,7 @@ fn args() -> AddSplTokenArgs {
         mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
             .parse()
             .unwrap(),
-        token_program: CLASSIC_TOKEN_PROGRAM.parse().unwrap(),
+        token_program: TokenProgram::Classic.id().into(),
         decimals: 6,
         ledger_id: Principal::from_slice(&[42, 1]),
         minimum_deposit_amount: 1_000_000,
@@ -40,7 +40,7 @@ fn mint_account(data: &[u8]) -> AccountInfo {
     AccountInfo {
         lamports: 1_461_600,
         data: AccountData::Binary(STANDARD.encode(data), AccountEncoding::Base64),
-        owner: CLASSIC_TOKEN_PROGRAM.to_string(),
+        owner: TokenProgram::Classic.id().to_string(),
         executable: false,
         rent_epoch: 0,
         space: data.len() as u64,
@@ -59,21 +59,21 @@ fn with_mint(runtime: TestCanisterRuntime, account: Option<AccountInfo>) -> Test
 
 fn assert_not_registered(mint: &cksol_types::Address) {
     assert!(read_state(|state| state
-        .supported_spl_token(mint)
+        .supported_spl_token(&mint.clone().into())
         .is_none()));
     assert_eq!(total_event_count(), 1); // Init only.
 }
 
 fn token_2022_args() -> AddSplTokenArgs {
     AddSplTokenArgs {
-        token_program: TOKEN_2022_PROGRAM.parse().unwrap(),
+        token_program: TokenProgram::Token2022.id().into(),
         ..args()
     }
 }
 
 fn token_2022_mint_account(data: &[u8]) -> AccountInfo {
     AccountInfo {
-        owner: TOKEN_2022_PROGRAM.to_string(),
+        owner: TokenProgram::Token2022.id().to_string(),
         ..mint_account(data)
     }
 }
@@ -84,8 +84,10 @@ async fn should_register_and_replay_the_token_from_stable_events() {
     let args = args();
     assert_eq!(add_spl_token(&runtime, args.clone()).await, Ok(()));
     assert_eq!(
-        read_state(|state| state.supported_spl_token(&args.mint).cloned()),
-        Some(SupportedSplToken::from(args.clone()))
+        read_state(|state| state
+            .supported_spl_token(&args.mint.clone().into())
+            .cloned()),
+        Some(SupportedSplToken::try_from(args.clone()).unwrap())
     );
     let events = with_event_iter(|events| {
         events
@@ -93,7 +95,7 @@ async fn should_register_and_replay_the_token_from_stable_events() {
             .collect::<Vec<_>>()
     });
     assert_eq!(events.len(), 2);
-    assert_matches!(&events[1].payload, EventType::AddedSplToken(token) if token.mint == args.mint);
+    assert_matches!(&events[1].payload, EventType::AddedSplToken(token) if cksol_types::Address::from(token.mint) == args.mint);
     let replayed = replay_events(events);
     read_state(|state| assert_eq!(state, &replayed));
     assert_eq!(runtime.sent_update_calls().len(), 1);
@@ -189,8 +191,10 @@ async fn should_reject_duplicate_mint_and_ledger_without_overwriting_config() {
     assert_eq!(runtime.sent_update_calls().len(), 1);
     assert_eq!(total_event_count(), 2);
     assert_eq!(
-        read_state(|state| state.supported_spl_token(&original.mint).cloned()),
-        Some(SupportedSplToken::from(original))
+        read_state(|state| state
+            .supported_spl_token(&original.mint.clone().into())
+            .cloned()),
+        Some(SupportedSplToken::try_from(original).unwrap())
     );
 }
 
@@ -266,8 +270,10 @@ async fn should_register_and_replay_token_2022_without_extensions() {
     assert_eq!(add_spl_token(&runtime, args.clone()).await, Ok(()));
 
     assert_eq!(
-        read_state(|state| state.supported_spl_token(&args.mint).cloned()),
-        Some(SupportedSplToken::from(args))
+        read_state(|state| state
+            .supported_spl_token(&args.mint.clone().into())
+            .cloned()),
+        Some(SupportedSplToken::try_from(args).unwrap())
     );
     let replayed = with_event_iter(|events| replay_events(events));
     read_state(|state| assert_eq!(state, &replayed));

@@ -38,6 +38,28 @@ mod spl_orchestrator_configuration {
     use super::*;
 
     #[test]
+    fn should_reject_orchestrator_equal_to_another_canister_on_init_and_upgrade() {
+        let args = valid_init_args();
+        for id in [args.sol_rpc_canister_id, args.ledger_canister_id] {
+            assert_matches!(
+                State::try_from(InitArgs {
+                    ledger_suite_orchestrator_id: Some(id),
+                    ..valid_init_args()
+                }),
+                Err(InvalidStateError::InvalidCanisterId(_))
+            );
+            let mut state = State::try_from(valid_init_args()).unwrap();
+            assert_matches!(
+                state.upgrade(UpgradeArgs {
+                    ledger_suite_orchestrator_id: Some(id),
+                    ..UpgradeArgs::default()
+                }),
+                Err(InvalidStateError::InvalidCanisterId(_))
+            );
+        }
+    }
+
+    #[test]
     fn should_reject_anonymous_and_management_orchestrators_on_init_and_upgrade() {
         for id in [Principal::anonymous(), Principal::management_canister()] {
             assert_matches!(

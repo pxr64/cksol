@@ -1,7 +1,8 @@
 use crate::state::{SupportedSplToken, read_state};
 use candid::Principal;
-use cksol_types::{Address, DepositSplError};
+use cksol_types::DepositSplError;
 use icrc_ledger_types::icrc1::account::Account;
+use solana_address::Address;
 
 pub mod insertion_ordered_map;
 
@@ -37,11 +38,16 @@ pub fn assert_valid_deposit_owner(account: &Account, minter_id: Principal) {
 
 pub fn assert_valid_deposit_token(mint: &Address) -> Result<SupportedSplToken, DepositSplError> {
     read_state(|state| {
-        let token = state
-            .supported_spl_token(mint)
-            .ok_or_else(|| DepositSplError::UnsupportedToken { mint: mint.clone() })?;
+        let token =
+            state
+                .supported_spl_token(mint)
+                .ok_or_else(|| DepositSplError::UnsupportedToken {
+                    mint: (*mint).into(),
+                })?;
         if token.paused {
-            return Err(DepositSplError::TokenPaused { mint: mint.clone() });
+            return Err(DepositSplError::TokenPaused {
+                mint: (*mint).into(),
+            });
         }
         Ok(token.clone())
     })

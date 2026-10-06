@@ -50,9 +50,6 @@ pub struct Event {
 
 #[derive(Clone, Eq, PartialEq, Debug, Decode, Encode)]
 pub enum EventType {
-    /// A validated SPL token was registered with its IC ledger.
-    #[n(13)]
-    AddedSplToken(#[n(0)] crate::state::SupportedSplToken),
     /// The minter initialization event.
     /// Must be the first event in the log.
     #[n(0)]
@@ -189,6 +186,10 @@ pub enum EventType {
         #[n(0)]
         deposit_id: DepositSolId,
     },
+    /// A validated SPL token was registered with its IC ledger.
+    /// Index 14 is reserved for the `MinterPublicKeyFetched` event of main.
+    #[n(15)]
+    AddedSplToken(#[n(0)] crate::state::SupportedSplToken),
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

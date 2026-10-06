@@ -43,8 +43,8 @@ pub const GET_TRANSACTION_CYCLES: u128 = 50_000_000_000;
 /// unused part is refunded and never charged to the caller of `deposit_sol`.
 pub const GET_BALANCE_CYCLES: u128 = 10_000_000_000;
 
-/// Cycles to attach for the `getAccountInfo` call reading an SPL token balance.
-pub const GET_SPL_TOKEN_BALANCE_CYCLES: u128 = 10_000_000_000;
+/// Cycles to attach for a `getAccountInfo` call, which reads a token account or a mint account.
+pub const GET_ACCOUNT_INFO_CYCLES: u128 = 10_000_000_000;
 
 /// Cycles to attach for `getSignatureStatuses` RPC calls.
 pub const GET_SIGNATURE_STATUSES_CYCLES: u128 = 1_000_000_000_000;

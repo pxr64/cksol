@@ -39,15 +39,9 @@ pub fn account_address(master_key: &SchnorrPublicKey, account: &Account) -> Addr
         .into()
 }
 
-/// The associated token account for an IC account's derived Solana deposit owner.
+/// The associated token account of a derived deposit owner, see [`account_address`].
 /// Deriving the address does not create the token account on Solana.
-pub fn spl_deposit_address(
-    master_key: &SchnorrPublicKey,
-    account: &Account,
-    mint: &Address,
-    token_program: &Address,
-) -> Address {
-    let owner = account_address(master_key, account);
+pub fn spl_deposit_address(owner: &Address, mint: &Address, token_program: &Address) -> Address {
     get_associated_token_address_with_program_id(
         &owner.to_bytes().into(),
         &mint.to_bytes().into(),

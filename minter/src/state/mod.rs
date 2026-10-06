@@ -34,7 +34,7 @@ mod deposits;
 pub mod event;
 mod spl;
 
-pub use spl::SupportedSplToken;
+pub use spl::{SupportedSplToken, TokenProgram};
 
 pub use deposits::{
     DepositBalance, Deposits, MintedSweep, PendingMint, QueuedDeposit, SettledSweep, Sweep,
@@ -106,10 +106,10 @@ pub struct State {
     deposit_sol_required_cycles: u128,
     deposit_consolidation_fee: u128,
     pending_deposit_sol_request_guards: BTreeSet<Account>,
-    pending_deposit_spl_request_guards: BTreeSet<(Account, cksol_types::Address)>,
+    pending_deposit_spl_request_guards: BTreeSet<(Account, Address)>,
     pending_withdrawal_request_guards: BTreeSet<Account>,
     deposits: Deposits,
-    supported_spl_tokens: BTreeMap<cksol_types::Address, SupportedSplToken>,
+    supported_spl_tokens: BTreeMap<Address, SupportedSplToken>,
     pending_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingWithdrawalRequest>,
     sent_withdrawal_requests: BTreeMap<LedgerBurnIndex, SentWithdrawalRequest>,
     successful_withdrawal_requests: BTreeMap<LedgerBurnIndex, SentWithdrawalRequest>,
@@ -127,7 +127,7 @@ impl State {
         self.ledger_suite_orchestrator_id
     }
 
-    pub fn supported_spl_token(&self, mint: &cksol_types::Address) -> Option<&SupportedSplToken> {
+    pub fn supported_spl_token(&self, mint: &Address) -> Option<&SupportedSplToken> {
         self.supported_spl_tokens.get(mint)
     }
 
@@ -137,7 +137,7 @@ impl State {
     ) -> Result<(), AddSplTokenError> {
         if self.supported_spl_tokens.contains_key(&token.mint) {
             return Err(AddSplTokenError::AlreadySupported {
-                mint: token.mint.clone(),
+                mint: token.mint.into(),
             });
         }
         if token.ledger_id == self.ledger_canister_id
@@ -156,8 +156,7 @@ impl State {
     fn process_added_spl_token(&mut self, token: &SupportedSplToken) {
         self.validate_spl_token_registration(token)
             .expect("BUG: invalid SPL token registration event");
-        self.supported_spl_tokens
-            .insert(token.mint.clone(), token.clone());
+        self.supported_spl_tokens.insert(token.mint, token.clone());
     }
 
     pub fn minter_public_key(&self) -> Option<&SchnorrPublicKey> {
@@ -306,9 +305,7 @@ impl State {
         &mut self.pending_deposit_sol_request_guards
     }
 
-    pub fn pending_deposit_spl_request_guards_mut(
-        &mut self,
-    ) -> &mut BTreeSet<(Account, cksol_types::Address)> {
+    pub fn pending_deposit_spl_request_guards_mut(&mut self) -> &mut BTreeSet<(Account, Address)> {
         &mut self.pending_deposit_spl_request_guards
     }
 
@@ -328,15 +325,15 @@ impl State {
                 "ERROR: ledger suite orchestrator must be a non-anonymous, non-management principal".to_string(),
             ));
         }
-        let canister_ids: BTreeSet<_> = [self.sol_rpc_canister_id, self.ledger_canister_id]
-            .into_iter()
-            .collect();
-        if canister_ids.contains(&Principal::anonymous()) {
+        let mut canister_ids = vec![self.sol_rpc_canister_id, self.ledger_canister_id];
+        canister_ids.extend(self.ledger_suite_orchestrator_id);
+        let distinct_ids: BTreeSet<_> = canister_ids.iter().copied().collect();
+        if distinct_ids.contains(&Principal::anonymous()) {
             return Err(InvalidStateError::InvalidCanisterId(
                 "ERROR: anonymous principal is not accepted!".to_string(),
             ));
         }
-        if canister_ids.len() < 2 {
+        if distinct_ids.len() < canister_ids.len() {
             return Err(InvalidStateError::InvalidCanisterId(
                 "ERROR: provided canister IDs are not distinct!".to_string(),
             ));

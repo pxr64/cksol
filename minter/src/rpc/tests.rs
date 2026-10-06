@@ -316,6 +316,7 @@ mod get_recent_block_tests {
 mod get_spl_token_balance_tests {
     use super::*;
     use crate::rpc::{GetSplTokenBalanceError, get_spl_token_balance};
+    use crate::state::TokenProgram;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use sol_rpc_types::{AccountData, AccountEncoding, AccountInfo};
     use solana_address::Address;
@@ -338,14 +339,6 @@ mod get_spl_token_balance_tests {
 
     fn mint() -> Address {
         [2; 32].into()
-    }
-
-    fn token_program() -> Address {
-        spl_token_interface::id().to_bytes().into()
-    }
-
-    fn token_2022_program() -> Address {
-        spl_token_2022_interface::id().to_bytes().into()
     }
 
     fn token_account(amount: u64) -> TokenAccount {
@@ -409,12 +402,12 @@ mod get_spl_token_balance_tests {
         };
         account.pack_base();
         account.init_account_type().unwrap();
-        account_info(&data, token_2022_program())
+        account_info(&data, TokenProgram::Token2022.id())
     }
 
     async fn balance(
         runtime: &TestCanisterRuntime,
-        program: Address,
+        program: TokenProgram,
     ) -> Result<u64, GetSplTokenBalanceError> {
         get_spl_token_balance(runtime, DEPOSIT_ADDRESS, owner(), mint(), program).await
     }
@@ -422,9 +415,9 @@ mod get_spl_token_balance_tests {
     #[tokio::test]
     async fn should_return_raw_balance_for_both_token_programs() {
         init_state();
-        for program in [token_program(), token_2022_program()] {
+        for program in [TokenProgram::Classic, TokenProgram::Token2022] {
             for amount in [0, 42, u64::MAX] {
-                let account = packed_account(token_account(amount), program);
+                let account = packed_account(token_account(amount), program.id());
                 let runtime = TestCanisterRuntime::new()
                     .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
 
@@ -443,7 +436,7 @@ mod get_spl_token_balance_tests {
         let runtime = TestCanisterRuntime::new()
             .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
 
-        let result = balance(&runtime, token_2022_program()).await;
+        let result = balance(&runtime, TokenProgram::Token2022).await;
 
         assert_eq!(result, Ok(42));
     }
@@ -460,7 +453,7 @@ mod get_spl_token_balance_tests {
                 let runtime = TestCanisterRuntime::new()
                     .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
 
-                let result = balance(&runtime, token_2022_program()).await;
+                let result = balance(&runtime, TokenProgram::Token2022).await;
 
                 assert_eq!(result, Ok(42));
             }
@@ -470,7 +463,7 @@ mod get_spl_token_balance_tests {
     #[tokio::test]
     async fn should_return_zero_if_account_does_not_exist() {
         init_state();
-        for program in [token_program(), token_2022_program()] {
+        for program in [TokenProgram::Classic, TokenProgram::Token2022] {
             let runtime =
                 TestCanisterRuntime::new().add_stub_response(MultiRpcResult::Consistent(Ok(None)));
 
@@ -499,7 +492,7 @@ mod get_spl_token_balance_tests {
                 GetSplTokenBalanceError::InconsistentRpcResults,
             ),
         ] {
-            let result = balance(&runtime, token_program()).await;
+            let result = balance(&runtime, TokenProgram::Classic).await;
 
             assert_eq!(result, Err(expected));
         }
@@ -508,8 +501,8 @@ mod get_spl_token_balance_tests {
     #[tokio::test]
     async fn should_reject_wrong_program_owner_mint_and_frozen_accounts() {
         init_state();
-        for program in [token_program(), token_2022_program()] {
-            let mut executable = packed_account(token_account(42), program);
+        for program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            let mut executable = packed_account(token_account(42), program.id());
             executable.executable = true;
             let cases = [
                 packed_account(token_account(42), Address::default()),
@@ -519,21 +512,21 @@ mod get_spl_token_balance_tests {
                         owner: [3; 32].into(),
                         ..token_account(42)
                     },
-                    program,
+                    program.id(),
                 ),
                 packed_account(
                     TokenAccount {
                         mint: [3; 32].into(),
                         ..token_account(42)
                     },
-                    program,
+                    program.id(),
                 ),
                 packed_account(
                     TokenAccount {
                         state: AccountState::Frozen,
                         ..token_account(42)
                     },
-                    program,
+                    program.id(),
                 ),
             ];
             for account in cases {
@@ -550,15 +543,15 @@ mod get_spl_token_balance_tests {
     #[tokio::test]
     async fn should_reject_invalid_or_uninitialized_account_data() {
         init_state();
-        for program in [token_program(), token_2022_program()] {
-            let mut invalid_encoding = packed_account(token_account(42), program);
+        for program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            let mut invalid_encoding = packed_account(token_account(42), program.id());
             invalid_encoding.data =
                 AccountData::Binary("invalid base64".to_string(), AccountEncoding::Base64);
             let cases = [
                 invalid_encoding,
-                account_info(&[], program),
-                account_info(&[0; 82], program),
-                packed_account(TokenAccount::default(), program),
+                account_info(&[], program.id()),
+                account_info(&[0; 82], program.id()),
+                packed_account(TokenAccount::default(), program.id()),
             ];
             for account in cases {
                 let runtime = TestCanisterRuntime::new()
@@ -572,13 +565,40 @@ mod get_spl_token_balance_tests {
     }
 
     #[tokio::test]
+    async fn should_reject_allowed_extensions_with_invalid_payload_size() {
+        init_state();
+        for extension in [ExtensionType::ImmutableOwner, ExtensionType::MemoTransfer] {
+            let account = account_with_extensions(&[extension], false);
+            let AccountData::Binary(encoded, AccountEncoding::Base64) = account.data else {
+                panic!("expected a base64 test account");
+            };
+            let mut data = STANDARD.decode(encoded).unwrap();
+            // After the base account and account-type byte, each TLV entry has
+            // a two-byte type and a two-byte length. Enlarge this allowed entry
+            // by one byte while keeping the TLV buffer structurally readable.
+            let length_offset = Token2022Account::LEN + 1 + 2;
+            let length =
+                u16::from_le_bytes(data[length_offset..length_offset + 2].try_into().unwrap());
+            data[length_offset..length_offset + 2].copy_from_slice(&(length + 1).to_le_bytes());
+            data.push(0);
+            let account = account_info(&data, TokenProgram::Token2022.id());
+            let runtime = TestCanisterRuntime::new()
+                .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
+
+            let result = balance(&runtime, TokenProgram::Token2022).await;
+
+            assert_matches!(result, Err(GetSplTokenBalanceError::InvalidTokenAccount(_)));
+        }
+    }
+
+    #[tokio::test]
     async fn should_reject_other_token_2022_account_extensions() {
         init_state();
         let account = account_with_extensions(&[ExtensionType::TransferFeeAmount], false);
         let runtime = TestCanisterRuntime::new()
             .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
 
-        let result = balance(&runtime, token_2022_program()).await;
+        let result = balance(&runtime, TokenProgram::Token2022).await;
 
         assert_eq!(
             result,
@@ -586,16 +606,5 @@ mod get_spl_token_balance_tests {
                 "Unsupported Token-2022 token account extension".to_string(),
             ))
         );
-    }
-
-    #[tokio::test]
-    async fn should_reject_unsupported_program_without_rpc_call() {
-        init_state();
-        let runtime = TestCanisterRuntime::new();
-
-        let result = balance(&runtime, Address::default()).await;
-
-        assert_matches!(result, Err(GetSplTokenBalanceError::InvalidTokenAccount(_)));
-        assert!(runtime.sent_update_calls().is_empty());
     }
 }

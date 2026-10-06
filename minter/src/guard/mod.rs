@@ -1,6 +1,7 @@
 use crate::state::{State, TaskType, mutate_state};
-use cksol_types::{Address, DepositSolError, DepositSplError, WithdrawalError};
+use cksol_types::{DepositSolError, DepositSplError, WithdrawalError};
 use icrc_ledger_types::icrc1::account::Account;
+use solana_address::Address;
 use std::{collections::BTreeSet, marker::PhantomData};
 
 #[cfg(test)]

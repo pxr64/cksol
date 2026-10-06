@@ -1,10 +1,10 @@
 use crate::{
     constants::{
-        GET_BALANCE_CYCLES, GET_RECENT_BLOCK_MAX_TRIES, GET_SIGNATURE_STATUSES_CYCLES,
-        GET_SPL_TOKEN_BALANCE_CYCLES, GET_TRANSACTION_CYCLES, MAX_HTTP_OUTCALL_RESPONSE_BYTES,
+        GET_ACCOUNT_INFO_CYCLES, GET_BALANCE_CYCLES, GET_RECENT_BLOCK_MAX_TRIES,
+        GET_SIGNATURE_STATUSES_CYCLES, GET_TRANSACTION_CYCLES, MAX_HTTP_OUTCALL_RESPONSE_BYTES,
     },
     runtime::CanisterRuntime,
-    state::read_state,
+    state::{TokenProgram, read_state},
 };
 use cksol_types::{DepositSolError, DepositSplError};
 use derive_more::From;
@@ -92,9 +92,39 @@ pub enum GetSplTokenBalanceError {
     InvalidTokenAccount(String),
 }
 
+impl From<GetAccountInfoError> for GetSplTokenBalanceError {
+    fn from(error: GetAccountInfoError) -> Self {
+        match error {
+            GetAccountInfoError::IcError(error) => Self::IcError(error),
+            GetAccountInfoError::RpcError(error) => Self::RpcError(error),
+            GetAccountInfoError::InconsistentRpcResults => Self::InconsistentRpcResults,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Error, From)]
+pub enum GetAccountInfoError {
+    #[error("Error while calling SOL RPC canister: {0}")]
+    IcError(IcError),
+    #[error("RPC error while fetching account info: {0}")]
+    RpcError(RpcError),
+    #[error("Inconsistent RPC results for account info")]
+    InconsistentRpcResults,
+}
+
 impl From<GetSplTokenBalanceError> for DepositSplError {
     fn from(error: GetSplTokenBalanceError) -> Self {
-        DepositSplError::TemporarilyUnavailable(error.to_string())
+        match error {
+            // The account itself is the problem, so a retry fails the same way.
+            GetSplTokenBalanceError::InvalidTokenAccount(reason) => {
+                DepositSplError::InvalidTokenAccount(reason)
+            }
+            GetSplTokenBalanceError::IcError(_)
+            | GetSplTokenBalanceError::RpcError(_)
+            | GetSplTokenBalanceError::InconsistentRpcResults => {
+                DepositSplError::TemporarilyUnavailable(error.to_string())
+            }
+        }
     }
 }
 
@@ -115,44 +145,32 @@ pub async fn get_balance<R: CanisterRuntime>(
     }
 }
 
-/// Reads the finalized amount in a token account, in the mint's smallest units.
-/// A missing account has a zero balance. Existing accounts must match the expected
-/// token program, mint, and token-account owner, and must not be frozen.
+/// Reads the finalized amount of a token account in the mint's smallest units, where a
+/// missing account holds zero. The account must belong to the expected program, mint and
+/// owner, and must not be frozen.
 pub async fn get_spl_token_balance<R: CanisterRuntime>(
     runtime: &R,
     address: Address,
     owner: Address,
     mint: Address,
-    token_program: Address,
+    token_program: TokenProgram,
 ) -> Result<u64, GetSplTokenBalanceError> {
-    let is_token_2022 = token_program.to_bytes() == spl_token_2022_interface::id().to_bytes();
-    if !is_token_2022 && token_program.to_bytes() != spl_token_interface::id().to_bytes() {
-        return Err(GetSplTokenBalanceError::InvalidTokenAccount(
-            "Unsupported token program".to_string(),
-        ));
-    }
-    let Some(account) = get_token_account(runtime, address).await? else {
+    let Some(account) = get_account_info(runtime, address).await? else {
         return Ok(0);
     };
-    if account.executable || account.owner != token_program.to_string() {
-        return Err(GetSplTokenBalanceError::InvalidTokenAccount(
-            "Token account must be non-executable and owned by the expected token program"
-                .to_string(),
-        ));
-    }
-    let data = account.data.decode().ok_or_else(|| {
-        GetSplTokenBalanceError::InvalidTokenAccount("Cannot decode token account data".to_string())
-    })?;
-    let account = if is_token_2022 {
-        parse_token_2022_account(&data)?
-    } else {
-        let account = TokenAccount::unpack(&data)
-            .map_err(|error| GetSplTokenBalanceError::InvalidTokenAccount(error.to_string()))?;
-        ParsedTokenAccount {
-            owner: account.owner.to_bytes().into(),
-            mint: account.mint.to_bytes().into(),
-            amount: account.amount,
-            frozen: account.is_frozen(),
+    let data = decode_program_account(account, &token_program.id())
+        .map_err(GetSplTokenBalanceError::InvalidTokenAccount)?;
+    let account = match token_program {
+        TokenProgram::Token2022 => parse_token_2022_account(&data)?,
+        TokenProgram::Classic => {
+            let account = TokenAccount::unpack(&data)
+                .map_err(|error| GetSplTokenBalanceError::InvalidTokenAccount(error.to_string()))?;
+            ParsedTokenAccount {
+                owner: account.owner.to_bytes().into(),
+                mint: account.mint.to_bytes().into(),
+                amount: account.amount,
+                frozen: account.is_frozen(),
+            }
         }
     };
     if account.owner != owner || account.mint != mint {
@@ -210,23 +228,36 @@ fn parse_token_2022_account(data: &[u8]) -> Result<ParsedTokenAccount, GetSplTok
     })
 }
 
-async fn get_token_account<R: CanisterRuntime>(
+/// Reads the finalized state of an account. A missing account is `None`.
+pub async fn get_account_info<R: CanisterRuntime>(
     runtime: &R,
     address: Address,
-) -> Result<Option<UiAccount>, GetSplTokenBalanceError> {
+) -> Result<Option<UiAccount>, GetAccountInfoError> {
     let result = read_state(|state| state.sol_rpc_client(runtime.inter_canister_call_runtime()))
         .get_account_info(GetAccountInfoParams::from_pubkey(address))
         .with_encoding(GetAccountInfoEncoding::Base64)
         .with_commitment(CommitmentLevel::Finalized)
         .with_response_size_estimate(2_048)
-        .with_cycles(GET_SPL_TOKEN_BALANCE_CYCLES)
+        .with_cycles(GET_ACCOUNT_INFO_CYCLES)
         .try_send()
         .await;
     match result? {
         MultiRpcResult::Consistent(Ok(account)) => Ok(account),
-        MultiRpcResult::Consistent(Err(error)) => Err(GetSplTokenBalanceError::RpcError(error)),
-        MultiRpcResult::Inconsistent(_) => Err(GetSplTokenBalanceError::InconsistentRpcResults),
+        MultiRpcResult::Consistent(Err(error)) => Err(GetAccountInfoError::RpcError(error)),
+        MultiRpcResult::Inconsistent(_) => Err(GetAccountInfoError::InconsistentRpcResults),
     }
+}
+
+/// Returns the data of a non-executable account owned by the given program.
+/// The error carries the reason the account is rejected.
+pub fn decode_program_account(account: UiAccount, program: &Address) -> Result<Vec<u8>, String> {
+    if account.executable || account.owner != program.to_string() {
+        return Err("Account must be non-executable and owned by the expected program".to_string());
+    }
+    account
+        .data
+        .decode()
+        .ok_or_else(|| "Cannot decode account data".to_string())
 }
 
 pub async fn submit_transaction<R: CanisterRuntime>(

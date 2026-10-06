@@ -173,6 +173,9 @@ type DepositSplError = variant {
     UnsupportedToken: record { mint: Address };
     // Deposits for this supported token are paused.
     TokenPaused: record { mint: Address };
+    // The token account is frozen, has an unsupported extension, or does not match
+    // the mint or the owner. A retry fails the same way.
+    InvalidTokenAccount: text;
     TemporarilyUnavailable: text;
 };
 type DepositSplResult = variant { Ok: DepositSplId; Err: DepositSplError };
@@ -559,8 +562,8 @@ service : (MinterArg) -> {
     // Queueing is not implemented yet, so valid balances return TemporarilyUnavailable.
     deposit_spl: (DepositSplArgs) -> (DepositSplResult);
 
-    // Registers an SPL token and its existing IC ledger.
-    // Token-2022 mint extensions are not supported. Configured orchestrator only.
+    // Registers an SPL token and its IC ledger. Only the configured orchestrator can
+    // call it, and Token-2022 mints with extensions are rejected.
     add_spl_token: (AddSplTokenArgs) -> (AddSplTokenResult);
 
     // Returns the status of the deposit with the given identifier,

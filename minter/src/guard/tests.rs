@@ -86,10 +86,10 @@ mod guard {
 
 mod spl_guard {
     use super::*;
-    use cksol_types::Address;
+    use solana_address::Address;
 
     fn mint(id: u8) -> Address {
-        solana_address::Address::from([id; 32]).into()
+        [id; 32].into()
     }
 
     #[test]

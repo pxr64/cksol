@@ -169,6 +169,10 @@ fn test_key_result() -> SchnorrPublicKeyResult {
 mod spl_deposit_address_tests {
     use super::*;
 
+    fn owner(account: &Account) -> Address {
+        account_address(&test_key(), account)
+    }
+
     fn mint() -> Address {
         [2; 32].into()
     }
@@ -183,18 +187,17 @@ mod spl_deposit_address_tests {
 
     #[test]
     fn should_match_known_associated_token_addresses() {
-        let master_key = test_key();
         let account = account(1);
         // Fixed vectors for the derived owner ALA4bv2qnUr5H81zcZM3FnEzMeEvh4ErZU3nbqHnghFK,
         // mint [2; 32], and each token program. Checked independently against the PDA seeds.
         assert_eq!(
-            spl_deposit_address(&master_key, &account, &mint(), &token_program()),
+            spl_deposit_address(&owner(&account), &mint(), &token_program()),
             "EEpHwkSW9e3qA4mSAU9FHUpXev2exT7cofkumm4NYLe6"
                 .parse::<Address>()
                 .unwrap(),
         );
         assert_eq!(
-            spl_deposit_address(&master_key, &account, &mint(), &token_2022_program()),
+            spl_deposit_address(&owner(&account), &mint(), &token_2022_program()),
             "8hXgbo4LFeHBHZn26thexNAYbUkpHGxwo7a9CuG2x8Aq"
                 .parse::<Address>()
                 .unwrap(),
@@ -208,14 +211,14 @@ mod spl_deposit_address_tests {
             ..account(1)
         };
         assert_eq!(
-            spl_deposit_address(&test_key(), &account(1), &mint(), &token_program()),
-            spl_deposit_address(&test_key(), &explicit_zero, &mint(), &token_program()),
+            spl_deposit_address(&owner(&account(1)), &mint(), &token_program()),
+            spl_deposit_address(&owner(&explicit_zero), &mint(), &token_program()),
         );
     }
 
     #[test]
     fn should_derive_different_addresses_for_different_accounts() {
-        let first = spl_deposit_address(&test_key(), &account(1), &mint(), &token_program());
+        let first = spl_deposit_address(&owner(&account(1)), &mint(), &token_program());
         for other in [
             account(2),
             Account {
@@ -225,7 +228,7 @@ mod spl_deposit_address_tests {
         ] {
             assert_ne!(
                 first,
-                spl_deposit_address(&test_key(), &other, &mint(), &token_program())
+                spl_deposit_address(&owner(&other), &mint(), &token_program())
             );
         }
     }
@@ -233,16 +236,16 @@ mod spl_deposit_address_tests {
     #[test]
     fn should_derive_different_addresses_for_different_mints() {
         assert_ne!(
-            spl_deposit_address(&test_key(), &account(1), &mint(), &token_program()),
-            spl_deposit_address(&test_key(), &account(1), &[3; 32].into(), &token_program()),
+            spl_deposit_address(&owner(&account(1)), &mint(), &token_program()),
+            spl_deposit_address(&owner(&account(1)), &[3; 32].into(), &token_program()),
         );
     }
 
     #[test]
     fn should_derive_different_addresses_for_different_token_programs() {
         assert_ne!(
-            spl_deposit_address(&test_key(), &account(1), &mint(), &token_program()),
-            spl_deposit_address(&test_key(), &account(1), &mint(), &token_2022_program()),
+            spl_deposit_address(&owner(&account(1)), &mint(), &token_program()),
+            spl_deposit_address(&owner(&account(1)), &mint(), &token_2022_program()),
         );
     }
 }

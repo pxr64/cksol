@@ -31,11 +31,12 @@ fn should_accept_balance_above_minimum() {
 mod balance_reading {
     use crate::{
         address::account_address,
-        constants::GET_SPL_TOKEN_BALANCE_CYCLES,
+        constants::GET_ACCOUNT_INFO_CYCLES,
         deposit::spl::deposit_spl,
         guard::deposit_spl_guard,
         state::{
-            SupportedSplToken, audit::process_event, event::EventType, mutate_state, read_state,
+            SupportedSplToken, TokenProgram, audit::process_event, event::EventType, mutate_state,
+            read_state,
         },
         storage::total_event_count,
         test_fixtures::{
@@ -53,7 +54,7 @@ mod balance_reading {
     use spl_token_interface::state::{Account as TokenAccount, AccountState};
 
     const MINIMUM_DEPOSIT_AMOUNT: u64 = 100;
-    const RPC_REFUND: u128 = GET_SPL_TOKEN_BALANCE_CYCLES / 2;
+    const RPC_REFUND: u128 = GET_ACCOUNT_INFO_CYCLES / 2;
 
     fn init_token(token_2022: bool) -> SupportedSplToken {
         init_state();
@@ -63,11 +64,11 @@ mod balance_reading {
 
     fn register_token(token_2022: bool) -> SupportedSplToken {
         let token = SupportedSplToken {
-            mint: solana_address::Address::from([2; 32]).into(),
+            mint: [2; 32].into(),
             token_program: if token_2022 {
-                solana_address::Address::from(spl_token_2022_interface::id().to_bytes()).into()
+                TokenProgram::Token2022
             } else {
-                solana_address::Address::from(spl_token_interface::id().to_bytes()).into()
+                TokenProgram::Classic
             },
             decimals: 6,
             ledger_id: Principal::from_slice(&[3; 20]),
@@ -85,14 +86,21 @@ mod balance_reading {
     }
 
     fn token_account_info(token: &SupportedSplToken, amount: u64) -> AccountInfo {
+        token_account_info_in_state(token, amount, AccountState::Initialized)
+    }
+
+    fn token_account_info_in_state(
+        token: &SupportedSplToken,
+        amount: u64,
+        state: AccountState,
+    ) -> AccountInfo {
         let master_key = read_state(|state| state.minter_public_key().cloned()).unwrap();
         let owner = account_address(&master_key, &DEPOSITOR_ACCOUNT);
-        let mint: solana_address::Address = token.mint.clone().into();
         let account = TokenAccount {
             owner: owner.to_bytes().into(),
-            mint: mint.to_bytes().into(),
+            mint: token.mint.to_bytes().into(),
             amount,
-            state: AccountState::Initialized,
+            state,
             ..TokenAccount::default()
         };
         let mut data = vec![0; TokenAccount::LEN];
@@ -100,7 +108,7 @@ mod balance_reading {
         AccountInfo {
             lamports: 2_000_000,
             data: AccountData::Binary(STANDARD.encode(&data), AccountEncoding::Base64),
-            owner: token.token_program.to_string(),
+            owner: token.token_program.id().to_string(),
             executable: false,
             rent_epoch: 0,
             space: data.len() as u64,
@@ -109,7 +117,7 @@ mod balance_reading {
 
     fn runtime() -> TestCanisterRuntime {
         TestCanisterRuntime::new()
-            .add_msg_cycles_available(GET_SPL_TOKEN_BALANCE_CYCLES)
+            .add_msg_cycles_available(GET_ACCOUNT_INFO_CYCLES)
             .add_msg_cycles_refunded(RPC_REFUND)
             .expecting_charges()
     }
@@ -117,7 +125,7 @@ mod balance_reading {
     fn assert_rpc_cost_charged_without_queueing(runtime: &TestCanisterRuntime) {
         assert_eq!(
             runtime.msg_cycles_accepted(),
-            [GET_SPL_TOKEN_BALANCE_CYCLES - RPC_REFUND]
+            [GET_ACCOUNT_INFO_CYCLES - RPC_REFUND]
         );
         assert_eq!(runtime.sent_update_calls().len(), 1);
         assert_eq!(runtime.sent_update_calls()[0].method, "getAccountInfo");
@@ -126,19 +134,37 @@ mod balance_reading {
     }
 
     #[tokio::test]
+    async fn should_reject_unknown_mints_without_side_effects() {
+        init_state();
+        let runtime = TestCanisterRuntime::new();
+        for mint in [
+            cksol_types::Address::from(solana_address::Address::from([2; 32])),
+            cksol_types::Address::default(),
+        ] {
+            assert_eq!(
+                deposit_spl(&runtime, DEPOSITOR_ACCOUNT, mint.clone()).await,
+                Err(DepositSplError::UnsupportedToken { mint })
+            );
+        }
+        assert!(runtime.sent_update_calls().is_empty());
+        assert!(runtime.msg_cycles_accepted().is_empty());
+        assert_eq!(total_event_count(), 0);
+    }
+
+    #[tokio::test]
     async fn should_fail_before_rpc_if_insufficient_cycles_are_attached() {
         let token = init_token(false);
         let runtime =
-            TestCanisterRuntime::new().add_msg_cycles_available(GET_SPL_TOKEN_BALANCE_CYCLES - 1);
+            TestCanisterRuntime::new().add_msg_cycles_available(GET_ACCOUNT_INFO_CYCLES - 1);
 
-        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint).await;
+        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
         assert_eq!(
             result,
             Err(DepositSplError::InsufficientCycles(
                 InsufficientCyclesError {
-                    expected: GET_SPL_TOKEN_BALANCE_CYCLES,
-                    received: GET_SPL_TOKEN_BALANCE_CYCLES - 1,
+                    expected: GET_ACCOUNT_INFO_CYCLES,
+                    received: GET_ACCOUNT_INFO_CYCLES - 1,
                 }
             ))
         );
@@ -153,7 +179,7 @@ mod balance_reading {
         let account = token_account_info(&token, MINIMUM_DEPOSIT_AMOUNT);
         let runtime = runtime().add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
 
-        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint).await;
+        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
         assert_eq!(
             result,
@@ -170,7 +196,7 @@ mod balance_reading {
         let account = token_account_info(&token, MINIMUM_DEPOSIT_AMOUNT + 1);
         let runtime = runtime().add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
 
-        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint).await;
+        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
         assert_matches!(result, Err(DepositSplError::TemporarilyUnavailable(_)));
         assert_rpc_cost_charged_without_queueing(&runtime);
@@ -183,7 +209,7 @@ mod balance_reading {
         let account = token_account_info(&token, balance);
         let runtime = runtime().add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
 
-        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint).await;
+        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
         assert_eq!(
             result,
@@ -201,7 +227,7 @@ mod balance_reading {
         let runtime = runtime()
             .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
 
-        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint).await;
+        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
         assert_eq!(
             result,
@@ -218,9 +244,27 @@ mod balance_reading {
         let token = init_token(false);
         let runtime = runtime().add_stub_error(IcError::CallPerformFailed);
 
-        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint).await;
+        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
         assert_matches!(result, Err(DepositSplError::TemporarilyUnavailable(_)));
+        assert_rpc_cost_charged_without_queueing(&runtime);
+    }
+
+    #[tokio::test]
+    async fn should_reject_frozen_token_account_as_invalid_and_charge_rpc_cost() {
+        let token = init_token(false);
+        let account =
+            token_account_info_in_state(&token, MINIMUM_DEPOSIT_AMOUNT, AccountState::Frozen);
+        let runtime = runtime().add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
+
+        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
+
+        assert_eq!(
+            result,
+            Err(DepositSplError::InvalidTokenAccount(
+                "Token account is frozen".to_string()
+            ))
+        );
         assert_rpc_cost_charged_without_queueing(&runtime);
     }
     #[tokio::test]
@@ -233,12 +277,12 @@ mod balance_reading {
         let mut first = Box::pin(deposit_spl(
             &first_runtime,
             DEPOSITOR_ACCOUNT,
-            token.mint.clone(),
+            token.mint.into(),
         ));
         assert!(futures::poll!(first.as_mut()).is_pending());
         let blocked_runtime = TestCanisterRuntime::new();
 
-        let result = deposit_spl(&blocked_runtime, DEPOSITOR_ACCOUNT, token.mint.clone()).await;
+        let result = deposit_spl(&blocked_runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
         assert_eq!(result, Err(DepositSplError::AlreadyProcessing));
         assert!(blocked_runtime.sent_update_calls().is_empty());
@@ -253,7 +297,7 @@ mod balance_reading {
         let token = init_token(false);
         let runtime = TestCanisterRuntime::new().add_msg_cycles_available(0);
 
-        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.clone()).await;
+        let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
         assert_matches!(result, Err(DepositSplError::InsufficientCycles(_)));
         let _guard = deposit_spl_guard(DEPOSITOR_ACCOUNT, token.mint).unwrap();

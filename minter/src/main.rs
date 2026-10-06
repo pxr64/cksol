@@ -239,8 +239,8 @@ fn get_events(
                 event::EventType::QuarantinedPendingMint { deposit_id }
             }
             EventType::AddedSplToken(token) => event::EventType::AddedSplToken {
-                mint: token.mint,
-                token_program: token.token_program,
+                mint: token.mint.into(),
+                token_program: token.token_program.id().into(),
                 decimals: token.decimals,
                 ledger_id: token.ledger_id,
                 minimum_deposit_amount: token.minimum_deposit_amount,

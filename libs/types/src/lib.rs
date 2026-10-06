@@ -236,6 +236,10 @@ pub enum DepositSplError {
         /// The requested Solana mint address.
         mint: Address,
     },
+    /// The token account at the deposit address is frozen, has an unsupported extension,
+    /// or does not match the mint or the owner. A retry fails the same way.
+    #[error("Invalid SPL token account: {0}")]
+    InvalidTokenAccount(String),
     /// SPL deposit processing is currently unavailable.
     #[error("SPL deposit processing is unavailable: {0}")]
     TemporarilyUnavailable(String),
