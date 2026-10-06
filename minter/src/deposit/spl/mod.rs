@@ -1,5 +1,5 @@
 use crate::{
-    address::{account_address, lazy_get_schnorr_master_key, spl_deposit_address},
+    address::{account_address, associated_token_address, lazy_get_schnorr_master_key},
     constants::GET_ACCOUNT_INFO_CYCLES,
     cycles::{RpcCallCharge, charge_rpc_call, check_caller_available_cycles},
     guard::deposit_spl_guard,
@@ -37,7 +37,7 @@ pub async fn deposit_spl<R: CanisterRuntime>(
 
     let master_key = lazy_get_schnorr_master_key(runtime).await;
     let owner = account_address(&master_key, &account);
-    let address = spl_deposit_address(&owner, &token.mint, &token.token_program.id());
+    let address = associated_token_address(&owner, &token.mint, &token.token_program.id());
     let result = get_spl_token_balance(runtime, address, owner, token.mint, token.token_program)
         .await
         .map_err(DepositSplError::from)

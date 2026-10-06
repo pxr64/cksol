@@ -38,7 +38,7 @@ mod spl;
 mod spl_deposits;
 
 pub use spl::{SupportedSplToken, TokenProgram};
-pub use spl_deposits::{QueuedSplDeposit, SplDeposits};
+pub use spl_deposits::{QueuedSplDeposit, SplDeposits, SplSweep};
 
 pub use deposits::{
     DepositBalance, Deposits, MintedSweep, PendingMint, QueuedDeposit, SettledSweep, Sweep,

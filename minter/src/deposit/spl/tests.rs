@@ -30,7 +30,7 @@ fn should_accept_balance_above_minimum() {
 
 mod balance_reading {
     use crate::{
-        address::{account_address, spl_deposit_address},
+        address::{account_address, associated_token_address},
         constants::GET_ACCOUNT_INFO_CYCLES,
         deposit::spl::deposit_spl,
         guard::deposit_spl_guard,
@@ -159,7 +159,7 @@ mod balance_reading {
             assert_eq!(queued.mint, token.mint);
             assert_eq!(
                 queued.address,
-                spl_deposit_address(&owner, &token.mint, &token.token_program.id())
+                associated_token_address(&owner, &token.mint, &token.token_program.id())
             );
             assert_eq!(queued.balance, balance);
             assert_eq!(

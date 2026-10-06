@@ -1,12 +1,14 @@
 use crate::{
     address::{
-        DerivationPath, account_address, lazy_get_schnorr_master_key, minter_address,
-        spl_deposit_address,
+        DerivationPath, account_address, associated_token_address, lazy_get_schnorr_master_key,
+        minter_address,
     },
     constants::FEE_PER_SIGNATURE,
     runtime::CanisterRuntime,
     signer::{SchnorrSigner, sign_bytes},
-    state::{QueuedSplDeposit, SupportedSplToken, Sweep, event::Signer},
+    state::{
+        QueuedSplDeposit, SchnorrPublicKey, SplSweep, SupportedSplToken, Sweep, event::Signer,
+    },
 };
 use derive_more::From;
 use ic_cdk_management_canister::SignCallError;
@@ -16,7 +18,7 @@ use solana_address::Address;
 use solana_hash::Hash;
 use solana_system_interface::instruction;
 use solana_transaction::{Instruction, Message, Transaction};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -43,7 +45,7 @@ pub enum CreateTransferError {
 
 /// Builds a checked transfer of the queued token balance to the minter's
 /// associated token account. The destination account must already exist.
-pub fn create_spl_sweep_instruction(
+fn create_spl_sweep_instruction(
     deposit: &QueuedSplDeposit,
     token: &SupportedSplToken,
     deposit_owner: &Address,
@@ -51,7 +53,12 @@ pub fn create_spl_sweep_instruction(
 ) -> Instruction {
     assert_eq!(deposit.mint, token.mint, "BUG: SPL sweep mint mismatch");
     let token_program = token.token_program.id();
-    let destination = spl_deposit_address(minter, &token.mint, &token_program);
+    assert_eq!(
+        deposit.address,
+        associated_token_address(deposit_owner, &token.mint, &token_program),
+        "BUG: SPL sweep source mismatch"
+    );
+    let destination = associated_token_address(minter, &token.mint, &token_program);
     spl_token_2022_interface::instruction::transfer_checked(
         &token_program.to_bytes().into(),
         &deposit.address.to_bytes().into(),
@@ -65,46 +72,65 @@ pub fn create_spl_sweep_instruction(
     .expect("BUG: supported SPL token program must accept transfer_checked")
 }
 
-/// Builds a single-deposit SPL sweep message. The minter funds destination
-/// account creation and transaction fees; the deposit owner authorizes the transfer.
+/// Builds the message of an SPL sweep, with one creation of each destination token account.
+/// The minter pays the creations and the fees, and each deposit owner authorizes its transfers.
 pub fn create_spl_sweep_message(
-    deposit: &QueuedSplDeposit,
-    token: &SupportedSplToken,
-    deposit_owner: &Address,
-    minter: &Address,
+    sweep: &SplSweep,
+    tokens: &BTreeMap<Address, SupportedSplToken>,
+    master_key: &SchnorrPublicKey,
     recent_blockhash: Hash,
 ) -> Message {
-    let create_destination =
-        spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(
-            &minter.to_bytes().into(),
-            &minter.to_bytes().into(),
-            &token.mint.to_bytes().into(),
-            &token.token_program.id().to_bytes().into(),
-        );
-    let transfer = create_spl_sweep_instruction(deposit, token, deposit_owner, minter);
-    Message::new_with_blockhash(
-        &[create_destination, transfer],
-        Some(minter),
-        &recent_blockhash,
-    )
+    let minter = minter_address(master_key);
+    let mut destinations = BTreeSet::new();
+    let mut instructions = Vec::new();
+    for deposit in sweep.deposits().values() {
+        let token = tokens
+            .get(&deposit.mint)
+            .unwrap_or_else(|| panic!("BUG: SPL sweep mint {} must be registered", deposit.mint));
+        let owner = account_address(master_key, &deposit.account);
+        let token_program = token.token_program.id();
+        let destination = associated_token_address(&minter, &token.mint, &token_program);
+        if destinations.insert(destination) {
+            instructions.push(
+                spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(
+                    &minter.to_bytes().into(),
+                    &minter.to_bytes().into(),
+                    &token.mint.to_bytes().into(),
+                    &token_program.to_bytes().into(),
+                ),
+            );
+        }
+        instructions.push(create_spl_sweep_instruction(
+            deposit, token, &owner, &minter,
+        ));
+    }
+    Message::new_with_blockhash(&instructions, Some(&minter), &recent_blockhash)
 }
 
-/// Signs a single-deposit SPL sweep with the minter and deposit owner.
+/// Signs an SPL sweep with the minter and each distinct deposit owner.
 /// Returns the signed transaction and its signers in signature order.
 pub async fn sign_spl_sweep_transaction<R: CanisterRuntime>(
     runtime: &R,
-    deposit: &QueuedSplDeposit,
-    token: &SupportedSplToken,
+    sweep: &SplSweep,
+    tokens: &BTreeMap<Address, SupportedSplToken>,
     recent_blockhash: Hash,
 ) -> Result<(Transaction, Vec<Signer>), CreateTransferError> {
     let master_key = lazy_get_schnorr_master_key(runtime).await;
     let minter = minter_address(&master_key);
-    let deposit_owner = account_address(&master_key, &deposit.account);
+    let accounts_by_address: BTreeMap<Address, Account> = sweep
+        .deposits()
+        .values()
+        .map(|deposit| {
+            (
+                account_address(&master_key, &deposit.account),
+                deposit.account,
+            )
+        })
+        .collect();
     let mut transaction = Transaction::new_unsigned(create_spl_sweep_message(
-        deposit,
-        token,
-        &deposit_owner,
-        &minter,
+        sweep,
+        tokens,
+        &master_key,
         recent_blockhash,
     ));
     let signers: Vec<Signer> = transaction
@@ -114,10 +140,12 @@ pub async fn sign_spl_sweep_transaction<R: CanisterRuntime>(
         .map(|key| {
             if **key == minter {
                 Signer::Minter
-            } else if **key == deposit_owner {
-                Signer::Account(deposit.account)
             } else {
-                panic!("BUG: unexpected SPL sweep signer {key}")
+                let account = accounts_by_address
+                    .get(key)
+                    .copied()
+                    .unwrap_or_else(|| panic!("BUG: unexpected SPL sweep signer {key}"));
+                Signer::Account(account)
             }
         })
         .collect();
