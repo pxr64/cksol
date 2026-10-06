@@ -164,7 +164,7 @@ mod spl_sweep_tests {
     }
 
     #[tokio::test]
-    async fn should_reject_spl_sweep_batch_exceeding_transaction_size_limit() {
+    async fn should_reject_oversized_spl_sweep_before_signing() {
         setup();
         let (first, token) = queued_spl_deposit(TokenProgram::Classic);
         let deposits: Vec<_> = (1..=20)
@@ -184,10 +184,7 @@ mod spl_sweep_tests {
                 }
             })
             .collect();
-        let mut runtime = TestCanisterRuntime::new().add_signer(sign_as_minter());
-        for deposit in &deposits {
-            runtime = runtime.add_signer(sign_for(&deposit.account));
-        }
+        let runtime = TestCanisterRuntime::new();
         let sweep = SplSweep::plan(
             deposits
                 .into_iter()
@@ -671,9 +668,12 @@ mod batch_withdrawal_tests {
             })
             .collect();
 
-        let result =
-            create_signed_batch_withdrawal_transaction(&minter_signing_once(), &targets, blockhash)
-                .await;
+        let result = create_signed_batch_withdrawal_transaction(
+            &TestCanisterRuntime::new(),
+            &targets,
+            blockhash,
+        )
+        .await;
 
         assert_matches!(
             result,
