@@ -16,8 +16,9 @@ use cksol_minter::{
 };
 use cksol_types::{
     AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
-    DepositSolStatus, GetDepositAddressArgs, MinterInfo, WithdrawalArgs, WithdrawalError,
-    WithdrawalOk, WithdrawalStatus, WithdrawalStatusArgs,
+    DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, GetDepositAddressArgs,
+    MinterInfo, WithdrawalArgs, WithdrawalError, WithdrawalOk, WithdrawalStatus,
+    WithdrawalStatusArgs,
 };
 use cksol_types_internal::{MinterArg, log::Priority};
 use ic_http_types::{HttpRequest, HttpResponse, HttpResponseBuilder};
@@ -83,6 +84,12 @@ async fn add_spl_token(args: AddSplTokenArgs) -> Result<(), AddSplTokenError> {
     cksol_minter::utils::assert_ledger_suite_orchestrator(ic_cdk::api::msg_caller())
         .unwrap_or_else(|error| ic_cdk::trap(error));
     cksol_minter::spl::add_spl_token(&IcCanisterRuntime::new(), args).await
+}
+
+#[ic_cdk::update]
+async fn deposit_spl(args: DepositSplArgs) -> Result<DepositSplId, DepositSplError> {
+    let account = resolve_account(args.owner, args.subaccount);
+    cksol_minter::deposit::spl::deposit_spl(&IcCanisterRuntime::new(), account, args.mint).await
 }
 
 #[ic_cdk::update]

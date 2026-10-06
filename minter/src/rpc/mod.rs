@@ -6,7 +6,7 @@ use crate::{
     runtime::CanisterRuntime,
     state::read_state,
 };
-use cksol_types::DepositSolError;
+use cksol_types::{DepositSolError, DepositSplError};
 use derive_more::From;
 use ic_canister_runtime::IcError;
 use minicbor::{Decode, Encode};
@@ -90,6 +90,12 @@ pub enum GetSplTokenBalanceError {
     InconsistentRpcResults,
     #[error("Invalid SPL token account: {0}")]
     InvalidTokenAccount(String),
+}
+
+impl From<GetSplTokenBalanceError> for DepositSplError {
+    fn from(error: GetSplTokenBalanceError) -> Self {
+        DepositSplError::TemporarilyUnavailable(error.to_string())
+    }
 }
 
 pub async fn get_balance<R: CanisterRuntime>(

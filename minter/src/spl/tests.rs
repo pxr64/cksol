@@ -1,12 +1,14 @@
 use super::*;
 use crate::{
+    deposit::spl::deposit_spl,
     lifecycle,
     state::{audit::replay_events, event::Event},
     storage::{total_event_count, with_event_iter},
-    test_fixtures::{runtime::TestCanisterRuntime, valid_init_args},
+    test_fixtures::{deposit::DEPOSITOR_ACCOUNT, runtime::TestCanisterRuntime, valid_init_args},
 };
 use assert_matches::assert_matches;
 use base64::{Engine, engine::general_purpose::STANDARD};
+use cksol_types::DepositSplError;
 use ic_stable_structures::Storable;
 use sol_rpc_types::{AccountData, AccountEncoding, AccountInfo};
 use spl_token_2022_interface::extension::{
@@ -62,6 +64,20 @@ fn assert_not_registered(mint: &cksol_types::Address) {
     assert_eq!(total_event_count(), 1); // Init only.
 }
 
+fn token_2022_args() -> AddSplTokenArgs {
+    AddSplTokenArgs {
+        token_program: TOKEN_2022_PROGRAM.parse().unwrap(),
+        ..args()
+    }
+}
+
+fn token_2022_mint_account(data: &[u8]) -> AccountInfo {
+    AccountInfo {
+        owner: TOKEN_2022_PROGRAM.to_string(),
+        ..mint_account(data)
+    }
+}
+
 #[tokio::test]
 async fn should_register_and_replay_the_token_from_stable_events() {
     let runtime = with_mint(init(), Some(mint_account(&mint_data())));
@@ -92,10 +108,10 @@ async fn should_preserve_initial_paused_flag() {
         ..args()
     };
     assert_eq!(add_spl_token(&runtime, args.clone()).await, Ok(()));
-    assert!(read_state(|state| state
-        .supported_spl_token(&args.mint)
-        .unwrap()
-        .paused));
+    assert_eq!(
+        deposit_spl(&runtime, DEPOSITOR_ACCOUNT, args.mint.clone()).await,
+        Err(DepositSplError::TokenPaused { mint: args.mint })
+    );
 }
 
 #[tokio::test]
@@ -240,20 +256,6 @@ async fn should_leave_registry_unchanged_when_rpc_results_are_inconsistent() {
         Err(AddSplTokenError::TemporarilyUnavailable(_))
     );
     assert_not_registered(&args().mint);
-}
-
-fn token_2022_args() -> AddSplTokenArgs {
-    AddSplTokenArgs {
-        token_program: TOKEN_2022_PROGRAM.parse().unwrap(),
-        ..args()
-    }
-}
-
-fn token_2022_mint_account(data: &[u8]) -> AccountInfo {
-    AccountInfo {
-        owner: TOKEN_2022_PROGRAM.to_string(),
-        ..mint_account(data)
-    }
 }
 
 #[tokio::test]

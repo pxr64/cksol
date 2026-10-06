@@ -150,6 +150,21 @@ pub enum DepositSolError {
     },
 }
 
+/// Arguments for a balance-based SPL deposit request.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
+pub struct DepositSplArgs {
+    /// The principal to credit. Defaults to the caller when omitted.
+    /// The resolved owner must be a non-anonymous principal.
+    pub owner: Option<Principal>,
+    /// The subaccount to credit with the deposit.
+    pub subaccount: Option<Subaccount>,
+    /// The Solana mint address identifying the SPL token to deposit.
+    pub mint: Address,
+}
+
+/// Identifies a deposit queued by the `deposit_spl` endpoint.
+pub type DepositSplId = u64;
+
 /// Configuration supplied when registering an SPL token.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
 pub struct AddSplTokenArgs {
@@ -188,6 +203,41 @@ pub enum AddSplTokenError {
     InvalidToken(String),
     /// The mint account could not be read consistently. Registration can be retried.
     #[error("Token registration is temporarily unavailable: {0}")]
+    TemporarilyUnavailable(String),
+}
+
+/// An error from the `deposit_spl` endpoint.
+/// Additional variants will be introduced as SPL deposits are implemented.
+#[derive(Debug, Clone, PartialEq, CandidType, Deserialize, Error)]
+pub enum DepositSplError {
+    /// A concurrent SPL deposit request is already processing for this account and mint.
+    #[error("There is already a concurrent SPL deposit request for this account and mint")]
+    AlreadyProcessing,
+    /// Insufficient cycles attached to read the token balance.
+    #[error(transparent)]
+    InsufficientCycles(#[from] InsufficientCyclesError),
+    /// The token balance is below the configured minimum, in the mint's smallest units.
+    #[error("Balance {balance} is below the minimum deposit amount {minimum_deposit_amount}")]
+    ValueTooSmall {
+        /// The token balance in the mint's smallest units.
+        balance: u64,
+        /// The minimum deposit in the mint's smallest units.
+        minimum_deposit_amount: u64,
+    },
+    /// The requested mint is not registered as a supported SPL token.
+    #[error("Unsupported SPL token: {mint}")]
+    UnsupportedToken {
+        /// The requested Solana mint address.
+        mint: Address,
+    },
+    /// Deposits for this supported token are paused.
+    #[error("SPL deposits are paused for token: {mint}")]
+    TokenPaused {
+        /// The requested Solana mint address.
+        mint: Address,
+    },
+    /// SPL deposit processing is currently unavailable.
+    #[error("SPL deposit processing is unavailable: {0}")]
     TemporarilyUnavailable(String),
 }
 

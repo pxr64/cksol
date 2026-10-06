@@ -697,6 +697,7 @@ mod state_from_init_args {
                 minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
                 deposit_sol_required_cycles: DEPOSIT_SOL_REQUIRED_CYCLES,
                 pending_deposit_sol_request_guards: BTreeSet::new(),
+                pending_deposit_spl_request_guards: BTreeSet::new(),
                 pending_withdrawal_request_guards: BTreeSet::new(),
                 deposits: Deposits::default(),
                 supported_spl_tokens: BTreeMap::new(),

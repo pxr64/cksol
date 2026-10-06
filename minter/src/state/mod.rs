@@ -106,6 +106,7 @@ pub struct State {
     deposit_sol_required_cycles: u128,
     deposit_consolidation_fee: u128,
     pending_deposit_sol_request_guards: BTreeSet<Account>,
+    pending_deposit_spl_request_guards: BTreeSet<(Account, cksol_types::Address)>,
     pending_withdrawal_request_guards: BTreeSet<Account>,
     deposits: Deposits,
     supported_spl_tokens: BTreeMap<cksol_types::Address, SupportedSplToken>,
@@ -303,6 +304,12 @@ impl State {
 
     pub fn pending_deposit_sol_request_guards_mut(&mut self) -> &mut BTreeSet<Account> {
         &mut self.pending_deposit_sol_request_guards
+    }
+
+    pub fn pending_deposit_spl_request_guards_mut(
+        &mut self,
+    ) -> &mut BTreeSet<(Account, cksol_types::Address)> {
+        &mut self.pending_deposit_spl_request_guards
     }
 
     pub fn pending_withdrawal_request_guards_mut(&mut self) -> &mut BTreeSet<Account> {
@@ -759,6 +766,7 @@ impl TryFrom<InitArgs> for State {
             deposit_sol_required_cycles: deposit_sol_required_cycles as u128,
             deposit_consolidation_fee: deposit_consolidation_fee as u128,
             pending_deposit_sol_request_guards: BTreeSet::new(),
+            pending_deposit_spl_request_guards: BTreeSet::new(),
             pending_withdrawal_request_guards: BTreeSet::new(),
             deposits: Deposits::default(),
             supported_spl_tokens: BTreeMap::new(),
