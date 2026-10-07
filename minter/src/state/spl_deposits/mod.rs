@@ -23,6 +23,7 @@ pub struct SplDeposits {
     finalized: SplSweeps,
     pending_mints: BTreeMap<DepositSplId, PendingSplMint>,
     dropped: BTreeMap<DepositSplId, SweptSplDeposit>,
+    quarantined: BTreeMap<DepositSplId, SweptSplDeposit>,
     in_flight_ids: BTreeMap<(Account, Address), DepositSplId>,
 }
 
@@ -49,6 +50,10 @@ impl SplDeposits {
 
     pub fn pending_mints(&self) -> &BTreeMap<DepositSplId, PendingSplMint> {
         &self.pending_mints
+    }
+
+    pub fn quarantined(&self) -> &BTreeMap<DepositSplId, SweptSplDeposit> {
+        &self.quarantined
     }
 
     pub fn in_flight_id(&self, account: &Account, mint: &Address) -> Option<DepositSplId> {
@@ -158,6 +163,23 @@ impl SplDeposits {
                 mint.deposit_id
             );
         }
+    }
+
+    /// Quarantines every deposit of a finalized sweep, keeping its account and mint in flight.
+    pub(super) fn quarantine_sweep(&mut self, signature: &Signature) {
+        let sweep = self.finalized.remove(signature).unwrap_or_else(|| {
+            panic!("Attempted to quarantine SPL sweep {signature} that is not finalized")
+        });
+        self.quarantined
+            .extend(sweep.deposits().iter().map(|(deposit_id, deposit)| {
+                (
+                    *deposit_id,
+                    SweptSplDeposit {
+                        deposit: deposit.clone(),
+                        signature: *signature,
+                    },
+                )
+            }));
     }
 
     /// Drops a failed or expired sweep and releases its account and mint pairs.

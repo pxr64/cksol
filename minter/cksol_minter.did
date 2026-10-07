@@ -489,6 +489,11 @@ type EventType = variant {
         // The token-account balance when the deposit was queued, in the mint's smallest units.
         balance: nat64;
     };
+    // The finalized SPL sweep's outcome did not match its plan, so its deposits stay locked.
+    QuarantinedSplSweep : record {
+        // The signature of the finalized sweep transaction.
+        signature: Signature;
+    };
     // A finalized SPL sweep was validated and its deposits queued for ledger minting.
     CreditedSplSweep : record {
         // The signature of the finalized sweep transaction.

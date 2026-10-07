@@ -1,7 +1,7 @@
 use crate::{
     address::DerivationPath,
     constants::MAX_CONCURRENT_RPC_CALLS,
-    deposit::sweep::credit_finalized_sweeps,
+    deposit::{spl::credit_finalized_spl_sweeps, sweep::credit_finalized_sweeps},
     guard::TimerGuard,
     rpc::{
         Block, BlockHeight, SubmitTransactionError, get_recent_block, get_signature_statuses,
@@ -59,8 +59,9 @@ pub async fn finalize_transactions<R: CanisterRuntime>(runtime: R) {
 
     let more_transactions_to_check = check_submitted_transactions(&runtime).await;
     let more_sweeps_to_credit = credit_finalized_sweeps(&runtime).await;
+    let more_spl_sweeps_to_credit = credit_finalized_spl_sweeps(&runtime).await;
 
-    if !more_transactions_to_check && !more_sweeps_to_credit {
+    if !more_transactions_to_check && !more_sweeps_to_credit && !more_spl_sweeps_to_credit {
         scopeguard::ScopeGuard::into_inner(reschedule);
     }
 }

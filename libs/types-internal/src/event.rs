@@ -87,6 +87,11 @@ pub enum EventType {
         /// The balance of the deposit address when the deposit was queued.
         balance: Lamport,
     },
+    /// The finalized SPL sweep's outcome did not match its plan, so its deposits stay locked.
+    QuarantinedSplSweep {
+        /// The signature of the finalized sweep transaction.
+        signature: Signature,
+    },
     /// A finalized SPL sweep was validated and its deposits queued for ledger minting.
     CreditedSplSweep {
         /// The signature of the finalized sweep transaction.

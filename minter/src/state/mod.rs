@@ -524,6 +524,10 @@ impl State {
         self.deposits.quarantine_sweep(signature);
     }
 
+    fn process_quarantined_spl_sweep(&mut self, signature: &Signature) {
+        self.spl_deposits.quarantine_sweep(signature);
+    }
+
     pub fn withdrawal_status(&self, block_index: u64) -> WithdrawalStatus {
         let burn_index = LedgerBurnIndex::from(block_index);
         if self.pending_withdrawal_requests.contains_key(&burn_index) {

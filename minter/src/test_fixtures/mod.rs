@@ -31,6 +31,7 @@ use std::{
 pub mod flow;
 pub mod runtime;
 pub mod signer;
+pub mod spl_sweep;
 mod stubs;
 #[cfg(test)]
 mod tests;

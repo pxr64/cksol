@@ -217,6 +217,13 @@ pub enum EventType {
         #[n(2)]
         mints: Vec<CreditedSplDeposit>,
     },
+    /// The finalized SPL sweep's outcome did not match its plan, so its deposits stay locked.
+    #[n(18)]
+    QuarantinedSplSweep {
+        /// The signature of the finalized sweep transaction.
+        #[cbor(n(0), with = "cbor::signature")]
+        signature: Signature,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

@@ -246,6 +246,9 @@ fn get_events(
             EventType::QuarantinedSweep { signature } => event::EventType::QuarantinedSweep {
                 signature: signature.into(),
             },
+            EventType::QuarantinedSplSweep { signature } => event::EventType::QuarantinedSplSweep {
+                signature: signature.into(),
+            },
             EventType::MintedSweptDeposit {
                 deposit_id,
                 mint_block_index,
