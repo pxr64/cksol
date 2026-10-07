@@ -14,6 +14,7 @@ pub mod runtime;
 mod signer;
 mod sol_transfer;
 pub mod spl;
+mod spl_transfer;
 pub mod state;
 pub mod storage;
 pub mod utils;

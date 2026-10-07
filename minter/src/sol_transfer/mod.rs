@@ -3,7 +3,7 @@ use crate::{
     constants::FEE_PER_SIGNATURE,
     runtime::CanisterRuntime,
     signer::{SchnorrSigner, sign_bytes},
-    state::{SplSweep, Sweep, event::Signer},
+    state::{Sweep, event::Signer},
 };
 use derive_more::From;
 use ic_cdk_management_canister::SignCallError;
@@ -36,24 +36,6 @@ pub enum CreateTransferError {
     TransactionTooLarge { max: usize, got: usize },
     #[error("signing failed: {0}")]
     SigningFailed(SignCallError),
-}
-
-/// Signs an SPL sweep with the minter and each distinct deposit owner.
-/// Returns the signed transaction and its signers in signature order.
-pub async fn sign_spl_sweep_transaction<R: CanisterRuntime>(
-    runtime: &R,
-    sweep: &SplSweep,
-    recent_blockhash: Hash,
-) -> Result<(Transaction, Vec<Signer>), CreateTransferError> {
-    let mut transaction = Transaction::new_unsigned(sweep.sweep_message(recent_blockhash));
-    let signers = sweep.signers(&transaction.message);
-    sign_transaction(
-        &mut transaction,
-        signers.iter().map(Signer::derivation_path),
-        &runtime.signer(),
-    )
-    .await?;
-    Ok((transaction, signers))
 }
 
 /// Signs the transaction of a planned sweep with the deposit addresses it transfers from.
@@ -133,7 +115,7 @@ pub fn transaction_size(message: &Message) -> usize {
 }
 
 /// Signs the transaction, unless it exceeds the maximum transaction size.
-async fn sign_transaction(
+pub(crate) async fn sign_transaction(
     transaction: &mut Transaction,
     signer_derivation_paths: impl IntoIterator<Item = DerivationPath>,
     signer: &impl SchnorrSigner,
