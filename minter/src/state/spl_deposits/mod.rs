@@ -1,3 +1,7 @@
+use crate::state::{
+    SupportedSplToken,
+    event::{Signer, VersionedMessage},
+};
 use cksol_types::DepositSplId;
 use icrc_ledger_types::icrc1::account::Account;
 use solana_address::Address;
@@ -7,12 +11,17 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 mod tests;
 
+mod sweeps;
+pub use sweeps::{SplSweep, SplSweepRecoveryError, SplSweeps, SplTransfer};
+
 /// SPL deposits grouped by their progress towards a token mint.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SplDeposits {
     next_id: DepositSplId,
     queued: BTreeMap<DepositSplId, QueuedSplDeposit>,
-    swept: BTreeMap<Signature, SplSweep>,
+    swept: SplSweeps,
+    finalized: SplSweeps,
+    dropped: BTreeMap<DepositSplId, SweptSplDeposit>,
     in_flight_ids: BTreeMap<(Account, Address), DepositSplId>,
 }
 
@@ -25,8 +34,16 @@ impl SplDeposits {
         &self.queued
     }
 
-    pub fn swept(&self) -> &BTreeMap<Signature, SplSweep> {
+    pub fn swept(&self) -> &SplSweeps {
         &self.swept
+    }
+
+    pub fn finalized(&self) -> &SplSweeps {
+        &self.finalized
+    }
+
+    pub fn dropped(&self) -> &BTreeMap<DepositSplId, SweptSplDeposit> {
+        &self.dropped
     }
 
     pub fn in_flight_id(&self, account: &Account, mint: &Address) -> Option<DepositSplId> {
@@ -57,14 +74,17 @@ impl SplDeposits {
 
     /// Moves the given queued deposits to their submitted sweep. Each account and mint
     /// stays in flight until the sweep and the ledger mint are resolved.
-    pub(super) fn sweep(&mut self, deposit_ids: &[DepositSplId], signature: &Signature) {
+    pub(super) fn sweep(
+        &mut self,
+        deposit_ids: &[DepositSplId],
+        message: &VersionedMessage,
+        signers: &[Signer],
+        tokens: &BTreeMap<Address, SupportedSplToken>,
+        signature: &Signature,
+    ) {
         assert!(
             !deposit_ids.is_empty(),
             "Attempted to sweep no SPL deposits with transaction {signature}"
-        );
-        assert!(
-            !self.swept.contains_key(signature),
-            "Attempted to submit SPL sweep {signature} twice"
         );
         let deposits = deposit_ids
             .iter()
@@ -75,35 +95,39 @@ impl SplDeposits {
                 (*deposit_id, deposit)
             })
             .collect::<Vec<_>>();
-        self.swept.insert(*signature, SplSweep::plan(deposits));
+        let sweep = SplSweep::recover(deposits, tokens, message, signers).unwrap_or_else(|error| {
+            panic!("Attempted to sweep with transaction {signature}: {error}")
+        });
+        self.swept.insert(*signature, sweep);
     }
-}
 
-/// The deposits moved by one SPL sweep transaction, kept as they were queued.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SplSweep {
-    deposits: BTreeMap<DepositSplId, QueuedSplDeposit>,
-}
+    pub(super) fn finalize_swept(&mut self, signature: &Signature) {
+        let sweep = self.swept.remove(signature).unwrap_or_else(|| {
+            panic!("Attempted to finalize SPL sweep {signature} that is not swept")
+        });
+        self.finalized.insert(*signature, sweep);
+    }
 
-impl SplSweep {
-    /// Groups the deposits of one sweep in deposit-id order.
-    pub fn plan(deposits: impl IntoIterator<Item = (DepositSplId, QueuedSplDeposit)>) -> Self {
-        let mut unique = BTreeMap::new();
-        for (deposit_id, deposit) in deposits {
-            assert!(
-                unique.insert(deposit_id, deposit).is_none(),
-                "Attempted to create an SPL sweep with deposit {deposit_id} twice"
+    /// Drops a failed or expired sweep and releases its account and mint pairs.
+    pub(super) fn drop_swept(&mut self, signature: &Signature) {
+        let sweep = self
+            .swept
+            .remove(signature)
+            .unwrap_or_else(|| panic!("Attempted to drop SPL sweep {signature} that is not swept"));
+        for (deposit_id, deposit) in sweep.deposits() {
+            assert_eq!(
+                self.in_flight_ids.remove(&(deposit.account, deposit.mint)),
+                Some(*deposit_id),
+                "BUG: SPL deposit {deposit_id} is not in flight"
+            );
+            self.dropped.insert(
+                *deposit_id,
+                SweptSplDeposit {
+                    deposit: deposit.clone(),
+                    signature: *signature,
+                },
             );
         }
-        assert!(
-            !unique.is_empty(),
-            "Attempted to plan an SPL sweep without deposits"
-        );
-        Self { deposits: unique }
-    }
-
-    pub fn deposits(&self) -> &BTreeMap<DepositSplId, QueuedSplDeposit> {
-        &self.deposits
     }
 }
 
@@ -115,4 +139,11 @@ pub struct QueuedSplDeposit {
     pub address: Address,
     /// The token-account balance when the deposit was queued, in the mint's smallest units.
     pub balance: u64,
+}
+
+/// A deposit together with the sweep transaction submitted to move its tokens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SweptSplDeposit {
+    pub deposit: QueuedSplDeposit,
+    pub signature: Signature,
 }

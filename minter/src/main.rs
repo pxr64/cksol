@@ -157,6 +157,9 @@ fn get_events(
                     TransactionPurpose::SweepDeposits { deposit_ids } => {
                         event::TransactionPurpose::SweepDeposits { deposit_ids }
                     }
+                    TransactionPurpose::SweepSplDeposits { deposit_ids } => {
+                        event::TransactionPurpose::SweepSplDeposits { deposit_ids }
+                    }
                 };
                 event::EventType::SubmittedTransaction {
                     signature: signature.into(),

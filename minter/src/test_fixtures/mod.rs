@@ -1,16 +1,17 @@
 use crate::{
-    address::{MINTER_DERIVATION_PATH, account_address, derivation_path},
+    address::{MINTER_DERIVATION_PATH, account_address, associated_token_address, derivation_path},
     constants::RENT_EXEMPTION_THRESHOLD,
     rpc::BlockHeight,
     state::{
-        DepositBalance, QueuedDeposit, SchnorrPublicKey, State, Sweep,
+        DepositBalance, QueuedDeposit, QueuedSplDeposit, SchnorrPublicKey, SplSweep, State,
+        SupportedSplToken, Sweep, TokenProgram,
         event::{Event, EventType, VersionedMessage},
         init_once_state, mutate_state,
     },
     storage::with_event_iter,
 };
 use candid::Principal;
-use cksol_types::DepositSolId;
+use cksol_types::{DepositSolId, DepositSplId};
 use cksol_types_internal::{Ed25519KeyName, InitArgs, SolanaNetwork};
 use ic_cdk_management_canister::SchnorrPublicKeyResult;
 use ic_ed25519::{PocketIcMasterPublicKeyId, PublicKey};
@@ -22,7 +23,10 @@ use solana_transaction_status_client_types::{
     EncodedTransactionWithStatusMeta, TransactionBinaryEncoding, UiLoadedAddresses,
     UiTransactionStatusMeta, option_serializer::OptionSerializer,
 };
-use std::{collections::VecDeque, str::FromStr};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    str::FromStr,
+};
 
 pub mod flow;
 pub mod runtime;
@@ -111,7 +115,7 @@ pub fn schnorr_master_key_response() -> SchnorrPublicKeyResult {
     }
 }
 
-fn schnorr_master_key() -> SchnorrPublicKey {
+pub fn schnorr_master_key() -> SchnorrPublicKey {
     SchnorrPublicKey {
         public_key: PublicKey::pocketic_key(PocketIcMasterPublicKeyId::Key1),
         chain_code: [1; 32],
@@ -174,6 +178,52 @@ pub fn queued_deposit_of(account: Account, sweepable_amount: Lamport) -> QueuedD
 /// The sweep of the given deposits to [`MINTER_ADDRESS`].
 pub fn planned_sweep(deposits: impl IntoIterator<Item = (DepositSolId, QueuedDeposit)>) -> Sweep {
     Sweep::plan(deposits, MINTER_ADDRESS)
+}
+
+/// A supported SPL token with a ledger derived from its mint, so registrations stay distinct.
+pub fn spl_token(mint: Address, token_program: TokenProgram) -> SupportedSplToken {
+    SupportedSplToken {
+        mint,
+        token_program,
+        decimals: 6,
+        ledger_id: Principal::from_slice(&mint.to_bytes()[..28]),
+        minimum_deposit_amount: 1,
+        paused: false,
+    }
+}
+
+/// A queued deposit on the token account that the test master key derives for the account.
+pub fn queued_spl_deposit(
+    account: Account,
+    mint: Address,
+    token_program: TokenProgram,
+) -> QueuedSplDeposit {
+    let owner = account_address(&schnorr_master_key(), &account);
+    QueuedSplDeposit {
+        account,
+        mint,
+        address: associated_token_address(&owner, &mint, &token_program.id()),
+        balance: 1_000_000,
+    }
+}
+
+/// The classic token of each mint among the given deposits.
+pub fn classic_spl_tokens<'a>(
+    deposits: impl IntoIterator<Item = &'a QueuedSplDeposit>,
+) -> BTreeMap<Address, SupportedSplToken> {
+    deposits
+        .into_iter()
+        .map(|deposit| (deposit.mint, spl_token(deposit.mint, TokenProgram::Classic)))
+        .collect()
+}
+
+/// A classic SPL sweep planned under the test master key.
+pub fn planned_spl_sweep(
+    deposits: impl IntoIterator<Item = (DepositSplId, QueuedSplDeposit)>,
+) -> SplSweep {
+    let deposits: Vec<_> = deposits.into_iter().collect();
+    let tokens = classic_spl_tokens(deposits.iter().map(|(_, deposit)| deposit));
+    SplSweep::plan(deposits, &tokens, &schnorr_master_key())
 }
 
 /// The message submitted for the sweep of the given deposits to [`MINTER_ADDRESS`].

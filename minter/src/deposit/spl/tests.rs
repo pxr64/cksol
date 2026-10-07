@@ -41,12 +41,11 @@ mod balance_reading {
         storage::total_event_count,
         test_fixtures::{
             DEPOSIT_CONSOLIDATION_FEE, deposit::DEPOSITOR_ACCOUNT, init_schnorr_master_key,
-            init_state, runtime::TestCanisterRuntime, schnorr_master_key_response,
+            init_state, runtime::TestCanisterRuntime, schnorr_master_key_response, spl_token,
         },
     };
     use assert_matches::assert_matches;
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use candid::Principal;
     use cksol_types::{DepositSplError, InsufficientCyclesError};
     use ic_canister_runtime::IcError;
     use sol_rpc_types::{AccountData, AccountEncoding, AccountInfo, MultiRpcResult};
@@ -67,17 +66,14 @@ mod balance_reading {
     }
 
     fn token(token_2022: bool) -> SupportedSplToken {
+        let token_program = if token_2022 {
+            TokenProgram::Token2022
+        } else {
+            TokenProgram::Classic
+        };
         SupportedSplToken {
-            mint: [2; 32].into(),
-            token_program: if token_2022 {
-                TokenProgram::Token2022
-            } else {
-                TokenProgram::Classic
-            },
-            decimals: 6,
-            ledger_id: Principal::from_slice(&[3; 20]),
             minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
-            paused: false,
+            ..spl_token([2; 32].into(), token_program)
         }
     }
 

@@ -274,6 +274,12 @@ pub enum TransactionPurpose {
         #[n(0)]
         deposit_ids: Vec<DepositSolId>,
     },
+    /// Sweep queued SPL token accounts into the minter's associated token accounts.
+    #[n(2)]
+    SweepSplDeposits {
+        #[n(0)]
+        deposit_ids: Vec<DepositSplId>,
+    },
 }
 
 impl Storable for Event {

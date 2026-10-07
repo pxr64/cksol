@@ -194,6 +194,11 @@ pub enum TransactionPurpose {
         /// The ids of the swept deposits.
         deposit_ids: Vec<u64>,
     },
+    /// Sweep queued SPL token accounts into the minter's associated token accounts.
+    SweepSplDeposits {
+        /// The ids of the swept SPL deposits.
+        deposit_ids: Vec<u64>,
+    },
 }
 
 /// A versioned Solana transaction message.

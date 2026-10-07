@@ -400,6 +400,11 @@ type TransactionPurpose = variant {
         // The ids of the swept deposits.
         deposit_ids: vec DepositSolId;
     };
+    // Sweep queued SPL token accounts into the minter's associated token accounts.
+    SweepSplDeposits : record {
+        // The ids of the swept SPL deposits.
+        deposit_ids: vec DepositSplId;
+    };
 };
 
 // A minter event payload.

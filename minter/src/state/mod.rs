@@ -38,7 +38,10 @@ mod spl;
 mod spl_deposits;
 
 pub use spl::{SupportedSplToken, TokenProgram};
-pub use spl_deposits::{QueuedSplDeposit, SplDeposits, SplSweep};
+pub use spl_deposits::{
+    QueuedSplDeposit, SplDeposits, SplSweep, SplSweepRecoveryError, SplSweeps, SplTransfer,
+    SweptSplDeposit,
+};
 
 pub use deposits::{
     DepositBalance, Deposits, MintedSweep, PendingMint, QueuedDeposit, SettledSweep, Sweep,
@@ -270,9 +273,16 @@ impl State {
             .unwrap_or_else(|| {
                 panic!("BUG: cannot mark non-submitted transaction {signature} for resubmission")
             });
-        if let TransactionPurpose::SweepDeposits { .. } = &transaction.purpose {
-            self.deposits.drop_swept(signature);
-            return;
+        match &transaction.purpose {
+            TransactionPurpose::SweepDeposits { .. } => {
+                self.deposits.drop_swept(signature);
+                return;
+            }
+            TransactionPurpose::SweepSplDeposits { .. } => {
+                self.spl_deposits.drop_swept(signature);
+                return;
+            }
+            TransactionPurpose::WithdrawSol { .. } => {}
         }
         assert!(
             self.transactions_to_resubmit
@@ -612,6 +622,17 @@ impl State {
             TransactionPurpose::SweepDeposits { deposit_ids } => {
                 self.deposits.sweep(deposit_ids, transaction, signature)
             }
+            TransactionPurpose::SweepSplDeposits { deposit_ids } => {
+                self.spl_deposits.sweep(
+                    deposit_ids,
+                    transaction,
+                    signers,
+                    &self.supported_spl_tokens,
+                    signature,
+                );
+                // This field is in lamports; SPL token amounts stay in the sweep deposits.
+                0
+            }
         };
         assert_eq!(
             self.submitted_transactions.insert(
@@ -645,6 +666,7 @@ impl State {
             !matches!(
                 old_transaction.purpose,
                 TransactionPurpose::SweepDeposits { .. }
+                    | TransactionPurpose::SweepSplDeposits { .. }
             ),
             "BUG: sweep transaction {old_signature} must be dropped instead of resubmitted"
         );
@@ -687,6 +709,9 @@ impl State {
         match &transaction.purpose {
             TransactionPurpose::WithdrawSol { .. } => {}
             TransactionPurpose::SweepDeposits { .. } => self.deposits.finalize_swept(signature),
+            TransactionPurpose::SweepSplDeposits { .. } => {
+                self.spl_deposits.finalize_swept(signature)
+            }
         }
         assert!(
             !self.transactions_to_resubmit.contains_key(signature),
@@ -718,8 +743,10 @@ impl State {
             !self.transactions_to_resubmit.contains_key(signature),
             "BUG: transaction {signature} is queued for resubmission but is being marked as failed"
         );
-        if let TransactionPurpose::SweepDeposits { .. } = &transaction.purpose {
-            self.deposits.drop_swept(signature);
+        match &transaction.purpose {
+            TransactionPurpose::SweepDeposits { .. } => self.deposits.drop_swept(signature),
+            TransactionPurpose::SweepSplDeposits { .. } => self.spl_deposits.drop_swept(signature),
+            TransactionPurpose::WithdrawSol { .. } => {}
         }
         assert_eq!(
             self.failed_transactions.insert(*signature, transaction),
