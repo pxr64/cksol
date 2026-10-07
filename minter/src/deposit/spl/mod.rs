@@ -17,6 +17,8 @@ use solana_address::Address;
 #[cfg(test)]
 mod tests;
 
+mod timer;
+
 /// Entry point for balance-based SPL deposits.
 pub async fn deposit_spl<R: CanisterRuntime>(
     runtime: &R,

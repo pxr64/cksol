@@ -126,22 +126,27 @@ pub async fn create_signed_batch_withdrawal_transaction<R: CanisterRuntime>(
     Ok((transaction, signers))
 }
 
+/// The wire size of the transaction of the given message, with every required signature.
+pub fn transaction_size(message: &Message) -> usize {
+    let signatures = message.header.num_required_signatures as usize;
+    1 + message.serialize().len() + signatures * BYTES_PER_SIGNATURE
+}
+
 /// Signs the transaction, unless it exceeds the maximum transaction size.
 async fn sign_transaction(
     transaction: &mut Transaction,
     signer_derivation_paths: impl IntoIterator<Item = DerivationPath>,
     signer: &impl SchnorrSigner,
 ) -> Result<(), CreateTransferError> {
-    let message_bytes = transaction.message_data();
     // The size is known before signing, and each signature is a paid call to the IC.
-    let signatures = transaction.message.header.num_required_signatures as usize;
-    let tx_size = 1 + message_bytes.len() + signatures * BYTES_PER_SIGNATURE;
+    let tx_size = transaction_size(&transaction.message);
     if tx_size > MAX_TX_SIZE {
         return Err(CreateTransferError::TransactionTooLarge {
             max: MAX_TX_SIZE,
             got: tx_size,
         });
     }
+    let message_bytes = transaction.message_data();
     transaction.signatures = sign_bytes(signer_derivation_paths, signer, message_bytes).await?;
     Ok(())
 }
