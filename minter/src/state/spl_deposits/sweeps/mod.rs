@@ -1,16 +1,23 @@
 use crate::{
     address::{account_address, associated_token_address, minter_address},
     state::{
-        QueuedSplDeposit, SchnorrPublicKey, SupportedSplToken, TokenProgram,
-        event::{Signer, VersionedMessage},
+        QueuedSplDeposit, SchnorrPublicKey, SupportedSplToken, SweepMismatch, SweepSettlementError,
+        TokenProgram, UnreadableOutcome,
+        event::{CreditedSplDeposit, Signer, VersionedMessage},
+        validate_sweep_transaction,
     },
 };
 use cksol_types::DepositSplId;
 use icrc_ledger_types::icrc1::account::Account;
+use sol_rpc_types::Lamport;
 use solana_address::Address;
 use solana_hash::Hash;
 use solana_signature::Signature;
 use solana_transaction::Message;
+use solana_transaction_status_client_types::{
+    EncodedConfirmedTransactionWithStatusMeta, UiTransactionStatusMeta, UiTransactionTokenBalance,
+    option_serializer::OptionSerializer,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -207,6 +214,105 @@ impl SplSweep {
         &self.transfers
     }
 
+    /// Checks the executed message and balance changes against the sweep plan.
+    /// Returns the lamport spend to debit and the token deposits to mint.
+    pub fn settle(
+        self,
+        outcome: &EncodedConfirmedTransactionWithStatusMeta,
+    ) -> Result<SettledSplSweep, SweepSettlementError> {
+        let (message, meta) = validate_sweep_transaction(outcome, |hash| self.sweep_message(hash))?;
+        let pre_lamports = meta.pre_balances[0];
+        let post_lamports = meta.post_balances[0];
+        let lamports_spent = pre_lamports
+            .checked_sub(post_lamports)
+            .filter(|spent| *spent >= meta.fee)
+            .ok_or(SweepMismatch::UnexpectedLamportsSpent {
+                pre: pre_lamports,
+                post: post_lamports,
+                fee: meta.fee,
+            })?;
+        self.validate_token_balances(&message, meta)?;
+        let mints = self
+            .deposits
+            .into_iter()
+            .map(|(deposit_id, deposit)| CreditedSplDeposit {
+                deposit_id,
+                amount_to_mint: deposit.balance,
+            })
+            .collect();
+        Ok(SettledSplSweep {
+            lamports_spent,
+            mints,
+        })
+    }
+
+    fn validate_token_balances(
+        &self,
+        message: &Message,
+        meta: &UiTransactionStatusMeta,
+    ) -> Result<(), SweepSettlementError> {
+        let pre = token_balances(&meta.pre_token_balances, &message.account_keys)?;
+        let post = token_balances(&meta.post_token_balances, &message.account_keys)?;
+        let mut expected = BTreeMap::new();
+        for transfer in &self.transfers {
+            let deposit = &self.deposits[&transfer.deposit_id];
+            let token_program = transfer.token_program.id();
+            expected.insert(
+                deposit.address,
+                ExpectedTokenBalance {
+                    mint: deposit.mint,
+                    owner: transfer.owner,
+                    token_program,
+                    decimals: transfer.decimals,
+                    change: -i128::from(deposit.balance),
+                },
+            );
+            let destination =
+                associated_token_address(&self.minter_address, &deposit.mint, &token_program);
+            expected
+                .entry(destination)
+                .or_insert(ExpectedTokenBalance {
+                    mint: deposit.mint,
+                    owner: self.minter_address,
+                    token_program,
+                    decimals: transfer.decimals,
+                    change: 0,
+                })
+                .change += i128::from(deposit.balance);
+        }
+        for (address, expected) in expected {
+            let post = post
+                .get(&address)
+                .ok_or(UnreadableOutcome::IncompleteTokenBalances)?;
+            let post = expected.amount(address, post)?;
+            let pre = match pre.get(&address) {
+                Some(balance) => expected.amount(address, balance)?,
+                // An ATA created by the sweep has no pre-token balance. Only infer zero
+                // for destinations that did not exist before the transaction.
+                None if expected.change > 0
+                    && message
+                        .account_keys
+                        .iter()
+                        .position(|key| *key == address)
+                        .is_some_and(|index| meta.pre_balances[index] == 0) =>
+                {
+                    0
+                }
+                None => return Err(UnreadableOutcome::IncompleteTokenBalances.into()),
+            };
+            if i128::from(post) - i128::from(pre) != expected.change {
+                return Err(SweepMismatch::UnexpectedTokenBalanceChange {
+                    address,
+                    pre,
+                    post,
+                    expected_change: expected.change,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     /// The signers of the given message of this sweep, in signature order.
     pub fn signers(&self, message: &Message) -> Vec<Signer> {
         let accounts_by_owner: BTreeMap<Address, Account> = self
@@ -266,6 +372,86 @@ impl SplSweep {
         }
         Message::new_with_blockhash(&instructions, Some(&self.minter_address), &recent_blockhash)
     }
+}
+
+/// A validated SPL sweep with the main account's spend and token deposits to mint.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SettledSplSweep {
+    lamports_spent: Lamport,
+    mints: Vec<CreditedSplDeposit>,
+}
+
+impl SettledSplSweep {
+    pub fn lamports_spent(&self) -> Lamport {
+        self.lamports_spent
+    }
+
+    pub fn into_mints(self) -> Vec<CreditedSplDeposit> {
+        self.mints
+    }
+}
+
+struct ExpectedTokenBalance {
+    mint: Address,
+    owner: Address,
+    token_program: Address,
+    decimals: u8,
+    change: i128,
+}
+
+impl ExpectedTokenBalance {
+    fn amount(
+        &self,
+        address: Address,
+        balance: &UiTransactionTokenBalance,
+    ) -> Result<u64, SweepSettlementError> {
+        let (OptionSerializer::Some(owner), OptionSerializer::Some(program)) =
+            (&balance.owner, &balance.program_id)
+        else {
+            return Err(UnreadableOutcome::IncompleteTokenBalances.into());
+        };
+        if balance.mint != self.mint.to_string()
+            || *owner != self.owner.to_string()
+            || *program != self.token_program.to_string()
+            || balance.ui_token_amount.decimals != self.decimals
+        {
+            return Err(SweepMismatch::UnexpectedTokenAccount { address }.into());
+        }
+        balance
+            .ui_token_amount
+            .amount
+            .parse()
+            .map_err(|error: std::num::ParseIntError| {
+                UnreadableOutcome::InvalidTokenBalances {
+                    reason: error.to_string(),
+                }
+                .into()
+            })
+    }
+}
+
+fn token_balances<'a>(
+    balances: &'a OptionSerializer<Vec<UiTransactionTokenBalance>>,
+    keys: &[Address],
+) -> Result<BTreeMap<Address, &'a UiTransactionTokenBalance>, SweepSettlementError> {
+    let OptionSerializer::Some(balances) = balances else {
+        return Err(UnreadableOutcome::IncompleteTokenBalances.into());
+    };
+    let mut by_address = BTreeMap::new();
+    for balance in balances {
+        let address = *keys.get(balance.account_index as usize).ok_or_else(|| {
+            UnreadableOutcome::InvalidTokenBalances {
+                reason: "Token account index is out of bounds".to_string(),
+            }
+        })?;
+        if by_address.insert(address, balance).is_some() {
+            return Err(UnreadableOutcome::InvalidTokenBalances {
+                reason: "Duplicate token account balance".to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(by_address)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

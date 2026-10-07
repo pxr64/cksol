@@ -228,6 +228,21 @@ fn get_events(
                     })
                     .collect(),
             },
+            EventType::CreditedSplSweep {
+                signature,
+                lamports_spent,
+                mints,
+            } => event::EventType::CreditedSplSweep {
+                signature: signature.into(),
+                lamports_spent,
+                mints: mints
+                    .into_iter()
+                    .map(|mint| event::CreditedSplDeposit {
+                        deposit_id: mint.deposit_id,
+                        amount_to_mint: mint.amount_to_mint,
+                    })
+                    .collect(),
+            },
             EventType::QuarantinedSweep { signature } => event::EventType::QuarantinedSweep {
                 signature: signature.into(),
             },

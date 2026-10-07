@@ -345,6 +345,12 @@ type CreditedDeposit = record {
     amount_to_mint: Lamport;
 };
 
+// A validated SPL deposit to mint on its token ledger.
+type CreditedSplDeposit = record {
+    deposit_id: DepositSplId;
+    amount_to_mint: nat64;
+};
+
 // Event payload for an accepted ckSOL-to-Solana withdrawal request.
 //
 // *WARNING*: This type is used exclusively by the debug `get_events` endpoint.
@@ -482,6 +488,15 @@ type EventType = variant {
         address: Address;
         // The token-account balance when the deposit was queued, in the mint's smallest units.
         balance: nat64;
+    };
+    // A finalized SPL sweep was validated and its deposits queued for ledger minting.
+    CreditedSplSweep : record {
+        // The signature of the finalized sweep transaction.
+        signature: Signature;
+        // The main account's spend on the transaction fee and destination rent.
+        lamports_spent: Lamport;
+        // The mint enqueued for each deposit of the sweep.
+        mints: vec CreditedSplDeposit;
     };
     // The minter read the amount that the finalized sweep transaction moved to
     // its main account and enqueued a pending mint for each deposit of that sweep.

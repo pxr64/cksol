@@ -1,6 +1,6 @@
 use crate::state::{
     SupportedSplToken,
-    event::{Signer, VersionedMessage},
+    event::{CreditedSplDeposit, Signer, VersionedMessage},
 };
 use cksol_types::DepositSplId;
 use icrc_ledger_types::icrc1::account::Account;
@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 mod tests;
 
 mod sweeps;
-pub use sweeps::{SplSweep, SplSweepRecoveryError, SplSweeps, SplTransfer};
+pub use sweeps::{SettledSplSweep, SplSweep, SplSweepRecoveryError, SplSweeps, SplTransfer};
 
 /// SPL deposits grouped by their progress towards a token mint.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -21,6 +21,7 @@ pub struct SplDeposits {
     queued: BTreeMap<DepositSplId, QueuedSplDeposit>,
     swept: SplSweeps,
     finalized: SplSweeps,
+    pending_mints: BTreeMap<DepositSplId, PendingSplMint>,
     dropped: BTreeMap<DepositSplId, SweptSplDeposit>,
     in_flight_ids: BTreeMap<(Account, Address), DepositSplId>,
 }
@@ -44,6 +45,10 @@ impl SplDeposits {
 
     pub fn dropped(&self) -> &BTreeMap<DepositSplId, SweptSplDeposit> {
         &self.dropped
+    }
+
+    pub fn pending_mints(&self) -> &BTreeMap<DepositSplId, PendingSplMint> {
+        &self.pending_mints
     }
 
     pub fn in_flight_id(&self, account: &Account, mint: &Address) -> Option<DepositSplId> {
@@ -108,6 +113,53 @@ impl SplDeposits {
         self.finalized.insert(*signature, sweep);
     }
 
+    /// Moves every deposit of a finalized sweep to its pending token mint.
+    pub(super) fn credit_sweep(
+        &mut self,
+        signature: &Signature,
+        mints: &[CreditedSplDeposit],
+        timestamp: u64,
+    ) {
+        let sweep = self.finalized.remove(signature).unwrap_or_else(|| {
+            panic!("Attempted to credit SPL sweep {signature} that is not finalized")
+        });
+        assert_eq!(
+            mints.len(),
+            sweep.deposits().len(),
+            "Attempted to credit SPL sweep {signature} with {} mints for {} deposits",
+            mints.len(),
+            sweep.deposits().len()
+        );
+        for mint in mints {
+            let deposit = sweep.deposits().get(&mint.deposit_id).unwrap_or_else(|| {
+                panic!(
+                    "Attempted to credit SPL deposit {} that is not part of sweep {signature}",
+                    mint.deposit_id
+                )
+            });
+            assert_eq!(
+                mint.amount_to_mint, deposit.balance,
+                "Attempted to credit SPL deposit {} with an amount different from its transferred balance",
+                mint.deposit_id
+            );
+            let pending = PendingSplMint {
+                deposit: SweptSplDeposit {
+                    deposit: deposit.clone(),
+                    signature: *signature,
+                },
+                amount_to_mint: mint.amount_to_mint,
+                created_at_time: timestamp,
+            };
+            assert!(
+                self.pending_mints
+                    .insert(mint.deposit_id, pending)
+                    .is_none(),
+                "Attempted to credit SPL deposit {} twice in sweep {signature}",
+                mint.deposit_id
+            );
+        }
+    }
+
     /// Drops a failed or expired sweep and releases its account and mint pairs.
     pub(super) fn drop_swept(&mut self, signature: &Signature) {
         let sweep = self
@@ -146,4 +198,23 @@ pub struct QueuedSplDeposit {
 pub struct SweptSplDeposit {
     pub deposit: QueuedSplDeposit,
     pub signature: Signature,
+}
+
+/// A swept SPL deposit waiting for its token ledger mint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSplMint {
+    pub deposit: SweptSplDeposit,
+    pub amount_to_mint: u64,
+    /// The credit event's timestamp, reused by ledger retries for deduplication.
+    pub created_at_time: u64,
+}
+
+impl PendingSplMint {
+    pub fn account(&self) -> Account {
+        self.deposit.deposit.account
+    }
+
+    pub fn sweep_signature(&self) -> Signature {
+        self.deposit.signature
+    }
 }

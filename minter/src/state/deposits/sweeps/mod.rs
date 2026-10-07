@@ -3,6 +3,7 @@ use crate::{
     state::{
         QueuedDeposit,
         event::{CreditedDeposit, VersionedMessage},
+        validate_sweep_transaction,
     },
 };
 use cksol_types::DepositSolId;
@@ -238,33 +239,7 @@ impl Sweep {
         self,
         outcome: &EncodedConfirmedTransactionWithStatusMeta,
     ) -> Result<SettledSweep, SweepSettlementError> {
-        let transaction = outcome
-            .transaction
-            .transaction
-            .decode()
-            .ok_or(UnreadableOutcome::TransactionDecodingFailed)?;
-        let meta = outcome
-            .transaction
-            .meta
-            .as_ref()
-            .ok_or(UnreadableOutcome::NoMetaField)?;
-        if let Some(error) = &meta.err {
-            return Err(SweepMismatch::TransactionFailed {
-                error: error.to_string(),
-            }
-            .into());
-        }
-        let solana_message::VersionedMessage::Legacy(message) = &transaction.message else {
-            return Err(SweepMismatch::UnexpectedMessage.into());
-        };
-        if message != &self.sweep_message(message.recent_blockhash) {
-            return Err(SweepMismatch::UnexpectedMessage.into());
-        }
-        if meta.pre_balances.len() != message.account_keys.len()
-            || meta.post_balances.len() != message.account_keys.len()
-        {
-            return Err(UnreadableOutcome::IncompleteBalances.into());
-        }
+        let (message, meta) = validate_sweep_transaction(outcome, |hash| self.sweep_message(hash))?;
         if meta.fee > self.fee() {
             return Err(SweepMismatch::UnexpectedFee {
                 expected: self.fee(),
@@ -386,6 +361,10 @@ pub enum UnreadableOutcome {
     NoMetaField,
     #[error("the balances in the metadata do not cover all account keys")]
     IncompleteBalances,
+    #[error("the token balances in the metadata do not cover the sweep accounts")]
+    IncompleteTokenBalances,
+    #[error("the token balances could not be read: {reason}")]
+    InvalidTokenBalances { reason: String },
 }
 
 #[derive(Debug, PartialEq, Eq, Error)]
@@ -413,6 +392,25 @@ pub enum SweepMismatch {
     MainAccountDebited { pre: Lamport, post: Lamport },
     #[error("the main account received {actual} lamports instead of the planned {expected}")]
     UnexpectedAmountReceived { expected: Lamport, actual: Lamport },
+    #[error("the token balance metadata for {address} does not match the planned token account")]
+    UnexpectedTokenAccount { address: Address },
+    #[error(
+        "the token account {address} went from {pre} to {post} tokens instead of changing by {expected_change}"
+    )]
+    UnexpectedTokenBalanceChange {
+        address: Address,
+        pre: u64,
+        post: u64,
+        expected_change: i128,
+    },
+    #[error(
+        "the main account went from {pre} to {post} lamports, spending less than the fee of {fee}"
+    )]
+    UnexpectedLamportsSpent {
+        pre: Lamport,
+        post: Lamport,
+        fee: Lamport,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]

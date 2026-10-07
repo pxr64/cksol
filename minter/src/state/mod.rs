@@ -36,11 +36,13 @@ mod deposits;
 pub mod event;
 mod spl;
 mod spl_deposits;
+mod sweep;
+use sweep::validate_sweep_transaction;
 
 pub use spl::{SupportedSplToken, TokenProgram};
 pub use spl_deposits::{
-    QueuedSplDeposit, SplDeposits, SplSweep, SplSweepRecoveryError, SplSweeps, SplTransfer,
-    SweptSplDeposit,
+    PendingSplMint, QueuedSplDeposit, SettledSplSweep, SplDeposits, SplSweep,
+    SplSweepRecoveryError, SplSweeps, SplTransfer, SweptSplDeposit,
 };
 
 pub use deposits::{
@@ -491,6 +493,19 @@ impl State {
         );
         self.deposits.credit_sweep(signature, mints, timestamp);
         self.balance += amount_received;
+    }
+
+    fn process_credited_spl_sweep(
+        &mut self,
+        signature: &Signature,
+        lamports_spent: Lamport,
+        mints: &[event::CreditedSplDeposit],
+        timestamp: u64,
+    ) {
+        self.spl_deposits.credit_sweep(signature, mints, timestamp);
+        // Operator top-ups are not tracked, and withdrawals can consume the tracked
+        // balance before settlement, so an on-chain spend may exceed this balance.
+        self.balance = self.balance.saturating_sub(lamports_spent);
     }
 
     fn process_minted_swept_deposit(

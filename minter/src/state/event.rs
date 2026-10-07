@@ -204,6 +204,19 @@ pub enum EventType {
         #[n(4)]
         balance: u64,
     },
+    /// A finalized SPL sweep was validated and its deposits queued for ledger minting.
+    #[n(17)]
+    CreditedSplSweep {
+        /// The signature of the finalized sweep transaction.
+        #[cbor(n(0), with = "cbor::signature")]
+        signature: Signature,
+        /// The main account's spend on the transaction fee and destination rent.
+        #[n(1)]
+        lamports_spent: Lamport,
+        /// The mint enqueued for each deposit of the sweep.
+        #[n(2)]
+        mints: Vec<CreditedSplDeposit>,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.
@@ -214,6 +227,16 @@ pub struct CreditedDeposit {
     /// The sweepable amount minus the deposit's share of the transaction fee of the sweep.
     #[n(1)]
     pub amount_to_mint: Lamport,
+}
+
+/// A validated SPL deposit to mint on its token ledger.
+#[derive(Clone, Eq, PartialEq, Debug, Decode, Encode)]
+pub struct CreditedSplDeposit {
+    #[n(0)]
+    pub deposit_id: DepositSplId,
+    /// The transferred token amount in the mint's smallest units.
+    #[n(1)]
+    pub amount_to_mint: u64,
 }
 
 /// Payload of the `AcceptedWithdrawalRequest` event.

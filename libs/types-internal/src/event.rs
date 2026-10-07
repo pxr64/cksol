@@ -87,6 +87,15 @@ pub enum EventType {
         /// The balance of the deposit address when the deposit was queued.
         balance: Lamport,
     },
+    /// A finalized SPL sweep was validated and its deposits queued for ledger minting.
+    CreditedSplSweep {
+        /// The signature of the finalized sweep transaction.
+        signature: Signature,
+        /// The main account's spend on the transaction fee and destination rent.
+        lamports_spent: Lamport,
+        /// The mint enqueued for each deposit of the sweep.
+        mints: Vec<CreditedSplDeposit>,
+    },
     /// The minter read the amount that the finalized sweep transaction moved to its
     /// main account and enqueued a pending mint for each deposit of that sweep.
     CreditedSweep {
@@ -168,6 +177,13 @@ pub struct CreditedDeposit {
     pub deposit_id: u64,
     /// The sweepable amount minus the deposit's share of the transaction fee of the sweep.
     pub amount_to_mint: Lamport,
+}
+
+/// A validated SPL deposit to mint on its token ledger.
+#[derive(Clone, Debug, PartialEq, CandidType, Deserialize)]
+pub struct CreditedSplDeposit {
+    pub deposit_id: u64,
+    pub amount_to_mint: u64,
 }
 
 /// The key that produced one signature of a submitted Solana transaction.

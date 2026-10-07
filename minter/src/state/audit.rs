@@ -86,6 +86,13 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
             state.process_quarantined_pending_mint(*deposit_id);
         }
         EventType::AddedSplToken(token) => state.process_added_spl_token(token),
+        EventType::CreditedSplSweep {
+            signature,
+            lamports_spent,
+            mints,
+        } => {
+            state.process_credited_spl_sweep(signature, *lamports_spent, mints, timestamp);
+        }
         EventType::QueuedSplDeposit {
             deposit_id,
             account,
