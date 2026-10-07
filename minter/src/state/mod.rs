@@ -907,6 +907,7 @@ pub struct SchnorrPublicKey {
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum TaskType {
     SweepDeposits,
+    SweepSplDeposits,
     Mint,
     FinalizeTransactions,
     ResubmitTransactions,

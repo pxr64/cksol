@@ -2,14 +2,388 @@ use super::*;
 use crate::sol_transfer::{MAX_SIGNATURES, MAX_TX_SIZE};
 use crate::{
     lifecycle,
-    state::{TokenProgram, audit::process_event, event::EventType, mutate_state, read_state},
+    state::{
+        TokenProgram,
+        audit::{process_event, replay_events},
+        event::{Event, EventType, TransactionPurpose},
+        mutate_state, read_state,
+    },
+    storage::with_event_iter,
     test_fixtures::{
-        account, queued_spl_deposit, runtime::TestCanisterRuntime, schnorr_master_key, spl_token,
-        valid_init_args,
+        DEFAULT_BLOCK_HEIGHT, EventsAssert, account, confirmed_block, minter_signature,
+        minter_signature_nth, queued_spl_deposit,
+        runtime::TestCanisterRuntime,
+        schnorr_master_key, schnorr_master_key_response,
+        signer::{sign_as_minter, sign_for},
+        spl_token, valid_init_args,
     },
 };
+use assert_matches::assert_matches;
+use ic_canister_runtime::IcError;
+use ic_cdk::call::CallRejected;
+use ic_cdk_management_canister::SignCallError;
+use ic_stable_structures::Storable;
+use sol_rpc_types::{MultiRpcResult, RpcError};
 use solana_hash::Hash;
 use solana_transaction::Transaction;
+
+fn queued_sweep() -> SplSweep {
+    read_state(|state| SweepRound::take_from_queue(state, &schnorr_master_key()))
+        .batches
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+fn block() -> Block {
+    Block {
+        slot: 300_000_000,
+        blockhash: Hash::new_from_array([0xBB; 32]),
+        block_height: DEFAULT_BLOCK_HEIGHT,
+    }
+}
+
+fn signing_runtime() -> TestCanisterRuntime {
+    TestCanisterRuntime::new()
+        .with_increasing_time()
+        .add_signer(sign_as_minter())
+        .add_signer(sign_for(&account(1)))
+}
+
+fn fetched_block() -> Block {
+    Block {
+        blockhash: confirmed_block().blockhash.to_string().parse().unwrap(),
+        ..block()
+    }
+}
+
+#[tokio::test]
+async fn should_return_early_when_spl_queue_is_empty() {
+    queue_deposits(0, false, true, Some(TokenProgram::Classic));
+    let before = EventsAssert::from_recorded();
+    let runtime = TestCanisterRuntime::new();
+
+    sweep_queued_spl_deposits(runtime.clone()).await;
+
+    assert_eq!(EventsAssert::from_recorded(), before);
+    assert!(runtime.sent_update_calls().is_empty());
+    assert_eq!(runtime.schnorr_public_key_call_count(), 0);
+    assert_eq!(runtime.set_timer_call_count(), 0);
+    assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
+}
+
+#[tokio::test]
+async fn should_return_early_when_spl_sweep_timer_is_active() {
+    queue_deposits(2, true, false, None);
+    let guard = TimerGuard::new(TaskType::SweepSplDeposits).unwrap();
+    let before = EventsAssert::from_recorded();
+    let runtime = TestCanisterRuntime::new();
+
+    sweep_queued_spl_deposits(runtime.clone()).await;
+
+    assert_eq!(EventsAssert::from_recorded(), before);
+    assert!(runtime.sent_update_calls().is_empty());
+    assert_eq!(runtime.schnorr_public_key_call_count(), 0);
+    assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_err());
+    drop(guard);
+    assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
+}
+
+#[tokio::test]
+async fn should_leave_spl_queue_unchanged_when_fetching_block_fails() {
+    queue_deposits(2, true, false, None);
+    let before = EventsAssert::from_recorded();
+    let runtime = TestCanisterRuntime::new()
+        .with_schnorr_public_key(schnorr_master_key_response())
+        .add_recent_block(Err(RpcError::ValidationError(
+            "block unavailable".to_string(),
+        )));
+
+    sweep_queued_spl_deposits(runtime.clone()).await;
+
+    assert_eq!(EventsAssert::from_recorded(), before);
+    assert_eq!(runtime.schnorr_public_key_call_count(), 1);
+    assert_eq!(runtime.set_timer_call_count(), 0);
+    assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
+    read_state(|state| assert_eq!(state.spl_deposits().queued().len(), 2));
+}
+
+#[tokio::test]
+async fn should_sweep_spl_deposits_while_sol_sweep_timer_is_active() {
+    queue_deposits(2, true, false, None);
+    let sol_guard = TimerGuard::new(TaskType::SweepDeposits).unwrap();
+    let sweep = queued_sweep();
+    let runtime = signing_runtime()
+        .add_recent_block(Ok(block().slot))
+        .with_schnorr_public_key(schnorr_master_key_response())
+        .add_stub_response(MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Ok(
+            minter_signature().into(),
+        )));
+
+    sweep_queued_spl_deposits(runtime.clone()).await;
+
+    assert_eq!(runtime.schnorr_public_key_call_count(), 1);
+    assert_eq!(runtime.set_timer_call_count(), 0);
+    assert!(TimerGuard::new(TaskType::SweepDeposits).is_err());
+    assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
+    drop(sol_guard);
+    assert_submission_is_tracked(&sweep, fetched_block());
+}
+
+#[tokio::test]
+async fn should_keep_spl_sweep_tracked_when_timer_submission_fails() {
+    queue_deposits(2, true, false, None);
+    let sweep = queued_sweep();
+    let runtime = signing_runtime()
+        .add_recent_block(Ok(block().slot))
+        .with_schnorr_public_key(schnorr_master_key_response())
+        .add_stub_error(IcError::CallPerformFailed);
+
+    sweep_queued_spl_deposits(runtime.clone()).await;
+
+    assert_submission_is_tracked(&sweep, fetched_block());
+    assert_eq!(runtime.set_timer_call_count(), 0);
+    assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
+}
+
+#[tokio::test]
+async fn should_leave_spl_deposits_queued_when_timer_signing_fails() {
+    queue_deposits(2, true, false, None);
+    let before = EventsAssert::from_recorded();
+    let runtime = TestCanisterRuntime::new()
+        .add_recent_block(Ok(block().slot))
+        .with_schnorr_public_key(schnorr_master_key_response())
+        .add_signer(sign_as_minter().expect([Err(SignCallError::CallFailed(
+            CallRejected::with_rejection(4, "signing unavailable".to_string()).into(),
+        ))]));
+
+    sweep_queued_spl_deposits(runtime.clone()).await;
+
+    assert_eq!(EventsAssert::from_recorded(), before);
+    assert_eq!(runtime.set_timer_call_count(), 0);
+    assert!(
+        !runtime
+            .sent_update_calls()
+            .iter()
+            .any(|call| call.method == "sendTransaction")
+    );
+    assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
+    read_state(|state| {
+        assert_eq!(state.spl_deposits().queued().len(), 2);
+        assert!(state.submitted_transactions().is_empty());
+    });
+}
+
+#[tokio::test]
+async fn should_reschedule_spl_sweep_round_until_all_deposits_are_submitted() {
+    queue_deposits(100, false, true, Some(TokenProgram::Classic));
+    let round = read_state(|state| SweepRound::take_from_queue(state, &schnorr_master_key()));
+    assert_eq!(round.batches.len(), MAX_CONCURRENT_RPC_CALLS);
+    assert!(round.leaves_deposits_queued);
+    let first_round_count = round
+        .batches
+        .iter()
+        .map(|batch| batch.deposits().len())
+        .sum::<usize>();
+    let (remaining, tokens) = read_state(|state| {
+        let deposits: Vec<_> = state
+            .spl_deposits()
+            .queued()
+            .iter()
+            .skip(first_round_count)
+            .map(|(id, deposit)| (*id, deposit.clone()))
+            .collect();
+        let tokens = deposits
+            .iter()
+            .map(|(_, deposit)| {
+                (
+                    deposit.mint,
+                    state.supported_spl_token(&deposit.mint).cloned().unwrap(),
+                )
+            })
+            .collect();
+        (deposits, tokens)
+    });
+    let first_batch_size = round.batches[0].deposits().len();
+    let second_round_batches = remaining
+        .chunks(first_batch_size)
+        .map(|batch| SplSweep::plan(batch.iter().cloned(), &tokens, &schnorr_master_key()))
+        .collect::<Vec<_>>();
+    let total_batches = round.batches.len() + second_round_batches.len();
+    let mut runtime = TestCanisterRuntime::new()
+        .with_increasing_time()
+        .with_schnorr_public_key(schnorr_master_key_response())
+        .add_signer(sign_as_minter().times(total_batches));
+    for id in 1..=100 {
+        runtime = runtime.add_signer(sign_for(&account(id)));
+    }
+    runtime = runtime.add_recent_block(Ok(block().slot));
+    for batch in 0..round.batches.len() {
+        runtime =
+            runtime.add_stub_response(MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Ok(
+                minter_signature_nth(batch).into(),
+            )));
+    }
+    runtime = runtime.add_recent_block(Ok(block().slot));
+    for batch in round.batches.len()..total_batches {
+        runtime =
+            runtime.add_stub_response(MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Ok(
+                minter_signature_nth(batch).into(),
+            )));
+    }
+
+    sweep_queued_spl_deposits(runtime.clone()).await;
+
+    assert_eq!(runtime.set_timer_call_count(), 1);
+    read_state(|state| {
+        assert_eq!(
+            state.submitted_transactions().len(),
+            MAX_CONCURRENT_RPC_CALLS
+        );
+        assert_eq!(state.spl_deposits().queued().len(), 100 - first_round_count);
+    });
+
+    sweep_queued_spl_deposits(runtime.clone()).await;
+
+    assert_eq!(runtime.set_timer_call_count(), 1);
+    assert_eq!(runtime.schnorr_public_key_call_count(), 1);
+    assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
+    read_state(|state| {
+        assert!(state.spl_deposits().queued().is_empty());
+        assert_eq!(state.spl_deposits().swept().deposit_count(), 100);
+        assert_eq!(state.submitted_transactions().len(), total_batches);
+    });
+}
+
+fn assert_submission_is_tracked(sweep: &SplSweep, block: Block) {
+    let message = sweep.sweep_message(block.blockhash);
+    let expected = EventType::SubmittedTransaction {
+        signature: minter_signature(),
+        message: message.clone().into(),
+        signers: sweep.signers(&message),
+        purpose: TransactionPurpose::SweepSplDeposits {
+            deposit_ids: sweep.deposits().keys().copied().collect(),
+        },
+        block_height: block.block_height,
+    };
+    assert!(EventsAssert::from_recorded().contains_event(&expected));
+    read_state(|state| {
+        assert!(state.spl_deposits().queued().is_empty());
+        assert_eq!(
+            state.spl_deposits().swept().get(&minter_signature()),
+            Some(sweep)
+        );
+        let submitted = state
+            .submitted_transactions()
+            .get(&minter_signature())
+            .unwrap();
+        assert_eq!(submitted.message, message.into());
+        assert_eq!(submitted.block_height, block.block_height);
+        assert!(state.failed_transactions().is_empty());
+        assert!(state.succeeded_transactions().is_empty());
+        for (deposit_id, deposit) in sweep.deposits() {
+            assert_eq!(
+                state
+                    .spl_deposits()
+                    .in_flight_id(&deposit.account, &deposit.mint),
+                Some(*deposit_id)
+            );
+        }
+    });
+    let mut replayed = replay_events(with_event_iter(|events| {
+        events
+            .map(|event| Event::from_bytes(event.to_bytes()))
+            .collect::<Vec<_>>()
+    }));
+    // The public key is a transient cache, fetched again after upgrade.
+    if let Some(key) = read_state(|state| state.minter_public_key().cloned()) {
+        replayed.cache_minter_public_key(key);
+    }
+    read_state(|state| assert_eq!(state, &replayed));
+}
+
+#[tokio::test]
+async fn should_sign_record_and_submit_spl_sweep() {
+    queue_deposits(2, true, false, None);
+    let sweep = queued_sweep();
+    let before = EventsAssert::from_recorded().len();
+    let runtime = signing_runtime().add_stub_response(
+        MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Ok(minter_signature().into())),
+    );
+
+    let signature = submit_spl_sweep_transaction(&runtime, sweep.clone(), block())
+        .await
+        .unwrap();
+
+    assert_eq!(signature, minter_signature());
+    assert_eq!(EventsAssert::from_recorded().len(), before + 1);
+    assert_submission_is_tracked(&sweep, block());
+    let calls = runtime.sent_update_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].method, "sendTransaction");
+    assert_eq!(runtime.set_timer_call_count(), 0);
+}
+
+#[tokio::test]
+async fn should_keep_spl_sweep_tracked_when_rpc_submission_fails() {
+    queue_deposits(2, true, false, None);
+    let sweep = queued_sweep();
+    let error = RpcError::ValidationError("submission failed".to_string());
+    let runtime = signing_runtime().add_stub_response(
+        MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Err(error.clone())),
+    );
+
+    let result = submit_spl_sweep_transaction(&runtime, sweep.clone(), block()).await;
+
+    assert_matches!(result, Err(SweepError::SubmitTransactionFailed(SubmitTransactionError::RpcError(actual))) if actual == error);
+    assert_submission_is_tracked(&sweep, block());
+    assert_eq!(runtime.sent_update_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn should_keep_spl_sweep_tracked_when_inter_canister_submission_fails() {
+    queue_deposits(2, true, false, None);
+    let sweep = queued_sweep();
+    let runtime = signing_runtime().add_stub_error(IcError::CallPerformFailed);
+
+    let result = submit_spl_sweep_transaction(&runtime, sweep.clone(), block()).await;
+
+    assert_matches!(
+        result,
+        Err(SweepError::SubmitTransactionFailed(
+            SubmitTransactionError::IcError(IcError::CallPerformFailed)
+        ))
+    );
+    assert_submission_is_tracked(&sweep, block());
+}
+
+#[tokio::test]
+async fn should_leave_spl_deposits_queued_when_signing_fails() {
+    queue_deposits(2, true, false, None);
+    let sweep = queued_sweep();
+    let before = EventsAssert::from_recorded();
+    let runtime = TestCanisterRuntime::new().add_signer(sign_as_minter().expect([Err(
+        SignCallError::CallFailed(
+            CallRejected::with_rejection(4, "signing service unavailable".to_string()).into(),
+        ),
+    )]));
+
+    let result = submit_spl_sweep_transaction(&runtime, sweep.clone(), block()).await;
+
+    assert_matches!(
+        result,
+        Err(SweepError::CreateTransactionFailed(
+            CreateTransferError::SigningFailed(_)
+        ))
+    );
+    assert_eq!(EventsAssert::from_recorded(), before);
+    assert!(runtime.sent_update_calls().is_empty());
+    read_state(|state| {
+        assert_eq!(state.spl_deposits().queued(), sweep.deposits());
+        assert!(state.spl_deposits().swept().is_empty());
+        assert!(state.submitted_transactions().is_empty());
+    });
+}
 
 fn queue_deposits(
     count: usize,

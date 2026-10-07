@@ -19,6 +19,8 @@ mod tests;
 
 mod timer;
 
+pub use timer::sweep_queued_spl_deposits;
+
 /// Entry point for balance-based SPL deposits.
 pub async fn deposit_spl<R: CanisterRuntime>(
     runtime: &R,
