@@ -241,6 +241,13 @@ pub enum EventType {
         #[n(0)]
         deposit_id: DepositSplId,
     },
+    /// A batch failed on chain and its SPL deposits were requeued for individual sweeps.
+    #[n(21)]
+    SplitFailedSplSweep {
+        /// The signature of the confirmed failed batch transaction.
+        #[cbor(n(0), with = "cbor::signature")]
+        signature: Signature,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

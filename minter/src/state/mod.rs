@@ -759,7 +759,7 @@ impl State {
             });
     }
 
-    fn process_transaction_failed(&mut self, signature: &Signature) {
+    fn process_transaction_failed(&mut self, signature: &Signature, split_spl_batch: bool) {
         assert!(
             !self.succeeded_transactions.contains(signature),
             "Attempted to mark already succeeded transaction {signature:?} as failed"
@@ -774,9 +774,23 @@ impl State {
             !self.transactions_to_resubmit.contains_key(signature),
             "BUG: transaction {signature} is queued for resubmission but is being marked as failed"
         );
+        assert!(
+            !split_spl_batch
+                || matches!(&transaction.purpose,
+                TransactionPurpose::SweepSplDeposits { deposit_ids } if deposit_ids.len() > 1),
+            "Attempted to split a transaction that is not an SPL batch"
+        );
         match &transaction.purpose {
             TransactionPurpose::SweepDeposits { .. } => self.deposits.drop_swept(signature),
-            TransactionPurpose::SweepSplDeposits { .. } => self.spl_deposits.drop_swept(signature),
+            TransactionPurpose::SweepSplDeposits { .. } => {
+                if split_spl_batch {
+                    self.spl_deposits.retry_individually(signature);
+                } else {
+                    self.spl_deposits.drop_swept(signature);
+                }
+                let fee = transaction.message.transaction_fee();
+                self.balance = self.balance.saturating_sub(fee);
+            }
             TransactionPurpose::WithdrawSol { .. } => {}
         }
         assert_eq!(

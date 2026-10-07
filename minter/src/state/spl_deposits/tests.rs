@@ -1,16 +1,18 @@
 use super::*;
 use crate::{
+    constants::FEE_PER_SIGNATURE,
     lifecycle,
     state::{
         State, TokenProgram,
         audit::{process_event, replay_events},
         event::{Event, EventType, Signer, TransactionPurpose},
-        mutate_state, read_state,
+        mutate_state, read_state, reset_state,
     },
-    storage::with_event_iter,
+    storage::{reset_events, with_event_iter},
     test_fixtures::{
-        DEFAULT_BLOCK_HEIGHT, account, classic_spl_tokens, planned_spl_sweep, queued_spl_deposit,
-        runtime::TestCanisterRuntime, schnorr_master_key, signature, spl_token, valid_init_args,
+        DEFAULT_BLOCK_HEIGHT, account, classic_spl_tokens, planned_spl_sweep, planned_sweep,
+        queued_deposit_of, queued_spl_deposit, runtime::TestCanisterRuntime, schnorr_master_key,
+        signature, spl_token, valid_init_args,
     },
 };
 use ic_stable_structures::Storable;
@@ -104,9 +106,44 @@ fn assert_replay_matches_state() -> State {
     replayed
 }
 
+fn fund_minter() -> u64 {
+    let runtime = TestCanisterRuntime::new().add_times([0; 8]);
+    let deposit = queued_deposit_of(account(3), 10_000_000);
+    let sweep = planned_sweep([(0, deposit)]);
+    let signature = signature(101);
+    let amount_received = sweep.expected_received();
+    mutate_state(|state| {
+        for event in [
+            EventType::QueuedDeposit {
+                deposit_id: 0,
+                account: deposit.account,
+                address: deposit.address,
+                balance: deposit.balance,
+            },
+            EventType::SubmittedTransaction {
+                signature,
+                message: sweep.sweep_message(Hash::default()).into(),
+                signers: vec![Signer::Account(deposit.account)],
+                purpose: TransactionPurpose::SweepDeposits {
+                    deposit_ids: vec![0],
+                },
+                block_height: DEFAULT_BLOCK_HEIGHT,
+            },
+            EventType::SucceededTransaction { signature },
+            EventType::CreditedSweep {
+                signature,
+                amount_received,
+                mints: sweep.mints(),
+            },
+        ] {
+            process_event(state, event, &runtime);
+        }
+    });
+    amount_received
+}
+
 mod credit_sweep {
     use super::*;
-    use crate::test_fixtures::{planned_sweep, queued_deposit_of};
 
     const CREDIT_TIMESTAMP: u64 = 1_234_000_000;
     const LAMPORTS_SPENT: u64 = 20_000;
@@ -134,42 +171,6 @@ mod credit_sweep {
             })
             .collect();
         (runtime, signature, sweep, mints)
-    }
-
-    fn fund_minter() -> u64 {
-        let runtime = TestCanisterRuntime::new().add_times([0; 8]);
-        let deposit = queued_deposit_of(account(3), 10_000_000);
-        let sweep = planned_sweep([(0, deposit)]);
-        let signature = signature(101);
-        let amount_received = sweep.expected_received();
-        mutate_state(|state| {
-            for event in [
-                EventType::QueuedDeposit {
-                    deposit_id: 0,
-                    account: deposit.account,
-                    address: deposit.address,
-                    balance: deposit.balance,
-                },
-                EventType::SubmittedTransaction {
-                    signature,
-                    message: sweep.sweep_message(Hash::default()).into(),
-                    signers: vec![Signer::Account(deposit.account)],
-                    purpose: TransactionPurpose::SweepDeposits {
-                        deposit_ids: vec![0],
-                    },
-                    block_height: DEFAULT_BLOCK_HEIGHT,
-                },
-                EventType::SucceededTransaction { signature },
-                EventType::CreditedSweep {
-                    signature,
-                    amount_received,
-                    mints: sweep.mints(),
-                },
-            ] {
-                process_event(state, event, &runtime);
-            }
-        });
-        amount_received
     }
 
     fn credit(signature: Signature, mints: Vec<CreditedSplDeposit>, spent: u64) {
@@ -445,6 +446,102 @@ fn should_drop_and_replay_expired_spl_sweep_without_resubmission() {
             None
         );
     }
+}
+
+#[test]
+fn should_split_and_replay_failed_spl_batch_without_releasing_accounts() {
+    let (runtime, signature, sweep) = submitted_spl_sweep();
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::SplitFailedSplSweep { signature },
+            &runtime,
+        )
+    });
+    let replayed = assert_replay_matches_state();
+    assert!(replayed.submitted_transactions().is_empty());
+    assert!(replayed.failed_transactions().contains_key(&signature));
+    assert!(replayed.transactions_to_resubmit().is_empty());
+    assert_eq!(replayed.spl_deposits().queued(), sweep.deposits());
+    assert!(replayed.spl_deposits().swept().is_empty());
+    assert!(replayed.spl_deposits().dropped().is_empty());
+    assert_eq!(replayed.spl_deposits().next_id(), 2);
+    for (id, deposit) in sweep.deposits() {
+        assert!(replayed.spl_deposits().requires_individual_sweep(*id));
+        assert_eq!(
+            replayed
+                .spl_deposits()
+                .in_flight_id(&deposit.account, &deposit.mint),
+            Some(*id)
+        );
+    }
+}
+
+#[test]
+fn should_debit_the_fee_of_a_failed_spl_sweep() {
+    for split in [false, true] {
+        reset_state();
+        reset_events();
+        let (runtime, signature, _) = submitted_spl_sweep();
+        let initial_balance = fund_minter();
+        let event = if split {
+            EventType::SplitFailedSplSweep { signature }
+        } else {
+            EventType::FailedTransaction { signature }
+        };
+
+        mutate_state(|state| process_event(state, event, &runtime));
+
+        let replayed = assert_replay_matches_state();
+        assert_eq!(replayed.balance(), initial_balance - 2 * FEE_PER_SIGNATURE);
+    }
+}
+
+#[test]
+#[should_panic(expected = "not an SPL batch")]
+fn should_reject_spl_split_event_for_single_deposit() {
+    let (runtime, batch_signature, _) = submitted_spl_sweep();
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::SplitFailedSplSweep {
+                signature: batch_signature,
+            },
+            &runtime,
+        )
+    });
+    let (deposit, token) = read_state(|state| {
+        let deposit = state.spl_deposits().queued()[&0].clone();
+        let token = state.supported_spl_token(&deposit.mint).cloned().unwrap();
+        (deposit, token)
+    });
+    let plan = SplSweep::plan(
+        [(0, deposit)],
+        &BTreeMap::from([(token.mint, token)]),
+        &schnorr_master_key(),
+    );
+    let message = plan.sweep_message(Hash::default());
+    let signature = signature(101);
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::SubmittedTransaction {
+                signature,
+                signers: plan.signers(&message),
+                message: message.into(),
+                purpose: TransactionPurpose::SweepSplDeposits {
+                    deposit_ids: vec![0],
+                },
+                block_height: DEFAULT_BLOCK_HEIGHT,
+            },
+            &runtime,
+        );
+        process_event(
+            state,
+            EventType::SplitFailedSplSweep { signature },
+            &runtime,
+        );
+    });
 }
 
 #[test]

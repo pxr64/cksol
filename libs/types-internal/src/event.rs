@@ -87,6 +87,11 @@ pub enum EventType {
         /// The balance of the deposit address when the deposit was queued.
         balance: Lamport,
     },
+    /// A batch failed on chain and its SPL deposits were requeued for individual sweeps.
+    SplitFailedSplSweep {
+        /// The signature of the confirmed failed batch transaction.
+        signature: Signature,
+    },
     /// The finalized SPL sweep's outcome did not match its plan, so its deposits stay locked.
     QuarantinedSplSweep {
         /// The signature of the finalized sweep transaction.

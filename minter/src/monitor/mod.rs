@@ -12,7 +12,7 @@ use crate::{
     state::{
         TaskType,
         audit::process_event,
-        event::{EventType, Signer, VersionedMessage},
+        event::{EventType, Signer, TransactionPurpose, VersionedMessage},
         mutate_state, read_state,
     },
 };
@@ -99,13 +99,21 @@ async fn check_submitted_transactions<R: CanisterRuntime>(runtime: &R) -> bool {
             "Transaction {signature} finalized with on-chain error: {error}"
         );
         mutate_state(|state| {
-            process_event(
-                state,
-                EventType::FailedTransaction {
+            let transaction = state
+                .submitted_transactions()
+                .get(signature)
+                .expect("BUG: a finalized failed transaction must be submitted");
+            let event = match &transaction.purpose {
+                TransactionPurpose::SweepSplDeposits { deposit_ids } if deposit_ids.len() > 1 => {
+                    EventType::SplitFailedSplSweep {
+                        signature: *signature,
+                    }
+                }
+                _ => EventType::FailedTransaction {
                     signature: *signature,
                 },
-                runtime,
-            )
+            };
+            process_event(state, event, runtime)
         });
     }
 

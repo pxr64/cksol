@@ -501,6 +501,11 @@ type EventType = variant {
         // The identifier of the SPL deposit whose pending mint was quarantined.
         deposit_id: DepositSplId;
     };
+    // A batch failed on chain and its SPL deposits were requeued for individual sweeps.
+    SplitFailedSplSweep : record {
+        // The signature of the confirmed failed batch transaction.
+        signature: Signature;
+    };
     // The finalized SPL sweep's outcome did not match its plan, so its deposits stay locked.
     QuarantinedSplSweep : record {
         // The signature of the finalized sweep transaction.

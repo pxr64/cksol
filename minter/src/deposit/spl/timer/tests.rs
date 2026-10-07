@@ -13,7 +13,7 @@ use crate::{
         DEFAULT_BLOCK_HEIGHT, EventsAssert, account, confirmed_block, minter_signature,
         minter_signature_nth, queued_spl_deposit,
         runtime::TestCanisterRuntime,
-        schnorr_master_key, schnorr_master_key_response,
+        schnorr_master_key, schnorr_master_key_response, signature,
         signer::{sign_as_minter, sign_for},
         spl_token, valid_init_args,
     },
@@ -24,6 +24,243 @@ use ic_cdk::call::CallRejected;
 use ic_cdk_management_canister::SignCallError;
 use ic_stable_structures::Storable;
 use sol_rpc_types::{MultiRpcResult, RpcError};
+
+fn submit_batch(ids: &[u64]) -> (Signature, SplSweep) {
+    let (deposits, tokens) = read_state(|state| {
+        let deposits = ids
+            .iter()
+            .map(|id| (*id, state.spl_deposits().queued()[id].clone()))
+            .collect::<Vec<_>>();
+        let tokens = deposits
+            .iter()
+            .map(|(_, deposit)| {
+                (
+                    deposit.mint,
+                    state.supported_spl_token(&deposit.mint).cloned().unwrap(),
+                )
+            })
+            .collect();
+        (deposits, tokens)
+    });
+    let plan = SplSweep::plan(deposits, &tokens, &schnorr_master_key());
+    let message = plan.sweep_message(Hash::default());
+    let signature =
+        signature(100 + ids[0] as usize + read_state(|state| state.failed_transactions().len()));
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::SubmittedTransaction {
+                signature,
+                signers: plan.signers(&message),
+                message: message.into(),
+                purpose: TransactionPurpose::SweepSplDeposits {
+                    deposit_ids: ids.to_vec(),
+                },
+                block_height: DEFAULT_BLOCK_HEIGHT,
+            },
+            &TestCanisterRuntime::new().with_increasing_time(),
+        )
+    });
+    (signature, plan)
+}
+
+fn split_batch(ids: &[u64]) {
+    let (signature, _) = submit_batch(ids);
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::SplitFailedSplSweep { signature },
+            &TestCanisterRuntime::new().with_increasing_time(),
+        )
+    });
+}
+
+fn failed_status(
+    confirmation: sol_rpc_types::TransactionConfirmationStatus,
+) -> sol_rpc_types::TransactionStatus {
+    sol_rpc_types::TransactionStatus {
+        slot: block().slot,
+        status: Err(sol_rpc_types::TransactionError::InsufficientFundsForFee),
+        err: Some(sol_rpc_types::TransactionError::InsufficientFundsForFee),
+        confirmation_status: Some(confirmation),
+    }
+}
+
+#[test]
+fn should_keep_individual_retries_separate_from_normal_batches() {
+    queue_deposits(6, false, true, Some(TokenProgram::Classic));
+    split_batch(&[2, 3]);
+    let round = read_state(|state| SweepRound::take_from_queue(state, &schnorr_master_key()));
+    let ids = round
+        .batches
+        .iter()
+        .map(|sweep| sweep.deposits().keys().copied().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![vec![0, 1], vec![2], vec![3], vec![4, 5]]);
+    assert!(!round.leaves_deposits_queued);
+}
+
+#[test]
+fn should_cap_individual_retries_at_the_existing_round_limit() {
+    queue_deposits(12, false, true, Some(TokenProgram::Classic));
+    split_batch(&[0, 1, 2, 3, 4, 5]);
+    split_batch(&[6, 7, 8, 9, 10, 11]);
+    let round = read_state(|state| SweepRound::take_from_queue(state, &schnorr_master_key()));
+    assert_eq!(round.batches.len(), MAX_CONCURRENT_RPC_CALLS);
+    assert!(
+        round
+            .batches
+            .iter()
+            .all(|batch| batch.deposits().len() == 1)
+    );
+    assert!(round.leaves_deposits_queued);
+}
+
+#[test]
+#[should_panic(expected = "marked for an individual sweep")]
+fn should_reject_rebatching_individual_spl_retries() {
+    queue_deposits(2, false, true, Some(TokenProgram::Classic));
+    split_batch(&[0, 1]);
+    submit_batch(&[0, 1]);
+}
+
+#[tokio::test]
+async fn should_split_only_finalized_failed_spl_batches() {
+    queue_deposits(2, false, true, Some(TokenProgram::Classic));
+    let (signature, plan) = submit_batch(&[0, 1]);
+    let runtime = TestCanisterRuntime::new()
+        .with_increasing_time()
+        .add_recent_block(Ok(block().slot))
+        .add_stub_response(MultiRpcResult::Consistent(Ok(vec![Some(failed_status(
+            sol_rpc_types::TransactionConfirmationStatus::Finalized,
+        ))])));
+    crate::monitor::finalize_transactions(runtime).await;
+    EventsAssert::from_recorded()
+        .expect_contains_event_eq(EventType::SplitFailedSplSweep { signature });
+    let replayed = replay_events(with_event_iter(|events| {
+        events
+            .map(|event| Event::from_bytes(event.to_bytes()))
+            .collect::<Vec<_>>()
+    }));
+    read_state(|state| {
+        assert_eq!(state, &replayed);
+        assert_eq!(state.spl_deposits().queued(), plan.deposits());
+        assert!(state.spl_deposits().dropped().is_empty());
+        assert!(state.failed_transactions().contains_key(&signature));
+    });
+}
+
+#[tokio::test]
+async fn should_keep_uncertain_or_unfinalized_spl_batches_tracked() {
+    for case in 0..3 {
+        crate::state::reset_state();
+        crate::storage::reset_events();
+        queue_deposits(2, false, true, Some(TokenProgram::Classic));
+        submit_batch(&[0, 1]);
+        let result = match case {
+            0 => MultiRpcResult::<Vec<Option<sol_rpc_types::TransactionStatus>>>::Inconsistent(
+                vec![],
+            ),
+            1 => MultiRpcResult::Consistent(Ok(vec![None])),
+            _ => MultiRpcResult::Consistent(Ok(vec![Some(failed_status(
+                sol_rpc_types::TransactionConfirmationStatus::Confirmed,
+            ))])),
+        };
+        let before = EventsAssert::from_recorded();
+        let runtime = TestCanisterRuntime::new()
+            .with_increasing_time()
+            .add_recent_block(Ok(block().slot))
+            .add_stub_response(result);
+        crate::monitor::finalize_transactions(runtime).await;
+        assert_eq!(EventsAssert::from_recorded(), before);
+        read_state(|state| {
+            assert!(state.spl_deposits().queued().is_empty());
+            assert_eq!(state.spl_deposits().swept().len(), 1);
+            assert_eq!(state.submitted_transactions().len(), 1);
+        });
+    }
+}
+
+#[tokio::test]
+async fn should_submit_individual_retries_and_drop_only_the_failed_deposit() {
+    queue_deposits(2, false, true, Some(TokenProgram::Classic));
+    split_batch(&[0, 1]);
+    let runtime = TestCanisterRuntime::new()
+        .with_increasing_time()
+        .with_schnorr_public_key(schnorr_master_key_response())
+        .add_recent_block(Ok(block().slot))
+        .add_signer(sign_as_minter().times(2))
+        .add_signer(sign_for(&account(1)))
+        .add_signer(sign_for(&account(2)))
+        .add_stub_response(MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Ok(
+            minter_signature().into(),
+        )))
+        .add_stub_response(MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Ok(
+            minter_signature_nth(1).into(),
+        )));
+    sweep_queued_spl_deposits(runtime).await;
+    read_state(|state| {
+        assert!(state.spl_deposits().queued().is_empty());
+        assert_eq!(state.spl_deposits().swept().len(), 2);
+        assert!(!state.spl_deposits().requires_individual_sweep(0));
+        assert!(!state.spl_deposits().requires_individual_sweep(1));
+    });
+    let statuses = read_state(|state| {
+        state
+            .submitted_transactions()
+            .keys()
+            .map(|signature| {
+                let mut status =
+                    failed_status(sol_rpc_types::TransactionConfirmationStatus::Finalized);
+                if *signature != minter_signature() {
+                    status.err = None;
+                    status.status = Ok(());
+                }
+                Some(status)
+            })
+            .collect::<Vec<_>>()
+    });
+    let runtime = TestCanisterRuntime::new()
+        .with_increasing_time()
+        .add_recent_block(Ok(block().slot))
+        .add_stub_response(MultiRpcResult::Consistent(Ok(statuses)))
+        .add_stub_response(crate::test_fixtures::GetTransactionResult::Consistent(Ok(
+            None,
+        )));
+    crate::monitor::finalize_transactions(runtime).await;
+    read_state(|state| {
+        assert_eq!(state.spl_deposits().dropped().len(), 1);
+        assert!(state.spl_deposits().dropped().contains_key(&0));
+        assert_eq!(
+            state
+                .spl_deposits()
+                .finalized()
+                .get(&minter_signature_nth(1))
+                .unwrap()
+                .deposits()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        let dropped = &state.spl_deposits().dropped()[&0].deposit;
+        assert!(
+            state
+                .spl_deposits()
+                .in_flight_id(&dropped.account, &dropped.mint)
+                .is_none()
+        );
+    });
+    let mut replayed = replay_events(with_event_iter(|events| {
+        events
+            .map(|event| Event::from_bytes(event.to_bytes()))
+            .collect::<Vec<_>>()
+    }));
+    if let Some(key) = read_state(|state| state.minter_public_key().cloned()) {
+        replayed.cache_minter_public_key(key);
+    }
+    read_state(|state| assert_eq!(state, &replayed));
+}
 use solana_hash::Hash;
 use solana_transaction::Transaction;
 

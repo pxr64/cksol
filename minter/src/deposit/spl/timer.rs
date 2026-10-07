@@ -91,6 +91,10 @@ impl SweepRound {
             let mut tokens = BTreeMap::new();
             let mut batch = None;
             while let Some((deposit_id, deposit)) = queued.peek() {
+                let individual = state.spl_deposits().requires_individual_sweep(**deposit_id);
+                if individual && !deposits.is_empty() {
+                    break;
+                }
                 tokens.entry(deposit.mint).or_insert_with(|| {
                     state
                         .supported_spl_token(&deposit.mint)
@@ -120,6 +124,9 @@ impl SweepRound {
                 deposits.push((**deposit_id, (**deposit).clone()));
                 queued.next();
                 batch = Some(candidate);
+                if individual {
+                    break;
+                }
             }
             match batch {
                 Some(batch) => batches.push(batch),
