@@ -224,6 +224,23 @@ pub enum EventType {
         #[cbor(n(0), with = "cbor::signature")]
         signature: Signature,
     },
+    /// The token ledger minted a swept SPL deposit.
+    #[n(19)]
+    MintedSweptSplDeposit {
+        /// The identifier of the minted SPL deposit.
+        #[n(0)]
+        deposit_id: DepositSplId,
+        /// The mint transaction index on the token ledger.
+        #[cbor(n(1), with = "cbor::id")]
+        mint_block_index: LedgerMintIndex,
+    },
+    /// A pending SPL mint cannot be safely retried and its account and mint stay locked.
+    #[n(20)]
+    QuarantinedPendingSplMint {
+        /// The identifier of the SPL deposit whose pending mint was quarantined.
+        #[n(0)]
+        deposit_id: DepositSplId,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

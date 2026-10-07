@@ -1,3 +1,4 @@
+use crate::numeric::LedgerMintIndex;
 use crate::state::{
     SupportedSplToken,
     event::{CreditedSplDeposit, Signer, VersionedMessage},
@@ -22,6 +23,7 @@ pub struct SplDeposits {
     swept: SplSweeps,
     finalized: SplSweeps,
     pending_mints: BTreeMap<DepositSplId, PendingSplMint>,
+    minted: BTreeMap<DepositSplId, MintedSplSweep>,
     dropped: BTreeMap<DepositSplId, SweptSplDeposit>,
     quarantined: BTreeMap<DepositSplId, SweptSplDeposit>,
     in_flight_ids: BTreeMap<(Account, Address), DepositSplId>,
@@ -54,6 +56,10 @@ impl SplDeposits {
 
     pub fn quarantined(&self) -> &BTreeMap<DepositSplId, SweptSplDeposit> {
         &self.quarantined
+    }
+
+    pub fn minted(&self) -> &BTreeMap<DepositSplId, MintedSplSweep> {
+        &self.minted
     }
 
     pub fn in_flight_id(&self, account: &Account, mint: &Address) -> Option<DepositSplId> {
@@ -182,6 +188,33 @@ impl SplDeposits {
             }));
     }
 
+    pub(super) fn mint(&mut self, deposit_id: DepositSplId, mint_block_index: LedgerMintIndex) {
+        let pending = self.pending_mints.remove(&deposit_id).unwrap_or_else(|| {
+            panic!("Attempted to mint SPL deposit {deposit_id} that has no pending mint")
+        });
+        let deposit = &pending.deposit.deposit;
+        assert_eq!(
+            self.in_flight_ids.remove(&(deposit.account, deposit.mint)),
+            Some(deposit_id),
+            "BUG: SPL deposit {deposit_id} is not in flight"
+        );
+        self.minted.insert(
+            deposit_id,
+            MintedSplSweep {
+                deposit: pending.deposit,
+                minted_amount: pending.amount_to_mint,
+                mint_block_index,
+            },
+        );
+    }
+
+    pub(super) fn quarantine_pending_mint(&mut self, deposit_id: DepositSplId) {
+        let pending = self.pending_mints.remove(&deposit_id).unwrap_or_else(|| {
+            panic!("Attempted to quarantine SPL deposit {deposit_id} that has no pending mint")
+        });
+        self.quarantined.insert(deposit_id, pending.deposit);
+    }
+
     /// Drops a failed or expired sweep and releases its account and mint pairs.
     pub(super) fn drop_swept(&mut self, signature: &Signature) {
         let sweep = self
@@ -229,6 +262,14 @@ pub struct PendingSplMint {
     pub amount_to_mint: u64,
     /// The credit event's timestamp, reused by ledger retries for deduplication.
     pub created_at_time: u64,
+}
+
+/// A swept SPL deposit whose token ledger mint completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MintedSplSweep {
+    pub deposit: SweptSplDeposit,
+    pub minted_amount: u64,
+    pub mint_block_index: LedgerMintIndex,
 }
 
 impl PendingSplMint {

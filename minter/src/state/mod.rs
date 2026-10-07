@@ -41,7 +41,7 @@ use sweep::validate_sweep_transaction;
 
 pub use spl::{SupportedSplToken, TokenProgram};
 pub use spl_deposits::{
-    PendingSplMint, QueuedSplDeposit, SettledSplSweep, SplDeposits, SplSweep,
+    MintedSplSweep, PendingSplMint, QueuedSplDeposit, SettledSplSweep, SplDeposits, SplSweep,
     SplSweepRecoveryError, SplSweeps, SplTransfer, SweptSplDeposit,
 };
 
@@ -520,6 +520,18 @@ impl State {
         self.deposits.quarantine_pending_mint(deposit_id);
     }
 
+    fn process_minted_swept_spl_deposit(
+        &mut self,
+        deposit_id: DepositSplId,
+        mint_block_index: &LedgerMintIndex,
+    ) {
+        self.spl_deposits.mint(deposit_id, *mint_block_index);
+    }
+
+    fn process_quarantined_pending_spl_mint(&mut self, deposit_id: DepositSplId) {
+        self.spl_deposits.quarantine_pending_mint(deposit_id);
+    }
+
     fn process_quarantined_sweep(&mut self, signature: &Signature) {
         self.deposits.quarantine_sweep(signature);
     }
@@ -928,6 +940,7 @@ pub enum TaskType {
     SweepDeposits,
     SweepSplDeposits,
     Mint,
+    MintSpl,
     FinalizeTransactions,
     ResubmitTransactions,
     WithdrawalProcessing,

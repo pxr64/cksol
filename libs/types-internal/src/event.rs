@@ -92,6 +92,18 @@ pub enum EventType {
         /// The signature of the finalized sweep transaction.
         signature: Signature,
     },
+    /// The token ledger minted a swept SPL deposit.
+    MintedSweptSplDeposit {
+        /// The identifier of the minted SPL deposit.
+        deposit_id: u64,
+        /// The mint transaction index on the token ledger.
+        mint_block_index: u64,
+    },
+    /// A pending SPL mint cannot be safely retried and its account and mint stay locked.
+    QuarantinedPendingSplMint {
+        /// The identifier of the SPL deposit whose pending mint was quarantined.
+        deposit_id: u64,
+    },
     /// A finalized SPL sweep was validated and its deposits queued for ledger minting.
     CreditedSplSweep {
         /// The signature of the finalized sweep transaction.

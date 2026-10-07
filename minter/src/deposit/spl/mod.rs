@@ -18,9 +18,11 @@ use solana_address::Address;
 mod tests;
 
 mod finalize;
+mod mint;
 mod timer;
 
 pub use finalize::credit_finalized_spl_sweeps;
+pub use mint::process_pending_spl_mints;
 pub use timer::sweep_queued_spl_deposits;
 
 /// Entry point for balance-based SPL deposits.

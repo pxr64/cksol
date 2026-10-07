@@ -489,6 +489,18 @@ type EventType = variant {
         // The token-account balance when the deposit was queued, in the mint's smallest units.
         balance: nat64;
     };
+    // The token ledger minted a swept SPL deposit.
+    MintedSweptSplDeposit : record {
+        // The identifier of the minted SPL deposit.
+        deposit_id: DepositSplId;
+        // The mint transaction index on the token ledger.
+        mint_block_index: nat64;
+    };
+    // A pending SPL mint cannot be safely retried and its account and mint stay locked.
+    QuarantinedPendingSplMint : record {
+        // The identifier of the SPL deposit whose pending mint was quarantined.
+        deposit_id: DepositSplId;
+    };
     // The finalized SPL sweep's outcome did not match its plan, so its deposits stay locked.
     QuarantinedSplSweep : record {
         // The signature of the finalized sweep transaction.
