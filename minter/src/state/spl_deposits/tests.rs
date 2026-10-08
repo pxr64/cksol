@@ -45,6 +45,16 @@ fn sweep(deposits: &mut SplDeposits, deposit_ids: &[u64], signature: &Signature)
     deposits.sweep(deposit_ids, &message.into(), &signers, &tokens, signature);
 }
 
+/// Retries one deposit alone under a plan recovered from its message.
+fn retry(deposits: &mut SplDeposits, deposit_id: u64, signature: &Signature) {
+    let selected = BTreeMap::from([(deposit_id, deposits.retrying()[&deposit_id].clone())]);
+    let tokens = classic_spl_tokens(selected.values());
+    let plan = planned_spl_sweep(selected);
+    let message = plan.sweep_message(Hash::default());
+    let signers = plan.signers(&message);
+    deposits.retry(deposit_id, &message.into(), &signers, &tokens, signature);
+}
+
 fn submitted_spl_sweep() -> (TestCanisterRuntime, Signature, SplSweep) {
     let runtime = TestCanisterRuntime::new().with_increasing_time();
     lifecycle::init(valid_init_args(), runtime.clone());
@@ -462,12 +472,12 @@ fn should_split_and_replay_failed_spl_batch_without_releasing_accounts() {
     assert!(replayed.submitted_transactions().is_empty());
     assert!(replayed.failed_transactions().contains_key(&signature));
     assert!(replayed.transactions_to_resubmit().is_empty());
-    assert_eq!(replayed.spl_deposits().queued(), sweep.deposits());
+    assert_eq!(replayed.spl_deposits().retrying(), sweep.deposits());
+    assert!(replayed.spl_deposits().queued().is_empty());
     assert!(replayed.spl_deposits().swept().is_empty());
     assert!(replayed.spl_deposits().dropped().is_empty());
     assert_eq!(replayed.spl_deposits().next_id(), 2);
     for (id, deposit) in sweep.deposits() {
-        assert!(replayed.spl_deposits().requires_individual_sweep(*id));
         assert_eq!(
             replayed
                 .spl_deposits()
@@ -511,7 +521,7 @@ fn should_reject_spl_split_event_for_single_deposit() {
         )
     });
     let (deposit, token) = read_state(|state| {
-        let deposit = state.spl_deposits().queued()[&0].clone();
+        let deposit = state.spl_deposits().retrying()[&0].clone();
         let token = state.supported_spl_token(&deposit.mint).cloned().unwrap();
         (deposit, token)
     });
@@ -529,9 +539,7 @@ fn should_reject_spl_split_event_for_single_deposit() {
                 signature,
                 signers: plan.signers(&message),
                 message: message.into(),
-                purpose: TransactionPurpose::SweepSplDeposits {
-                    deposit_ids: vec![0],
-                },
+                purpose: TransactionPurpose::RetrySplDeposit { deposit_id: 0 },
                 block_height: DEFAULT_BLOCK_HEIGHT,
             },
             &runtime,
@@ -685,6 +693,54 @@ fn should_reject_reusing_sweep_signature() {
     sweep(&mut deposits, &[0], &signature);
 
     sweep(&mut deposits, &[1], &signature);
+}
+
+#[test]
+fn should_sweep_a_retried_deposit_alone() {
+    let mut deposits = SplDeposits::default();
+    let first = deposit(account(1), [1; 32].into());
+    let second = deposit(account(2), [1; 32].into());
+    deposits.queue(0, first.clone());
+    deposits.queue(1, second.clone());
+    sweep(&mut deposits, &[0, 1], &signature(1));
+    deposits.retry_individually(&signature(1));
+    assert_eq!(
+        deposits.retrying(),
+        &BTreeMap::from([(0, first.clone()), (1, second.clone())])
+    );
+    assert!(deposits.queued().is_empty());
+
+    retry(&mut deposits, 0, &signature(2));
+
+    assert_eq!(deposits.retrying(), &BTreeMap::from([(1, second)]));
+    assert_eq!(
+        deposits.swept().get(&signature(2)).unwrap().deposits(),
+        &BTreeMap::from([(0, first)])
+    );
+    assert_eq!(deposits.in_flight_id(&account(1), &[1; 32].into()), Some(0));
+}
+
+#[test]
+#[should_panic(expected = "unknown or already swept SPL deposit")]
+fn should_reject_batching_a_retried_deposit() {
+    let mut deposits = SplDeposits::default();
+    deposits.queue(0, deposit(account(1), [1; 32].into()));
+    deposits.queue(1, deposit(account(2), [1; 32].into()));
+    sweep(&mut deposits, &[0, 1], &signature(1));
+    deposits.retry_individually(&signature(1));
+
+    let (message, signers, tokens) = no_plan();
+    deposits.sweep(&[0, 1], &message, &signers, &tokens, &signature(2));
+}
+
+#[test]
+#[should_panic(expected = "that is not retrying")]
+fn should_reject_retrying_a_queued_deposit() {
+    let mut deposits = SplDeposits::default();
+    deposits.queue(0, deposit(account(1), [1; 32].into()));
+
+    let (message, signers, tokens) = no_plan();
+    deposits.retry(0, &message, &signers, &tokens, &signature(1));
 }
 
 #[test]

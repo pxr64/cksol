@@ -280,7 +280,8 @@ impl State {
                 self.deposits.drop_swept(signature);
                 return;
             }
-            TransactionPurpose::SweepSplDeposits { .. } => {
+            TransactionPurpose::SweepSplDeposits { .. }
+            | TransactionPurpose::RetrySplDeposit { .. } => {
                 self.spl_deposits.drop_swept(signature);
                 return;
             }
@@ -664,6 +665,16 @@ impl State {
                 // This field is in lamports; SPL token amounts stay in the sweep deposits.
                 0
             }
+            TransactionPurpose::RetrySplDeposit { deposit_id } => {
+                self.spl_deposits.retry(
+                    *deposit_id,
+                    transaction,
+                    signers,
+                    &self.supported_spl_tokens,
+                    signature,
+                );
+                0
+            }
         };
         assert_eq!(
             self.submitted_transactions.insert(
@@ -698,6 +709,7 @@ impl State {
                 old_transaction.purpose,
                 TransactionPurpose::SweepDeposits { .. }
                     | TransactionPurpose::SweepSplDeposits { .. }
+                    | TransactionPurpose::RetrySplDeposit { .. }
             ),
             "BUG: sweep transaction {old_signature} must be dropped instead of resubmitted"
         );
@@ -740,7 +752,8 @@ impl State {
         match &transaction.purpose {
             TransactionPurpose::WithdrawSol { .. } => {}
             TransactionPurpose::SweepDeposits { .. } => self.deposits.finalize_swept(signature),
-            TransactionPurpose::SweepSplDeposits { .. } => {
+            TransactionPurpose::SweepSplDeposits { .. }
+            | TransactionPurpose::RetrySplDeposit { .. } => {
                 self.spl_deposits.finalize_swept(signature)
             }
         }
@@ -759,7 +772,28 @@ impl State {
             });
     }
 
-    fn process_transaction_failed(&mut self, signature: &Signature, split_spl_batch: bool) {
+    fn process_transaction_failed(&mut self, signature: &Signature) {
+        let transaction = self.take_failed_transaction(signature);
+        match &transaction.purpose {
+            TransactionPurpose::SweepDeposits { .. } => self.deposits.drop_swept(signature),
+            TransactionPurpose::SweepSplDeposits { .. }
+            | TransactionPurpose::RetrySplDeposit { .. } => {
+                self.spl_deposits.drop_swept(signature);
+                self.debit_spl_sweep_fee(&transaction);
+            }
+            TransactionPurpose::WithdrawSol { .. } => {}
+        }
+        self.record_failed_transaction(signature, transaction);
+    }
+
+    fn process_split_failed_spl_sweep(&mut self, signature: &Signature) {
+        let transaction = self.take_failed_spl_batch(signature);
+        self.spl_deposits.retry_individually(signature);
+        self.debit_spl_sweep_fee(&transaction);
+        self.record_failed_transaction(signature, transaction);
+    }
+
+    fn take_failed_transaction(&mut self, signature: &Signature) -> SolanaTransaction {
         assert!(
             !self.succeeded_transactions.contains(signature),
             "Attempted to mark already succeeded transaction {signature:?} as failed"
@@ -774,25 +808,25 @@ impl State {
             !self.transactions_to_resubmit.contains_key(signature),
             "BUG: transaction {signature} is queued for resubmission but is being marked as failed"
         );
+        transaction
+    }
+
+    fn take_failed_spl_batch(&mut self, signature: &Signature) -> SolanaTransaction {
+        let transaction = self.take_failed_transaction(signature);
         assert!(
-            !split_spl_batch
-                || matches!(&transaction.purpose,
+            matches!(&transaction.purpose,
                 TransactionPurpose::SweepSplDeposits { deposit_ids } if deposit_ids.len() > 1),
             "Attempted to split a transaction that is not an SPL batch"
         );
-        match &transaction.purpose {
-            TransactionPurpose::SweepDeposits { .. } => self.deposits.drop_swept(signature),
-            TransactionPurpose::SweepSplDeposits { .. } => {
-                if split_spl_batch {
-                    self.spl_deposits.retry_individually(signature);
-                } else {
-                    self.spl_deposits.drop_swept(signature);
-                }
-                let fee = transaction.message.transaction_fee();
-                self.balance = self.balance.saturating_sub(fee);
-            }
-            TransactionPurpose::WithdrawSol { .. } => {}
-        }
+        transaction
+    }
+
+    fn debit_spl_sweep_fee(&mut self, transaction: &SolanaTransaction) {
+        let fee = transaction.message.transaction_fee();
+        self.balance = self.balance.saturating_sub(fee);
+    }
+
+    fn record_failed_transaction(&mut self, signature: &Signature, transaction: SolanaTransaction) {
         assert_eq!(
             self.failed_transactions.insert(*signature, transaction),
             None,

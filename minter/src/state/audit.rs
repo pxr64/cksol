@@ -53,10 +53,10 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
             state.process_transaction_succeeded(signature);
         }
         EventType::FailedTransaction { signature } => {
-            state.process_transaction_failed(signature, false);
+            state.process_transaction_failed(signature);
         }
         EventType::SplitFailedSplSweep { signature } => {
-            state.process_transaction_failed(signature, true)
+            state.process_split_failed_spl_sweep(signature)
         }
         EventType::ExpiredTransaction { signature } => {
             state.process_transaction_expired(signature);

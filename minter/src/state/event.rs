@@ -334,6 +334,12 @@ pub enum TransactionPurpose {
         #[n(0)]
         deposit_ids: Vec<DepositSplId>,
     },
+    /// Sweep one retried SPL deposit alone after the batch holding it failed.
+    #[n(3)]
+    RetrySplDeposit {
+        #[n(0)]
+        deposit_id: DepositSplId,
+    },
 }
 
 impl Storable for Event {

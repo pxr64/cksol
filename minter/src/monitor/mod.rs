@@ -21,7 +21,7 @@ use cksol_types_internal::log::Priority;
 use ic_cdk_management_canister::SignCallError;
 use itertools::Itertools;
 use solana_signature::Signature;
-use solana_transaction::Transaction;
+use solana_transaction::{Transaction, TransactionError};
 use solana_transaction_status_client_types::TransactionConfirmationStatus;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -96,25 +96,27 @@ async fn check_submitted_transactions<R: CanisterRuntime>(runtime: &R) -> bool {
     for (signature, error) in &statuses.errored {
         log!(
             Priority::Error,
-            "Transaction {signature} finalized with on-chain error: {error}"
+            "Transaction {signature} finalized with on-chain error: {error:?}"
         );
-        mutate_state(|state| {
-            let transaction = state
+        let purpose = read_state(|state| {
+            state
                 .submitted_transactions()
                 .get(signature)
-                .expect("BUG: a finalized failed transaction must be submitted");
-            let event = match &transaction.purpose {
-                TransactionPurpose::SweepSplDeposits { deposit_ids } if deposit_ids.len() > 1 => {
-                    EventType::SplitFailedSplSweep {
-                        signature: *signature,
-                    }
-                }
-                _ => EventType::FailedTransaction {
-                    signature: *signature,
-                },
-            };
-            process_event(state, event, runtime)
+                .expect("BUG: a finalized failed transaction must be submitted")
+                .purpose
+                .clone()
         });
+        let event = match &purpose {
+            TransactionPurpose::SweepSplDeposits { deposit_ids } if deposit_ids.len() > 1 => {
+                EventType::SplitFailedSplSweep {
+                    signature: *signature,
+                }
+            }
+            _ => EventType::FailedTransaction {
+                signature: *signature,
+            },
+        };
+        mutate_state(|state| process_event(state, event, runtime));
     }
 
     for signature in &statuses.succeeded {
@@ -204,7 +206,7 @@ struct TransactionStatuses {
     /// Transactions confirmed as finalized on-chain without errors.
     succeeded: BTreeSet<Signature>,
     /// Transactions that finalized with an on-chain error.
-    errored: BTreeMap<Signature, String>,
+    errored: BTreeMap<Signature, TransactionError>,
     /// Transactions with no on-chain status (safe to resubmit if expired).
     not_found: BTreeSet<Signature>,
 }
@@ -245,7 +247,7 @@ async fn check_transaction_statuses<R: CanisterRuntime>(
                     if s.confirmation_status == Some(TransactionConfirmationStatus::Finalized) =>
                 {
                     if let Some(err) = s.err {
-                        result.errored.insert(*signature, format!("{err:?}"));
+                        result.errored.insert(*signature, err);
                     } else {
                         result.succeeded.insert(*signature);
                     }

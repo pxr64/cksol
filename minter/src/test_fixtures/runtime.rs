@@ -220,9 +220,17 @@ pub struct SentUpdateCall {
 }
 
 impl SentUpdateCall {
+    /// Decodes the Candid argument tuple of the recorded call.
+    pub fn args_tuple<Args>(&self) -> Args
+    where
+        for<'a> Args: candid::utils::ArgumentDecoder<'a>,
+    {
+        decode_args(&self.args).expect("Failed to decode the call arguments")
+    }
+
     /// Decodes the single Candid argument of the recorded call.
     pub fn single_arg<Arg: CandidType + DeserializeOwned>(&self) -> Arg {
-        let (arg,) = decode_args(&self.args).expect("Failed to decode the call argument");
+        let (arg,) = self.args_tuple();
         arg
     }
 }

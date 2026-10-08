@@ -1,9 +1,11 @@
 use crate::{
-    address::{account_address, associated_token_address, lazy_get_schnorr_master_key},
+    address::{
+        account_address, associated_token_address, lazy_get_schnorr_master_key, minter_address,
+    },
     constants::GET_ACCOUNT_INFO_CYCLES,
     cycles::{RpcCallCharge, charge_rpc_call, check_caller_available_cycles},
     guard::deposit_spl_guard,
-    rpc::get_spl_token_balance,
+    rpc::{get_spl_token_account, get_spl_token_balance},
     runtime::CanisterRuntime,
     state::{audit::process_event, event::EventType, mutate_state, read_state},
     utils::{assert_valid_deposit_owner, assert_valid_deposit_token},
@@ -41,7 +43,10 @@ pub async fn deposit_spl<R: CanisterRuntime>(
     }
     let token = assert_valid_deposit_token(&mint)?;
     let deposit_consolidation_fee = read_state(|state| state.deposit_consolidation_fee());
-    check_caller_available_cycles(runtime, GET_ACCOUNT_INFO_CYCLES + deposit_consolidation_fee)?;
+    check_caller_available_cycles(
+        runtime,
+        2 * GET_ACCOUNT_INFO_CYCLES + deposit_consolidation_fee,
+    )?;
 
     let master_key = lazy_get_schnorr_master_key(runtime).await;
     let owner = account_address(&master_key, &account);
@@ -54,11 +59,30 @@ pub async fn deposit_spl<R: CanisterRuntime>(
         runtime,
         RpcCallCharge {
             attached_cycles: GET_ACCOUNT_INFO_CYCLES,
-            fee_on_success: deposit_consolidation_fee,
+            fee_on_success: 0,
         },
         &result,
     );
     let balance = result?;
+    let destination_owner = minter_address(&master_key);
+    let destination =
+        associated_token_address(&destination_owner, &token.mint, &token.token_program.id());
+    let result = get_spl_token_account(runtime, destination, token.token_program)
+        .await
+        .and_then(|account| match account {
+            Some(account) => account.validate(destination_owner, token.mint),
+            None => Ok(()),
+        })
+        .map_err(DepositSplError::from);
+    charge_rpc_call(
+        runtime,
+        RpcCallCharge {
+            attached_cycles: GET_ACCOUNT_INFO_CYCLES,
+            fee_on_success: deposit_consolidation_fee,
+        },
+        &result,
+    );
+    result?;
     let deposit_id = mutate_state(|state| {
         let deposit_id = state.spl_deposits().next_id();
         process_event(

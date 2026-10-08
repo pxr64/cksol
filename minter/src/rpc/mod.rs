@@ -155,9 +155,29 @@ pub async fn get_spl_token_balance<R: CanisterRuntime>(
     mint: Address,
     token_program: TokenProgram,
 ) -> Result<u64, GetSplTokenBalanceError> {
-    let Some(account) = get_account_info(runtime, address).await? else {
+    let Some(account) = get_spl_token_account(runtime, address, token_program).await? else {
         return Ok(0);
     };
+    account.validate(owner, mint)?;
+    Ok(account.amount)
+}
+
+/// Reads the finalized state of a token account of the given program. A missing account is `None`.
+pub async fn get_spl_token_account<R: CanisterRuntime>(
+    runtime: &R,
+    address: Address,
+    token_program: TokenProgram,
+) -> Result<Option<SplTokenAccount>, GetSplTokenBalanceError> {
+    let Some(account) = get_account_info(runtime, address).await? else {
+        return Ok(None);
+    };
+    // A prefunded, unallocated ATA can still be created by the sweep.
+    if !account.executable
+        && account.owner == solana_system_interface::program::id().to_string()
+        && account.data.decode().is_some_and(|data| data.is_empty())
+    {
+        return Ok(None);
+    }
     let data = decode_program_account(account, &token_program.id())
         .map_err(GetSplTokenBalanceError::InvalidTokenAccount)?;
     let account = match token_program {
@@ -165,7 +185,7 @@ pub async fn get_spl_token_balance<R: CanisterRuntime>(
         TokenProgram::Classic => {
             let account = TokenAccount::unpack(&data)
                 .map_err(|error| GetSplTokenBalanceError::InvalidTokenAccount(error.to_string()))?;
-            ParsedTokenAccount {
+            SplTokenAccount {
                 owner: account.owner.to_bytes().into(),
                 mint: account.mint.to_bytes().into(),
                 amount: account.amount,
@@ -173,29 +193,37 @@ pub async fn get_spl_token_balance<R: CanisterRuntime>(
             }
         }
     };
-    if account.owner != owner || account.mint != mint {
-        return Err(GetSplTokenBalanceError::InvalidTokenAccount(
-            "Token account mint or owner does not match the expected deposit".to_string(),
-        ));
-    }
-    if account.frozen {
-        return Err(GetSplTokenBalanceError::InvalidTokenAccount(
-            "Token account is frozen".to_string(),
-        ));
-    }
-    Ok(account.amount)
+    Ok(Some(account))
 }
 
+/// The fields of a token account that the minter checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ParsedTokenAccount {
-    owner: Address,
-    mint: Address,
+pub struct SplTokenAccount {
+    pub owner: Address,
+    pub mint: Address,
     /// The amount in the mint's smallest units.
-    amount: u64,
-    frozen: bool,
+    pub amount: u64,
+    pub frozen: bool,
 }
 
-fn parse_token_2022_account(data: &[u8]) -> Result<ParsedTokenAccount, GetSplTokenBalanceError> {
+impl SplTokenAccount {
+    /// Checks the expected owner and mint and rejects frozen accounts.
+    pub fn validate(&self, owner: Address, mint: Address) -> Result<(), GetSplTokenBalanceError> {
+        if self.owner != owner || self.mint != mint {
+            return Err(GetSplTokenBalanceError::InvalidTokenAccount(
+                "Token account mint or owner does not match the expected deposit".to_string(),
+            ));
+        }
+        if self.frozen {
+            return Err(GetSplTokenBalanceError::InvalidTokenAccount(
+                "Token account is frozen".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn parse_token_2022_account(data: &[u8]) -> Result<SplTokenAccount, GetSplTokenBalanceError> {
     let account = StateWithExtensions::<Token2022Account>::unpack(data)
         .map_err(|error| GetSplTokenBalanceError::InvalidTokenAccount(error.to_string()))?;
     for extension in account
@@ -220,7 +248,7 @@ fn parse_token_2022_account(data: &[u8]) -> Result<ParsedTokenAccount, GetSplTok
             }
         }
     }
-    Ok(ParsedTokenAccount {
+    Ok(SplTokenAccount {
         owner: account.base.owner.to_bytes().into(),
         mint: account.base.mint.to_bytes().into(),
         amount: account.base.amount,

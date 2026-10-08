@@ -237,6 +237,11 @@ pub enum TransactionPurpose {
         /// The ids of the swept SPL deposits.
         deposit_ids: Vec<u64>,
     },
+    /// Sweep one retried SPL deposit alone after the batch holding it failed.
+    RetrySplDeposit {
+        /// The id of the retried SPL deposit.
+        deposit_id: u64,
+    },
 }
 
 /// A versioned Solana transaction message.

@@ -103,6 +103,22 @@ mod settle {
     }
 
     #[test]
+    fn should_settle_new_destinations_prefunded_with_lamports() {
+        let sweep = sweep();
+        let mut outcome = balanced_outcome(&sweep, Hash::default(), true);
+        let meta = outcome.transaction.meta.as_mut().unwrap();
+        let OptionSerializer::Some(balances) = &meta.post_token_balances else {
+            unreachable!()
+        };
+        for balance in balances {
+            if balance.owner == OptionSerializer::Some(sweep.minter_address().to_string()) {
+                meta.pre_balances[balance.account_index as usize] = 1;
+            }
+        }
+        assert_eq!(sweep.settle(&outcome).unwrap().lamports_spent(), 5_000);
+    }
+
+    #[test]
     fn should_reject_incomplete_lamport_metadata() {
         let sweep = sweep();
         let mut outcome = balanced_outcome(&sweep, Hash::default(), true);

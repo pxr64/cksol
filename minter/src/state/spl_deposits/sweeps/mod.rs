@@ -287,17 +287,9 @@ impl SplSweep {
             let post = expected.amount(address, post)?;
             let pre = match pre.get(&address) {
                 Some(balance) => expected.amount(address, balance)?,
-                // An ATA created by the sweep has no pre-token balance. Only infer zero
-                // for destinations that did not exist before the transaction.
-                None if expected.change > 0
-                    && message
-                        .account_keys
-                        .iter()
-                        .position(|key| *key == address)
-                        .is_some_and(|index| meta.pre_balances[index] == 0) =>
-                {
-                    0
-                }
+                // A newly initialized ATA has no pre-token balance, even when prefunded
+                // with lamports. Infer zero only when its post balance is the planned total.
+                None if expected.change > 0 && i128::from(post) == expected.change => 0,
                 None => return Err(UnreadableOutcome::IncompleteTokenBalances.into()),
             };
             if i128::from(post) - i128::from(pre) != expected.change {

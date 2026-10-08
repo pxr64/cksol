@@ -7,7 +7,7 @@ use cksol_types::DepositSplId;
 use icrc_ledger_types::icrc1::account::Account;
 use solana_address::Address;
 use solana_signature::Signature;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 #[cfg(test)]
 mod tests;
@@ -20,7 +20,7 @@ pub use sweeps::{SettledSplSweep, SplSweep, SplSweepRecoveryError, SplSweeps, Sp
 pub struct SplDeposits {
     next_id: DepositSplId,
     queued: BTreeMap<DepositSplId, QueuedSplDeposit>,
-    individual_sweep_ids: BTreeSet<DepositSplId>,
+    retrying: BTreeMap<DepositSplId, QueuedSplDeposit>,
     swept: SplSweeps,
     finalized: SplSweeps,
     pending_mints: BTreeMap<DepositSplId, PendingSplMint>,
@@ -39,8 +39,8 @@ impl SplDeposits {
         &self.queued
     }
 
-    pub fn requires_individual_sweep(&self, deposit_id: DepositSplId) -> bool {
-        self.individual_sweep_ids.contains(&deposit_id)
+    pub fn retrying(&self) -> &BTreeMap<DepositSplId, QueuedSplDeposit> {
+        &self.retrying
     }
 
     pub fn swept(&self) -> &SplSweeps {
@@ -107,30 +107,54 @@ impl SplDeposits {
             !deposit_ids.is_empty(),
             "Attempted to sweep no SPL deposits with transaction {signature}"
         );
-        assert!(
-            deposit_ids.len() == 1
-                || deposit_ids
-                    .iter()
-                    .all(|id| !self.requires_individual_sweep(*id)),
-            "Attempted to batch an SPL deposit marked for an individual sweep"
-        );
         let deposits = deposit_ids
             .iter()
             .map(|deposit_id| {
                 let deposit = self.queued.remove(deposit_id).unwrap_or_else(|| {
                     panic!("Attempted to sweep unknown or already swept SPL deposit {deposit_id}")
                 });
-                self.individual_sweep_ids.remove(deposit_id);
                 (*deposit_id, deposit)
             })
-            .collect::<Vec<_>>();
+            .collect();
+        self.record_sweep(deposits, message, signers, tokens, signature);
+    }
+
+    /// Moves one retried deposit to its submitted sweep.
+    pub(super) fn retry(
+        &mut self,
+        deposit_id: DepositSplId,
+        message: &VersionedMessage,
+        signers: &[Signer],
+        tokens: &BTreeMap<Address, SupportedSplToken>,
+        signature: &Signature,
+    ) {
+        let deposit = self.retrying.remove(&deposit_id).unwrap_or_else(|| {
+            panic!("Attempted to retry SPL deposit {deposit_id} that is not retrying")
+        });
+        self.record_sweep(
+            vec![(deposit_id, deposit)],
+            message,
+            signers,
+            tokens,
+            signature,
+        );
+    }
+
+    fn record_sweep(
+        &mut self,
+        deposits: Vec<(DepositSplId, QueuedSplDeposit)>,
+        message: &VersionedMessage,
+        signers: &[Signer],
+        tokens: &BTreeMap<Address, SupportedSplToken>,
+        signature: &Signature,
+    ) {
         let sweep = SplSweep::recover(deposits, tokens, message, signers).unwrap_or_else(|error| {
             panic!("Attempted to sweep with transaction {signature}: {error}")
         });
         self.swept.insert(*signature, sweep);
     }
 
-    /// Requeues a confirmed failed batch for individual sweeps, keeping accounts in flight.
+    /// Moves the deposits of a failed batch to the retrying stage, where each sweeps alone.
     pub(super) fn retry_individually(&mut self, signature: &Signature) {
         let sweep = self.swept.remove(signature).unwrap_or_else(|| {
             panic!("Attempted to split SPL sweep {signature} that is not swept")
@@ -141,12 +165,8 @@ impl SplDeposits {
         );
         for (id, deposit) in sweep.deposits() {
             assert!(
-                self.queued.insert(*id, deposit.clone()).is_none(),
-                "Attempted to requeue already queued SPL deposit {id}"
-            );
-            assert!(
-                self.individual_sweep_ids.insert(*id),
-                "Attempted to mark SPL deposit {id} for an individual sweep twice"
+                self.retrying.insert(*id, deposit.clone()).is_none(),
+                "Attempted to retry already retrying SPL deposit {id}"
             );
         }
     }
@@ -256,19 +276,28 @@ impl SplDeposits {
             .remove(signature)
             .unwrap_or_else(|| panic!("Attempted to drop SPL sweep {signature} that is not swept"));
         for (deposit_id, deposit) in sweep.deposits() {
-            assert_eq!(
-                self.in_flight_ids.remove(&(deposit.account, deposit.mint)),
-                Some(*deposit_id),
-                "BUG: SPL deposit {deposit_id} is not in flight"
-            );
-            self.dropped.insert(
-                *deposit_id,
-                SweptSplDeposit {
-                    deposit: deposit.clone(),
-                    signature: *signature,
-                },
-            );
+            self.drop_deposit(*deposit_id, deposit, signature);
         }
+    }
+
+    fn drop_deposit(
+        &mut self,
+        deposit_id: DepositSplId,
+        deposit: &QueuedSplDeposit,
+        signature: &Signature,
+    ) {
+        assert_eq!(
+            self.in_flight_ids.remove(&(deposit.account, deposit.mint)),
+            Some(deposit_id),
+            "BUG: SPL deposit {deposit_id} is not in flight"
+        );
+        self.dropped.insert(
+            deposit_id,
+            SweptSplDeposit {
+                deposit: deposit.clone(),
+                signature: *signature,
+            },
+        );
     }
 }
 

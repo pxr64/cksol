@@ -411,6 +411,11 @@ type TransactionPurpose = variant {
         // The ids of the swept SPL deposits.
         deposit_ids: vec DepositSplId;
     };
+    // Sweep one retried SPL deposit alone after the batch holding it failed.
+    RetrySplDeposit : record {
+        // The id of the retried SPL deposit.
+        deposit_id: DepositSplId;
+    };
 };
 
 // A minter event payload.
