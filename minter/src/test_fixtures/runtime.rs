@@ -107,6 +107,11 @@ impl TestCanisterRuntime {
         self
     }
 
+    pub fn with_time(mut self, time: u64) -> Self {
+        self.times = std::iter::repeat(time).into();
+        self
+    }
+
     pub fn expecting_charges(mut self) -> Self {
         self.expects_charges = true;
         self

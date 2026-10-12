@@ -162,7 +162,7 @@ type DepositSplArgs = record {
 // Identifies a deposit queued by the deposit_spl endpoint.
 type DepositSplId = nat64;
 
-// Further error variants will be added as SPL deposits are implemented.
+// Errors returned when an SPL deposit request cannot be queued.
 type DepositSplError = variant {
     // A concurrent request for the same IC account and mint is processing.
     AlreadyProcessing;
@@ -173,8 +173,8 @@ type DepositSplError = variant {
     UnsupportedToken: record { mint: Address };
     // Deposits for this supported token are paused.
     TokenPaused: record { mint: Address };
-    // The token account is frozen, has an unsupported extension, or does not match
-    // the mint or the owner. A retry fails the same way.
+    // The source or destination token account is frozen, has an unsupported extension,
+    // or does not match the expected token program, mint, or owner.
     InvalidTokenAccount: text;
     TemporarilyUnavailable: text;
 };
@@ -614,10 +614,10 @@ service : (MinterArg) -> {
     // The resolved owner must be a non-anonymous principal.
     deposit_sol: (DepositSolArgs) -> (DepositSolResult);
 
-    // Queues the finalized SPL balance for a future token sweep and returns its deposit ID.
-    // New deposits pay the RPC cost and consolidation fee in cycles. Repeated requests for
-    // an in-flight account and mint return the existing ID without a charge, also when the
-    // token is paused. SPL sweeping and minting are not implemented yet.
+    // Queues a finalized SPL balance for sweeping to the minter and minting on its token ledger.
+    // New deposits cover two account reads and a consolidation fee in cycles; the fee is
+    // charged only when both source and destination checks succeed. Repeated requests for
+    // an in-flight account and mint return the existing ID without a charge, also when paused.
     deposit_spl: (DepositSplArgs) -> (DepositSplResult);
 
     // Registers an SPL token and its IC ledger. Only the configured orchestrator can

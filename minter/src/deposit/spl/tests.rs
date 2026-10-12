@@ -52,7 +52,7 @@ mod balance_reading {
     use solana_program_pack::Pack;
     use spl_token_interface::state::{Account as TokenAccount, AccountState};
 
-    const MINIMUM_DEPOSIT_AMOUNT: u64 = 100;
+    pub(super) const MINIMUM_DEPOSIT_AMOUNT: u64 = 100;
     const RPC_REFUND: u128 = GET_ACCOUNT_INFO_CYCLES / 2;
 
     fn init_token(token_2022: bool) -> SupportedSplToken {
@@ -61,7 +61,7 @@ mod balance_reading {
         register_token(token_2022)
     }
 
-    fn register_token(token_2022: bool) -> SupportedSplToken {
+    pub(super) fn register_token(token_2022: bool) -> SupportedSplToken {
         register(token(token_2022))
     }
 
@@ -77,7 +77,7 @@ mod balance_reading {
         }
     }
 
-    fn register(token: SupportedSplToken) -> SupportedSplToken {
+    pub(super) fn register(token: SupportedSplToken) -> SupportedSplToken {
         mutate_state(|state| {
             process_event(
                 state,
@@ -88,7 +88,7 @@ mod balance_reading {
         token
     }
 
-    fn token_account_info(token: &SupportedSplToken, amount: u64) -> AccountInfo {
+    pub(super) fn token_account_info(token: &SupportedSplToken, amount: u64) -> AccountInfo {
         token_account_info_in_state(token, amount, AccountState::Initialized)
     }
 
@@ -132,7 +132,7 @@ mod balance_reading {
         }
     }
 
-    fn runtime() -> TestCanisterRuntime {
+    pub(super) fn runtime() -> TestCanisterRuntime {
         TestCanisterRuntime::new()
             .with_increasing_time()
             .add_msg_cycles_available(2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_CONSOLIDATION_FEE)
@@ -517,5 +517,738 @@ mod balance_reading {
         assert!(runtime.sent_update_calls().is_empty());
         assert!(runtime.msg_cycles_accepted().is_empty());
         assert_eq!(total_event_count(), 2);
+    }
+}
+
+mod lifecycle {
+    use super::balance_reading::{MINIMUM_DEPOSIT_AMOUNT, register, register_token, runtime};
+    use crate::{
+        address::{account_address, associated_token_address},
+        constants::FEE_PER_SIGNATURE,
+        deposit::spl::{deposit_spl, process_pending_spl_mints, sweep_queued_spl_deposits},
+        lifecycle,
+        monitor::finalize_transactions,
+        state::{
+            SplSweep, SupportedSplToken, TokenProgram,
+            audit::replay_events,
+            event::{CreditedSplDeposit, Event, EventType, TransactionPurpose},
+            read_state, reset_state,
+        },
+        storage::{reset_events, total_event_count, with_event_iter},
+        test_fixtures::{
+            BLOCK_INDEX, DEFAULT_BLOCK_HEIGHT, EventsAssert, GetTransactionResult, account,
+            confirmed_block,
+            deposit::DEPOSITOR_ACCOUNT,
+            init_balance_to, init_schnorr_master_key, minter_signature_nth,
+            runtime::{SentUpdateCall, TestCanisterRuntime},
+            schnorr_master_key,
+            signer::{sign_as_minter, sign_for},
+            spl_sweep::balanced_outcome,
+            spl_token, valid_init_args,
+        },
+    };
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use cksol_types::{DepositSplId, Memo, MintMemo};
+    use ic_stable_structures::Storable;
+    use icrc_ledger_types::icrc1::{
+        account::Account,
+        transfer::{BlockIndex, NumTokens, TransferArg, TransferError},
+    };
+    use sol_rpc_types::{AccountData, AccountEncoding, AccountInfo, MultiRpcResult};
+    use solana_hash::Hash;
+    use solana_program_pack::Pack;
+    use solana_signature::Signature;
+    use solana_transaction_status_client_types::{
+        EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, TransactionBinaryEncoding,
+        option_serializer::OptionSerializer,
+    };
+    use spl_token_interface::state::{Account as TokenAccount, AccountState};
+    use std::collections::BTreeSet;
+
+    const INITIAL_BALANCE: u64 = 10_000_000;
+    const DESTINATION_LAMPORTS: u64 = 2_039_280;
+    const SLOT: u64 = 300_000_000;
+    const CREDITED_AT: u64 = 1_000;
+
+    fn setup() {
+        reset_state();
+        reset_events();
+        lifecycle::init(
+            valid_init_args(),
+            TestCanisterRuntime::new().with_increasing_time(),
+        );
+        init_schnorr_master_key();
+        init_balance_to(INITIAL_BALANCE);
+    }
+
+    fn source_account_info(
+        token: &SupportedSplToken,
+        account: Account,
+        amount: u64,
+    ) -> AccountInfo {
+        let token_account = TokenAccount {
+            owner: account_address(&schnorr_master_key(), &account)
+                .to_bytes()
+                .into(),
+            mint: token.mint.to_bytes().into(),
+            amount,
+            state: AccountState::Initialized,
+            ..TokenAccount::default()
+        };
+        let mut data = vec![0; TokenAccount::LEN];
+        TokenAccount::pack(token_account, &mut data).unwrap();
+        AccountInfo {
+            lamports: 2_000_000,
+            data: AccountData::Binary(STANDARD.encode(&data), AccountEncoding::Base64),
+            owner: token.token_program.id().to_string(),
+            executable: false,
+            rent_epoch: 0,
+            space: data.len() as u64,
+        }
+    }
+
+    async fn deposit(token: &SupportedSplToken, account: Account, amount: u64) -> DepositSplId {
+        let runtime = runtime()
+            .add_stub_response(MultiRpcResult::Consistent(Ok(Some(source_account_info(
+                token, account, amount,
+            )))))
+            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
+        deposit_spl(&runtime, account, token.mint.into())
+            .await
+            .unwrap()
+    }
+
+    struct SubmittedSweep {
+        signature: Signature,
+        plan: SplSweep,
+        sent_transaction: String,
+    }
+
+    /// Runs one sweep round that submits one transaction signed by the minter and the owners.
+    async fn sweep(owners: &[Account], nth: usize) -> SubmittedSweep {
+        let signature = minter_signature_nth(nth);
+        let mut runtime = TestCanisterRuntime::new()
+            .with_increasing_time()
+            .add_recent_block(Ok(SLOT))
+            .add_signer(sign_as_minter().expect([Ok(signature)]));
+        for owner in owners {
+            runtime = runtime.add_signer(sign_for(owner));
+        }
+        let runtime = runtime.add_stub_response(
+            MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Ok(signature.into())),
+        );
+
+        sweep_queued_spl_deposits(runtime.clone()).await;
+
+        let plan = read_state(|state| {
+            state
+                .spl_deposits()
+                .swept()
+                .get(&signature)
+                .expect("the round submitted one sweep")
+                .clone()
+        });
+        let sends: Vec<SentUpdateCall> = runtime
+            .sent_update_calls()
+            .into_iter()
+            .filter(|call| call.method == "sendTransaction")
+            .collect();
+        assert_eq!(sends.len(), 1);
+        let (_, _, params): (
+            sol_rpc_types::RpcSources,
+            Option<sol_rpc_types::RpcConfig>,
+            sol_rpc_types::SendTransactionParams,
+        ) = sends[0].args_tuple();
+        SubmittedSweep {
+            signature,
+            plan,
+            sent_transaction: params.get_transaction().to_string(),
+        }
+    }
+
+    fn blockhash() -> Hash {
+        confirmed_block().blockhash.to_string().parse().unwrap()
+    }
+
+    /// The outcome of the sweep's own signed transaction: every planned transfer landed, and
+    /// the minter paid the fee plus the rent of one new account per mint.
+    fn outcome_of(sweep: &SubmittedSweep) -> (EncodedConfirmedTransactionWithStatusMeta, u64) {
+        let message = sweep.plan.sweep_message(blockhash());
+        let fee = u64::from(message.header.num_required_signatures) * FEE_PER_SIGNATURE;
+        let destinations: BTreeSet<_> = sweep
+            .plan
+            .transfers()
+            .iter()
+            .map(|transfer| {
+                let deposit = &sweep.plan.deposits()[&transfer.deposit_id];
+                associated_token_address(
+                    &sweep.plan.minter_address(),
+                    &deposit.mint,
+                    &transfer.token_program.id(),
+                )
+            })
+            .collect();
+        let spent = fee + destinations.len() as u64 * DESTINATION_LAMPORTS;
+        let balance_before = read_state(|state| state.balance());
+        let mut outcome = balanced_outcome(&sweep.plan, blockhash(), true);
+        outcome.transaction.transaction = EncodedTransaction::Binary(
+            sweep.sent_transaction.clone(),
+            TransactionBinaryEncoding::Base64,
+        );
+        let meta = outcome.transaction.meta.as_mut().unwrap();
+        meta.fee = fee;
+        meta.pre_balances[0] = balance_before;
+        meta.post_balances[0] = balance_before - spent;
+        for destination in destinations {
+            let index = message
+                .account_keys
+                .iter()
+                .position(|key| *key == destination)
+                .unwrap();
+            meta.post_balances[index] = DESTINATION_LAMPORTS;
+        }
+        (outcome, spent)
+    }
+
+    /// Runs the finalizer with a finalized status and the given outcome of the sweep.
+    async fn finalize_with(outcome: EncodedConfirmedTransactionWithStatusMeta) {
+        let runtime = TestCanisterRuntime::new()
+            .with_time(CREDITED_AT)
+            .add_recent_block(Ok(SLOT))
+            .add_stub_response(MultiRpcResult::Consistent(Ok(vec![Some(
+                sol_rpc_types::TransactionStatus {
+                    slot: SLOT,
+                    status: Ok(()),
+                    err: None,
+                    confirmation_status: Some(
+                        sol_rpc_types::TransactionConfirmationStatus::Finalized,
+                    ),
+                },
+            )])))
+            .add_stub_response(GetTransactionResult::Consistent(Ok(Some(
+                outcome.try_into().unwrap(),
+            ))));
+
+        finalize_transactions(runtime).await;
+    }
+
+    /// Settles the sweep with its expected outcome and returns the credit timestamp.
+    async fn settle(sweep: &SubmittedSweep) -> u64 {
+        let balance_before = read_state(|state| state.balance());
+        let (outcome, spent) = outcome_of(sweep);
+
+        finalize_with(outcome).await;
+
+        let created_at = read_state(|state| {
+            assert!(state.submitted_transactions().is_empty());
+            assert!(state.spl_deposits().swept().is_empty());
+            assert!(state.spl_deposits().finalized().is_empty());
+            assert_eq!(state.balance(), balance_before - spent);
+            let (first_id, _) = sweep.plan.deposits().first_key_value().unwrap();
+            state.spl_deposits().pending_mints()[first_id].created_at_time
+        });
+        assert_eq!(created_at, CREDITED_AT);
+        assert_replay_matches();
+        created_at
+    }
+
+    /// Runs one mint round with a ledger block index per pending mint, in id order.
+    async fn mint(count: usize) -> Vec<SentUpdateCall> {
+        let mut runtime = TestCanisterRuntime::new().with_increasing_time();
+        for index in 0..count {
+            runtime =
+                runtime.add_stub_response::<Result<BlockIndex, TransferError>>(Ok((BLOCK_INDEX
+                    + index as u64)
+                    .into()));
+        }
+
+        process_pending_spl_mints(runtime.clone()).await;
+
+        runtime.sent_update_calls()
+    }
+
+    fn mint_arg(
+        to: Account,
+        created_at: u64,
+        signature: Signature,
+        deposit_id: DepositSplId,
+        amount: u64,
+    ) -> TransferArg {
+        TransferArg {
+            from_subaccount: None,
+            to,
+            fee: None,
+            created_at_time: Some(created_at),
+            memo: Some(Memo::from(MintMemo::sweep(signature, deposit_id)).into()),
+            amount: NumTokens::from(amount),
+        }
+    }
+
+    /// Finalizes the sweep as failed on chain with the given error.
+    async fn fail(sweep: &SubmittedSweep, error: sol_rpc_types::TransactionError) {
+        let runtime = TestCanisterRuntime::new()
+            .with_increasing_time()
+            .add_recent_block(Ok(SLOT))
+            .add_stub_response(MultiRpcResult::Consistent(Ok(vec![Some(
+                sol_rpc_types::TransactionStatus {
+                    slot: SLOT,
+                    status: Err(error.clone()),
+                    err: Some(error),
+                    confirmation_status: Some(
+                        sol_rpc_types::TransactionConfirmationStatus::Finalized,
+                    ),
+                },
+            )])));
+
+        finalize_transactions(runtime).await;
+
+        read_state(|state| {
+            assert!(state.failed_transactions().contains_key(&sweep.signature));
+            assert!(state.spl_deposits().swept().get(&sweep.signature).is_none());
+        });
+    }
+
+    /// The token balance the outcome leaves on the source account of the deposit.
+    fn source_balance_after(
+        sweep: &SubmittedSweep,
+        outcome: &EncodedConfirmedTransactionWithStatusMeta,
+        deposit_id: DepositSplId,
+    ) -> u64 {
+        let source = sweep.plan.deposits()[&deposit_id].address;
+        let source_index = sweep
+            .plan
+            .sweep_message(blockhash())
+            .account_keys
+            .iter()
+            .position(|key| *key == source)
+            .unwrap() as u8;
+        let OptionSerializer::Some(balances) = &outcome
+            .transaction
+            .meta
+            .as_ref()
+            .unwrap()
+            .post_token_balances
+        else {
+            unreachable!()
+        };
+        balances
+            .iter()
+            .find(|balance| balance.account_index == source_index)
+            .unwrap()
+            .ui_token_amount
+            .amount
+            .parse()
+            .unwrap()
+    }
+
+    fn assert_replay_matches() {
+        let mut replayed = replay_events(with_event_iter(|events| {
+            events
+                .map(|event| Event::from_bytes(event.to_bytes()))
+                .collect::<Vec<_>>()
+        }));
+        replayed.cache_minter_public_key(
+            read_state(|state| state.minter_public_key().cloned()).unwrap(),
+        );
+        read_state(|state| assert_eq!(state, &replayed));
+    }
+
+    #[tokio::test]
+    async fn should_process_spl_deposit_through_sweep_credit_and_mint() {
+        for token_2022 in [false, true] {
+            setup();
+            let token = register_token(token_2022);
+            let deposit_id = deposit(&token, DEPOSITOR_ACCOUNT, MINIMUM_DEPOSIT_AMOUNT).await;
+            assert_eq!(deposit_id, 0);
+            read_state(|state| {
+                assert_eq!(
+                    state.spl_deposits().queued()[&deposit_id].balance,
+                    MINIMUM_DEPOSIT_AMOUNT
+                )
+            });
+
+            let sweep = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+
+            let signature = sweep.signature;
+            read_state(|state| {
+                assert!(state.spl_deposits().queued().is_empty());
+                assert!(state.submitted_transactions().contains_key(&signature));
+            });
+            let created_at = settle(&sweep).await;
+            let lamports_spent = 2 * FEE_PER_SIGNATURE + DESTINATION_LAMPORTS;
+            read_state(|state| {
+                let pending = &state.spl_deposits().pending_mints()[&deposit_id];
+                assert_eq!(pending.amount_to_mint, MINIMUM_DEPOSIT_AMOUNT);
+                assert_eq!(
+                    state
+                        .spl_deposits()
+                        .in_flight_id(&DEPOSITOR_ACCOUNT, &token.mint),
+                    Some(deposit_id)
+                );
+                assert_eq!(state.balance(), INITIAL_BALANCE - lamports_spent);
+            });
+
+            let calls = mint(1).await;
+
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].canister_id, token.ledger_id);
+            assert_eq!(calls[0].method, "icrc1_transfer");
+            assert_eq!(
+                calls[0].single_arg::<TransferArg>(),
+                mint_arg(
+                    DEPOSITOR_ACCOUNT,
+                    created_at,
+                    signature,
+                    deposit_id,
+                    MINIMUM_DEPOSIT_AMOUNT
+                )
+            );
+            read_state(|state| {
+                assert!(state.spl_deposits().pending_mints().is_empty());
+                let minted = &state.spl_deposits().minted()[&deposit_id];
+                assert_eq!(minted.minted_amount, MINIMUM_DEPOSIT_AMOUNT);
+                assert_eq!(*minted.mint_block_index.get(), BLOCK_INDEX);
+                assert!(
+                    state
+                        .spl_deposits()
+                        .in_flight_id(&DEPOSITOR_ACCOUNT, &token.mint)
+                        .is_none()
+                );
+                assert_eq!(state.balance(), INITIAL_BALANCE - lamports_spent);
+            });
+            let deposit = sweep.plan.deposits()[&deposit_id].clone();
+            let message = sweep.plan.sweep_message(blockhash());
+            let payloads: Vec<EventType> =
+                with_event_iter(|events| events.map(|event| event.payload).collect());
+            assert_eq!(
+                payloads[payloads.len() - 5..],
+                [
+                    EventType::QueuedSplDeposit {
+                        deposit_id,
+                        account: deposit.account,
+                        mint: deposit.mint,
+                        address: deposit.address,
+                        balance: deposit.balance,
+                    },
+                    EventType::SubmittedTransaction {
+                        signature,
+                        message: message.clone().into(),
+                        signers: sweep.plan.signers(&message),
+                        purpose: TransactionPurpose::SweepSplDeposits {
+                            deposit_ids: vec![deposit_id],
+                        },
+                        block_height: DEFAULT_BLOCK_HEIGHT,
+                    },
+                    EventType::SucceededTransaction { signature },
+                    EventType::CreditedSplSweep {
+                        signature,
+                        lamports_spent,
+                        mints: vec![CreditedSplDeposit {
+                            deposit_id,
+                            amount_to_mint: MINIMUM_DEPOSIT_AMOUNT,
+                        }],
+                    },
+                    EventType::MintedSweptSplDeposit {
+                        deposit_id,
+                        mint_block_index: BLOCK_INDEX.into(),
+                    },
+                ]
+            );
+            assert_replay_matches();
+            let events_before = total_event_count();
+            let repeated_runtime = TestCanisterRuntime::new();
+
+            process_pending_spl_mints(repeated_runtime.clone()).await;
+
+            assert!(repeated_runtime.sent_update_calls().is_empty());
+            assert_eq!(total_event_count(), events_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn should_sweep_a_batch_across_two_mints_and_owners_into_two_ledgers() {
+        setup();
+        let classic = register_token(false);
+        let token_2022 = register(SupportedSplToken {
+            minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
+            ..spl_token([3; 32].into(), TokenProgram::Token2022)
+        });
+        let alice = DEPOSITOR_ACCOUNT;
+        let bob = account(2);
+        let expected = [
+            (deposit(&classic, alice, 100).await, &classic, alice, 100),
+            (deposit(&classic, bob, 200).await, &classic, bob, 200),
+            (
+                deposit(&token_2022, alice, 300).await,
+                &token_2022,
+                alice,
+                300,
+            ),
+        ];
+        assert_eq!(expected.map(|(id, ..)| id), [0, 1, 2]);
+
+        let sweep = sweep(&[alice, bob], 0).await;
+
+        let message = sweep.plan.sweep_message(blockhash());
+        assert_eq!(
+            sweep.plan.deposits().keys().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(message.header.num_required_signatures, 3);
+        assert_eq!(message.instructions.len(), 5);
+        let created_at = settle(&sweep).await;
+        let lamports_spent = 3 * FEE_PER_SIGNATURE + 2 * DESTINATION_LAMPORTS;
+        read_state(|state| {
+            assert_eq!(state.spl_deposits().pending_mints().len(), 3);
+            assert_eq!(state.balance(), INITIAL_BALANCE - lamports_spent);
+        });
+        EventsAssert::from_recorded().expect_contains_event_eq(EventType::CreditedSplSweep {
+            signature: sweep.signature,
+            lamports_spent,
+            mints: expected
+                .iter()
+                .map(|(deposit_id, _, _, amount)| CreditedSplDeposit {
+                    deposit_id: *deposit_id,
+                    amount_to_mint: *amount,
+                })
+                .collect(),
+        });
+
+        let calls = mint(3).await;
+
+        assert_eq!(calls.len(), 3);
+        for (call, (deposit_id, token, owner, amount)) in calls.iter().zip(expected) {
+            assert_eq!(call.canister_id, token.ledger_id);
+            assert_eq!(call.method, "icrc1_transfer");
+            assert_eq!(
+                call.single_arg::<TransferArg>(),
+                mint_arg(owner, created_at, sweep.signature, deposit_id, amount)
+            );
+        }
+        read_state(|state| {
+            assert!(state.spl_deposits().pending_mints().is_empty());
+            assert_eq!(state.spl_deposits().minted().len(), 3);
+            for (deposit_id, token, owner, amount) in expected {
+                assert_eq!(
+                    state.spl_deposits().minted()[&deposit_id].minted_amount,
+                    amount
+                );
+                assert!(
+                    state
+                        .spl_deposits()
+                        .in_flight_id(&owner, &token.mint)
+                        .is_none()
+                );
+            }
+        });
+        assert_replay_matches();
+    }
+
+    #[tokio::test]
+    async fn should_release_a_dropped_deposit_and_mint_its_replacement() {
+        setup();
+        let token = register_token(false);
+        let first = deposit(&token, DEPOSITOR_ACCOUNT, MINIMUM_DEPOSIT_AMOUNT).await;
+        let failed = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+        assert_eq!(
+            deposit_spl(
+                &TestCanisterRuntime::new(),
+                DEPOSITOR_ACCOUNT,
+                token.mint.into()
+            )
+            .await,
+            Ok(first)
+        );
+
+        fail(
+            &failed,
+            sol_rpc_types::TransactionError::InstructionError(
+                1,
+                sol_rpc_types::InstructionError::Custom(1),
+            ),
+        )
+        .await;
+
+        let failed_fee = 2 * FEE_PER_SIGNATURE;
+        read_state(|state| {
+            assert_eq!(
+                state.spl_deposits().dropped()[&first].signature,
+                failed.signature
+            );
+            assert!(
+                state
+                    .spl_deposits()
+                    .in_flight_id(&DEPOSITOR_ACCOUNT, &token.mint)
+                    .is_none()
+            );
+            assert_eq!(state.balance(), INITIAL_BALANCE - failed_fee);
+        });
+
+        let second = deposit(&token, DEPOSITOR_ACCOUNT, MINIMUM_DEPOSIT_AMOUNT).await;
+
+        assert_eq!(second, first + 1);
+        let retry = sweep(&[DEPOSITOR_ACCOUNT], 1).await;
+        assert_ne!(retry.signature, failed.signature);
+        let created_at = settle(&retry).await;
+        let calls = mint(1).await;
+        assert_eq!(
+            calls[0].single_arg::<TransferArg>(),
+            mint_arg(
+                DEPOSITOR_ACCOUNT,
+                created_at,
+                retry.signature,
+                second,
+                MINIMUM_DEPOSIT_AMOUNT
+            )
+        );
+        read_state(|state| {
+            assert_eq!(
+                state
+                    .spl_deposits()
+                    .minted()
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![second]
+            );
+            assert!(state.spl_deposits().dropped().contains_key(&first));
+            assert!(
+                state
+                    .spl_deposits()
+                    .in_flight_id(&DEPOSITOR_ACCOUNT, &token.mint)
+                    .is_none()
+            );
+            assert_eq!(
+                state.balance(),
+                INITIAL_BALANCE - failed_fee - (2 * FEE_PER_SIGNATURE + DESTINATION_LAMPORTS)
+            );
+        });
+        assert_replay_matches();
+    }
+
+    #[tokio::test]
+    async fn should_report_a_quarantined_pair_by_its_deposit_id() {
+        setup();
+        let token = register_token(false);
+        let deposit_id = deposit(&token, DEPOSITOR_ACCOUNT, MINIMUM_DEPOSIT_AMOUNT).await;
+        let sweep = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+        let (mut outcome, _) = outcome_of(&sweep);
+        let OptionSerializer::Some(balances) = &mut outcome
+            .transaction
+            .meta
+            .as_mut()
+            .unwrap()
+            .post_token_balances
+        else {
+            unreachable!()
+        };
+        balances[0].ui_token_amount.amount = "1".to_string();
+
+        finalize_with(outcome).await;
+
+        EventsAssert::from_recorded().expect_contains_event_eq(EventType::QuarantinedSplSweep {
+            signature: sweep.signature,
+        });
+        read_state(|state| {
+            assert_eq!(
+                state.spl_deposits().quarantined()[&deposit_id].signature,
+                sweep.signature
+            );
+            assert!(state.spl_deposits().pending_mints().is_empty());
+            assert_eq!(
+                state
+                    .spl_deposits()
+                    .in_flight_id(&DEPOSITOR_ACCOUNT, &token.mint),
+                Some(deposit_id)
+            );
+        });
+        assert_eq!(
+            deposit_spl(
+                &TestCanisterRuntime::new(),
+                DEPOSITOR_ACCOUNT,
+                token.mint.into()
+            )
+            .await,
+            Ok(deposit_id)
+        );
+        let other_subaccount = Account {
+            subaccount: Some([1; 32]),
+            ..DEPOSITOR_ACCOUNT
+        };
+
+        let next = deposit(&token, other_subaccount, MINIMUM_DEPOSIT_AMOUNT).await;
+
+        assert_eq!(next, deposit_id + 1);
+        assert_replay_matches();
+    }
+
+    #[tokio::test]
+    async fn should_mint_the_recorded_balance_and_leave_a_top_up_for_the_next_deposit() {
+        setup();
+        let token = register_token(false);
+        let first = deposit(&token, DEPOSITOR_ACCOUNT, MINIMUM_DEPOSIT_AMOUNT).await;
+        let first_sweep = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+        let (outcome, _) = outcome_of(&first_sweep);
+        let leftover = source_balance_after(&first_sweep, &outcome, first);
+        assert!(leftover >= MINIMUM_DEPOSIT_AMOUNT);
+        let created_at = settle(&first_sweep).await;
+
+        let calls = mint(1).await;
+
+        assert_eq!(
+            calls[0].single_arg::<TransferArg>(),
+            mint_arg(
+                DEPOSITOR_ACCOUNT,
+                created_at,
+                first_sweep.signature,
+                first,
+                MINIMUM_DEPOSIT_AMOUNT
+            )
+        );
+        read_state(|state| {
+            assert_eq!(
+                state.spl_deposits().minted()[&first].minted_amount,
+                MINIMUM_DEPOSIT_AMOUNT
+            );
+            assert!(
+                state
+                    .spl_deposits()
+                    .in_flight_id(&DEPOSITOR_ACCOUNT, &token.mint)
+                    .is_none()
+            );
+        });
+
+        let second = deposit(&token, DEPOSITOR_ACCOUNT, leftover).await;
+
+        assert_eq!(second, first + 1);
+        read_state(|state| assert_eq!(state.spl_deposits().queued()[&second].balance, leftover));
+        let second_sweep = sweep(&[DEPOSITOR_ACCOUNT], 1).await;
+        let created_at = settle(&second_sweep).await;
+        let calls = mint(1).await;
+        assert_eq!(
+            calls[0].single_arg::<TransferArg>(),
+            mint_arg(
+                DEPOSITOR_ACCOUNT,
+                created_at,
+                second_sweep.signature,
+                second,
+                leftover
+            )
+        );
+        read_state(|state| {
+            let minted = state.spl_deposits().minted();
+            assert_eq!(minted.len(), 2);
+            assert_eq!(
+                minted.values().map(|mint| mint.minted_amount).sum::<u64>(),
+                MINIMUM_DEPOSIT_AMOUNT + leftover
+            );
+            assert!(
+                state
+                    .spl_deposits()
+                    .in_flight_id(&DEPOSITOR_ACCOUNT, &token.mint)
+                    .is_none()
+            );
+        });
+        assert_replay_matches();
     }
 }
