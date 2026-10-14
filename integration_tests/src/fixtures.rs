@@ -15,7 +15,7 @@ use serde_json::json;
 use sol_rpc_types::{AccountInfo, Lamport};
 use solana_account_decoder_client_types::UiAccount;
 use solana_address::{Address, address};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 pub const DEFAULT_CALLER_ACCOUNT: Account = Account {
@@ -31,6 +31,15 @@ pub const MINTER_ADDRESS: Address = address!("2YKPWqP51gUFEYo1FD2K3LoRE6Cd2f99E1
 pub const DEPOSIT_AMOUNT: Lamport = 500_000_000;
 /// Minimum balance left on a deposit address to keep it rent-exempt.
 pub const RENT_EXEMPTION_THRESHOLD: Lamport = 890_880;
+
+/// The timer periods of the minter, so that a test can advance time past them.
+pub const WITHDRAWAL_PROCESSING_DELAY: Duration = Duration::from_mins(1);
+pub const SWEEP_DEPOSITS_DELAY: Duration = Duration::from_mins(1);
+pub const PROCESS_PENDING_MINTS_DELAY: Duration = Duration::from_mins(1);
+pub const FINALIZE_TRANSACTIONS_DELAY: Duration = Duration::from_mins(2);
+pub const RESUBMIT_TRANSACTIONS_DELAY: Duration = Duration::from_mins(3);
+/// Height of the block whose blockhash the mocks hand a timer for a first submission.
+pub const SUBMISSION_BLOCK_HEIGHT: u64 = 100_000_000;
 
 /// The slot the mocked `getSlot` reports. A test says which block height the mocked
 /// `getBlock` then reports, since that is what the minter records and what it judges
@@ -187,10 +196,12 @@ impl MockBuilder {
     /// given signature, reporting metadata that credits the minter's main account with the
     /// sweepable amount minus the transaction fee of one signature.
     pub fn get_sweep_transaction(self, signature: &Signature, sweepable_amount: Lamport) -> Self {
-        self.expect(
-            get_transaction_request(signature),
-            sweep_transaction_response(sweepable_amount),
-        )
+        self.get_transaction(signature, sweep_transaction_response(sweepable_amount))
+    }
+
+    /// Mock for a finalized transaction outcome under the given signature.
+    pub fn get_transaction(self, signature: &Signature, response: JsonRpcResponse) -> Self {
+        self.expect(get_transaction_request(signature), response)
     }
 
     fn check_signature_statuses(self, response: JsonRpcResponse) -> Self {
