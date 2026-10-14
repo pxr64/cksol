@@ -1,14 +1,19 @@
 use assert_matches::assert_matches;
 use assert2::check;
+use candid::Principal;
 use cksol_int_tests::{
     Setup, SetupBuilder,
     fixtures::{
-        DEFAULT_CALLER_DEPOSIT_ADDRESS, EXPIRY_BLOCK_HEIGHT, FINALIZE_TRANSACTIONS_DELAY,
-        MINTER_ADDRESS, MockBuilder, SUBMISSION_BLOCK_HEIGHT, get_memo,
+        DEFAULT_CALLER_ACCOUNT, DEFAULT_CALLER_DEPOSIT_ADDRESS, EXPIRY_BLOCK_HEIGHT,
+        FINALIZE_TRANSACTIONS_DELAY, MINTER_ADDRESS, MockBuilder, SUBMISSION_BLOCK_HEIGHT,
+        SharedMockHttpOutcalls, get_memo,
     },
     validator::FEE_PER_SIGNATURE,
 };
-use cksol_types::{DepositSplArgs, DepositSplError, GetSplDepositAddressArgs, Memo, MintMemo};
+use cksol_types::{
+    AddSplTokenArgs, AddSplTokenError, DepositSplArgs, DepositSplError, GetSplDepositAddressArgs,
+    GetSplDepositAddressError, Memo, MintMemo,
+};
 use cksol_types_internal::{
     UpgradeArgs,
     event::{CreditedSplDeposit, EventType},
@@ -19,66 +24,58 @@ use sol_rpc_types::{
 };
 use solana_address::Address;
 use spl_token_2022_interface::extension::ExtensionType;
+use tokio::join;
 
 mod fixtures;
 
 use fixtures::spl::{
-    BALANCE_ABOVE_MINIMUM, DECIMALS, MINIMUM_DEPOSIT_AMOUNT, MINT, RENT_EXEMPT_LAMPORTS,
-    account_info, associated_token_address, finalize_sweep, frozen_token_account_data,
-    queue_deposit, queue_deposit_for_caller, register_token, run_mint_timer,
-    setup_with_registered_mint, sweep_queued_deposit, token_account_data,
-    token_account_data_with_amount,
+    BALANCE_ABOVE_MINIMUM, DECIMALS, MINIMUM_DEPOSIT_AMOUNT, MINT, OTHER_MINT,
+    RENT_EXEMPT_LAMPORTS, account_info, add_spl_token_args, associated_token_address,
+    finalize_sweep, finalize_sweep_with_amount, frozen_token_account_data, queue_deposit,
+    queue_deposit_for_caller, register_token, run_mint_timer, setup_with_registered_mint,
+    sweep_queued_deposit, token_account_data, token_account_data_with_amount, try_register_token,
 };
 
 #[tokio::test]
 async fn should_sweep_finalize_and_mint_queued_deposit_after_timers() {
-    let token_program = spl_token_interface::id().to_bytes().into();
+    sweep_finalize_and_mint(spl_token_interface::id().to_bytes().into(), &[]).await;
+}
+
+#[tokio::test]
+async fn should_sweep_finalize_and_mint_token_2022_deposit_after_timers() {
+    sweep_finalize_and_mint(
+        spl_token_2022_interface::id().to_bytes().into(),
+        &[ExtensionType::ImmutableOwner],
+    )
+    .await;
+}
+
+/// Queues a deposit, sweeps it on the timers, settles it and mints it on the ledger.
+async fn sweep_finalize_and_mint(token_program: Address, extensions: &[ExtensionType]) {
     let setup = SetupBuilder::new()
         .with_proxy_canister()
         .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
         .build()
         .await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
-    // The mint account read uses RPC IDs 0 to 3.
     register_token(&setup, ledger.canister_id(), token_program).await;
     let account = Account {
         owner: setup.proxy_canister_id(),
         subaccount: Some([1; 32]),
     };
     let owner: Address = setup.minter().get_deposit_address(account).await.into();
-    let source: Address = setup
-        .minter()
-        .get_spl_deposit_address(GetSplDepositAddressArgs {
-            owner: None,
-            subaccount: account.subaccount,
-            mint: MINT.into(),
-        })
-        .await
-        .expect("get_spl_deposit_address should return the source token address")
-        .into();
-    let deposit_id = setup
-        .minter()
-        .with_http_mocks(
-            // Each RPC uses four providers. The source read uses IDs 4 to 7.
-            // The destination read uses IDs 8 to 11.
-            MockBuilder::with_start_id(4)
-                .get_account_info(
-                    &source,
-                    Some(account_info(token_account_data(&owner, &[]), token_program)),
-                )
-                .get_account_info(
-                    &associated_token_address(&MINTER_ADDRESS, &token_program),
-                    None,
-                )
-                .build(),
-        )
-        .deposit_spl(DepositSplArgs {
-            owner: None,
-            subaccount: account.subaccount,
-            mint: MINT.into(),
-        })
-        .await
-        .expect("deposit_spl should queue a sweep");
+    assert_eq!(
+        setup
+            .minter()
+            .get_spl_deposit_address(GetSplDepositAddressArgs {
+                owner: None,
+                subaccount: account.subaccount,
+                mint: MINT.into(),
+            })
+            .await,
+        Ok(associated_token_address(&owner, &token_program).into())
+    );
+    let deposit_id = queue_deposit(&setup, account, token_program, extensions, 4).await;
     assert_eq!(ledger.balance_of(account).await, 0);
 
     let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 12).await;
@@ -92,7 +89,6 @@ async fn should_sweep_finalize_and_mint_queued_deposit_after_timers() {
             lamports_spent: 2 * FEE_PER_SIGNATURE + RENT_EXEMPT_LAMPORTS,
             mints: vec![CreditedSplDeposit {
                 deposit_id,
-                // The fee is zero. Queue the full accepted balance for the user.
                 amount_to_mint: BALANCE_ABOVE_MINIMUM
             }],
         }));
@@ -131,6 +127,203 @@ async fn should_sweep_finalize_and_mint_queued_deposit_after_timers() {
 }
 
 #[tokio::test]
+async fn should_quarantine_deposit_when_finalized_sweep_does_not_match_its_plan() {
+    let token_program = spl_token_interface::id().to_bytes().into();
+    let setup = setup_with_registered_mint(token_program).await;
+    let account = Account {
+        owner: setup.proxy_canister_id(),
+        subaccount: Some([1; 32]),
+    };
+    let owner: Address = setup.minter().get_deposit_address(account).await.into();
+    let deposit_id = queue_deposit(&setup, account, token_program, &[], 4).await;
+    let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 12).await;
+
+    finalize_sweep_with_amount(
+        &setup,
+        &signature,
+        transaction,
+        &owner,
+        &token_program,
+        BALANCE_ABOVE_MINIMUM - 1,
+        24,
+    )
+    .await;
+
+    setup.minter().assert_that_events().await.satisfy(|events| {
+        check!(events.contains(&EventType::QuarantinedSplSweep {
+            signature: signature.clone()
+        }));
+        check!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EventType::CreditedSplSweep { .. }))
+        );
+    });
+    // The pair stays locked, so a new request returns the quarantined deposit.
+    assert_eq!(
+        setup
+            .minter()
+            .deposit_spl(DepositSplArgs {
+                owner: None,
+                subaccount: account.subaccount,
+                mint: MINT.into(),
+            })
+            .await,
+        Ok(deposit_id)
+    );
+    setup.drop().await;
+}
+
+#[tokio::test]
+async fn should_reject_invalid_token_registrations() {
+    let token_program: Address = spl_token_interface::id().to_bytes().into();
+    let other_mint: cksol_types::Address = OTHER_MINT.into();
+
+    let setup = SetupBuilder::new().with_proxy_canister().build().await;
+    let ledger = setup.install_spl_ledger(DECIMALS).await;
+    let result = setup
+        .minter()
+        .try_add_spl_token(add_spl_token_args(ledger.canister_id(), token_program))
+        .await;
+    assert_matches!(result, Err(message) if message.contains("not activated"));
+    setup.drop().await;
+
+    let setup = SetupBuilder::new()
+        .with_proxy_canister()
+        .with_ledger_suite_orchestrator(Principal::from_slice(&[7]))
+        .build()
+        .await;
+    let ledger = setup.install_spl_ledger(DECIMALS).await;
+    let result = setup
+        .minter()
+        .try_add_spl_token(add_spl_token_args(ledger.canister_id(), token_program))
+        .await;
+    assert_matches!(result, Err(message) if message.contains("Only the ledger suite orchestrator"));
+    setup.drop().await;
+
+    let setup = SetupBuilder::new()
+        .with_proxy_canister()
+        .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
+        .build()
+        .await;
+    let ledger = setup.install_spl_ledger(DECIMALS).await;
+    let other_ledger = setup.install_spl_ledger(DECIMALS).await;
+    register_token(&setup, ledger.canister_id(), token_program).await;
+    assert_eq!(
+        setup
+            .minter()
+            .add_spl_token(add_spl_token_args(
+                other_ledger.canister_id(),
+                token_program
+            ))
+            .await,
+        Err(AddSplTokenError::AlreadySupported { mint: MINT.into() })
+    );
+    assert_eq!(
+        setup
+            .minter()
+            .add_spl_token(AddSplTokenArgs {
+                mint: other_mint.clone(),
+                ..add_spl_token_args(ledger.canister_id(), token_program)
+            })
+            .await,
+        Err(AddSplTokenError::LedgerAlreadyUsed {
+            ledger_id: ledger.canister_id()
+        })
+    );
+    let result = try_register_token(
+        &setup,
+        AddSplTokenArgs {
+            mint: other_mint,
+            decimals: DECIMALS + 1,
+            ..add_spl_token_args(other_ledger.canister_id(), token_program)
+        },
+        4,
+    )
+    .await;
+    assert_matches!(result, Err(AddSplTokenError::InvalidToken(reason)) if reason.contains("decimals"));
+    setup.drop().await;
+}
+
+#[tokio::test]
+async fn should_reject_invalid_deposit_requests() {
+    let token_program: Address = spl_token_interface::id().to_bytes().into();
+    let other_mint: cksol_types::Address = OTHER_MINT.into();
+    let setup = SetupBuilder::new()
+        .with_proxy_canister()
+        .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
+        .build()
+        .await;
+    let ledger = setup.install_spl_ledger(DECIMALS).await;
+    register_token(&setup, ledger.canister_id(), token_program).await;
+    let account = Account {
+        owner: setup.proxy_canister_id(),
+        subaccount: Some([1; 32]),
+    };
+    let args = |mint: cksol_types::Address| DepositSplArgs {
+        owner: None,
+        subaccount: account.subaccount,
+        mint,
+    };
+
+    assert_eq!(
+        setup.minter().deposit_spl(args(other_mint.clone())).await,
+        Err(DepositSplError::UnsupportedToken {
+            mint: other_mint.clone()
+        })
+    );
+    assert_eq!(
+        setup
+            .minter()
+            .get_spl_deposit_address(GetSplDepositAddressArgs {
+                owner: None,
+                subaccount: account.subaccount,
+                mint: other_mint.clone(),
+            })
+            .await,
+        Err(GetSplDepositAddressError::UnsupportedToken {
+            mint: other_mint.clone()
+        })
+    );
+
+    let owner: Address = setup.minter().get_deposit_address(account).await.into();
+    let result = setup
+        .minter()
+        .with_http_mocks(
+            MockBuilder::with_start_id(4)
+                .get_account_info(
+                    &associated_token_address(&owner, &token_program),
+                    Some(account_info(
+                        frozen_token_account_data(&owner),
+                        token_program,
+                    )),
+                )
+                .build(),
+        )
+        .deposit_spl(args(MINT.into()))
+        .await;
+    assert_matches!(result, Err(DepositSplError::InvalidTokenAccount(reason)) if reason.contains("frozen"));
+
+    let other_ledger = setup.install_spl_ledger(DECIMALS).await;
+    try_register_token(
+        &setup,
+        AddSplTokenArgs {
+            mint: other_mint.clone(),
+            paused: true,
+            ..add_spl_token_args(other_ledger.canister_id(), token_program)
+        },
+        8,
+    )
+    .await
+    .expect("add_spl_token should register the paused token");
+    assert_eq!(
+        setup.minter().deposit_spl(args(other_mint.clone())).await,
+        Err(DepositSplError::TokenPaused { mint: other_mint })
+    );
+    setup.drop().await;
+}
+
+#[tokio::test]
 async fn should_keep_in_flight_deposit_and_mint_it_after_upgrade() {
     let token_program = spl_token_interface::id().to_bytes().into();
     let setup = SetupBuilder::new()
@@ -147,7 +340,7 @@ async fn should_keep_in_flight_deposit_and_mint_it_after_upgrade() {
     };
     let owner: Address = setup.minter().get_deposit_address(account).await.into();
     let source = associated_token_address(&owner, &token_program);
-    let deposit_id = queue_deposit(&setup, account, token_program, 4).await;
+    let deposit_id = queue_deposit(&setup, account, token_program, &[], 4).await;
     let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 12).await;
     finalize_sweep(&setup, &signature, transaction, &owner, &token_program, 24).await;
     let events_before_upgrade = setup.minter().get_all_events().await;
@@ -215,7 +408,7 @@ async fn should_drop_deposit_and_release_account_after_sweep_expires() {
         owner: setup.proxy_canister_id(),
         subaccount: Some([1; 32]),
     };
-    let deposit_id = queue_deposit(&setup, account, token_program, 4).await;
+    let deposit_id = queue_deposit(&setup, account, token_program, &[], 4).await;
     let (signature, _) = sweep_queued_deposit(&setup, deposit_id, 12).await;
 
     setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
@@ -238,7 +431,7 @@ async fn should_drop_deposit_and_release_account_after_sweep_expires() {
         )));
     });
     assert_eq!(
-        queue_deposit(&setup, account, token_program, 36).await,
+        queue_deposit(&setup, account, token_program, &[], 36).await,
         deposit_id + 1
     );
     setup.drop().await;
@@ -252,7 +445,7 @@ async fn should_drop_deposit_and_release_account_when_sweep_fails_on_chain() {
         owner: setup.proxy_canister_id(),
         subaccount: Some([1; 32]),
     };
-    let deposit_id = queue_deposit(&setup, account, token_program, 4).await;
+    let deposit_id = queue_deposit(&setup, account, token_program, &[], 4).await;
     let (signature, _) = sweep_queued_deposit(&setup, deposit_id, 12).await;
 
     setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
@@ -275,8 +468,75 @@ async fn should_drop_deposit_and_release_account_when_sweep_fails_on_chain() {
         )));
     });
     assert_eq!(
-        queue_deposit(&setup, account, token_program, 36).await,
+        queue_deposit(&setup, account, token_program, &[], 36).await,
         deposit_id + 1
+    );
+    setup.drop().await;
+}
+
+#[tokio::test]
+async fn should_treat_default_subaccount_spellings_as_one_account() {
+    let token_program = spl_token_interface::id().to_bytes().into();
+    let setup = setup_with_registered_mint(token_program).await;
+    let deposit_id = queue_deposit(&setup, DEFAULT_CALLER_ACCOUNT, token_program, &[], 4).await;
+
+    let result = setup
+        .minter()
+        .deposit_spl(DepositSplArgs {
+            owner: None,
+            subaccount: Some([0; 32]),
+            mint: MINT.into(),
+        })
+        .await;
+
+    assert_eq!(result, Ok(deposit_id));
+    setup.minter().assert_that_events().await.satisfy(|events| {
+        let queued: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                EventType::QueuedSplDeposit { account, .. } => Some(*account),
+                _ => None,
+            })
+            .collect();
+        check!(queued == [DEFAULT_CALLER_ACCOUNT]);
+    });
+    setup.drop().await;
+}
+
+#[tokio::test]
+async fn should_fail_for_concurrent_access() {
+    let token_program: Address = spl_token_interface::id().to_bytes().into();
+    let setup = setup_with_registered_mint(token_program).await;
+    let owner: Address = DEFAULT_CALLER_DEPOSIT_ADDRESS.parse().unwrap();
+    let mocks = SharedMockHttpOutcalls::new(
+        MockBuilder::with_start_id(4)
+            .get_account_info(
+                &associated_token_address(&owner, &token_program),
+                Some(account_info(token_account_data(&owner, &[]), token_program)),
+            )
+            .get_account_info(
+                &associated_token_address(&MINTER_ADDRESS, &token_program),
+                None,
+            )
+            .build(),
+    );
+    let minter1 = setup.minter().with_http_mocks(mocks.clone());
+    let minter2 = setup.minter().with_http_mocks(mocks.clone());
+    let args = DepositSplArgs {
+        owner: None,
+        subaccount: None,
+        mint: MINT.into(),
+    };
+
+    let results = join!(minter1.deposit_spl(args.clone()), minter2.deposit_spl(args));
+
+    assert!(
+        matches!(
+            results,
+            (Ok(0), Err(DepositSplError::AlreadyProcessing))
+                | (Err(DepositSplError::AlreadyProcessing), Ok(0))
+        ),
+        "Expected one queued deposit and one AlreadyProcessing error, got: {results:?}"
     );
     setup.drop().await;
 }

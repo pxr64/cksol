@@ -454,9 +454,17 @@ impl CkSolMinter<'_> {
         &self,
         args: impl Into<GetSplDepositAddressArgs>,
     ) -> Result<Address, GetSplDepositAddressError> {
-        self.try_query_call("get_spl_deposit_address", (args.into(),))
+        self.try_get_spl_deposit_address(args)
             .await
             .expect("get_spl_deposit_address failed")
+    }
+
+    pub async fn try_get_spl_deposit_address(
+        &self,
+        args: impl Into<GetSplDepositAddressArgs>,
+    ) -> Result<Result<Address, GetSplDepositAddressError>, String> {
+        self.try_query_call("get_spl_deposit_address", (args.into(),))
+            .await
     }
 
     pub async fn deposit_sol(

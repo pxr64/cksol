@@ -12,8 +12,9 @@ use cksol_int_tests::{
     validator::FEE_PER_SIGNATURE,
 };
 use cksol_types::{
-    DepositSolArgs, DepositSolError, DepositSolStatus, GetDepositAddressArgs, Lamport, MinterInfo,
-    TxFinalizedStatus, WithdrawalArgs, WithdrawalError, WithdrawalStatus,
+    DepositSolArgs, DepositSolError, DepositSolStatus, DepositSplArgs, GetDepositAddressArgs,
+    GetSplDepositAddressArgs, Lamport, MinterInfo, TxFinalizedStatus, WithdrawalArgs,
+    WithdrawalError, WithdrawalStatus,
 };
 use cksol_types_internal::{
     UpgradeArgs,
@@ -24,6 +25,9 @@ use icrc_ledger_types::icrc1::account::{Account, Subaccount};
 use sol_rpc_types::{CommitmentLevel, ConsensusStrategy, RpcConfig};
 use std::time::Duration;
 use tokio::join;
+
+/// Any mint: the owner checks of the SPL endpoints run before the token checks.
+const ANY_MINT: solana_address::Address = solana_address::Address::new_from_array([1; 32]);
 
 /// Deposits funds into the minter via `deposit_sol`, sweeps them, and finalizes
 /// and credits the sweep so the minter's internal balance is credited.
@@ -1151,6 +1155,24 @@ mod anonymous_caller_tests {
                 })
                 .await;
             assert_matches!(result, Err(s) if s.contains("the owner must be non-anonymous"));
+
+            let result = minter
+                .try_get_spl_deposit_address(GetSplDepositAddressArgs {
+                    owner,
+                    subaccount: None,
+                    mint: ANY_MINT.into(),
+                })
+                .await;
+            assert_matches!(result, Err(s) if s.contains("the owner must be non-anonymous"));
+
+            let result = minter
+                .try_deposit_spl(DepositSplArgs {
+                    owner,
+                    subaccount: None,
+                    mint: ANY_MINT.into(),
+                })
+                .await;
+            assert_matches!(result, Err(s) if s.contains("the owner must be non-anonymous"));
         }
 
         // `withdraw` endpoint (no `owner` field, only anonymous caller applies)
@@ -1194,6 +1216,26 @@ mod minter_owner_tests {
             .try_deposit_sol(DepositSolArgs {
                 owner,
                 subaccount: None,
+            })
+            .await;
+        assert_matches!(result, Err(s) if s.contains(&expected_message));
+
+        let result = setup
+            .minter()
+            .try_get_spl_deposit_address(GetSplDepositAddressArgs {
+                owner,
+                subaccount: None,
+                mint: ANY_MINT.into(),
+            })
+            .await;
+        assert_matches!(result, Err(s) if s.contains(&expected_message));
+
+        let result = setup
+            .minter()
+            .try_deposit_spl(DepositSplArgs {
+                owner,
+                subaccount: None,
+                mint: ANY_MINT.into(),
             })
             .await;
         assert_matches!(result, Err(s) if s.contains(&expected_message));

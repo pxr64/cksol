@@ -11,8 +11,8 @@ use cksol_int_tests::{
     validator::FEE_PER_SIGNATURE,
 };
 use cksol_types::{
-    AddSplTokenArgs, DepositSplArgs, DepositSplId, GetDepositAddressArgs, GetSplDepositAddressArgs,
-    Lamport, Signature,
+    AddSplTokenArgs, AddSplTokenError, DepositSplArgs, DepositSplId, GetDepositAddressArgs,
+    GetSplDepositAddressArgs, Lamport, Signature,
 };
 use cksol_types_internal::event::{EventType, TransactionPurpose, VersionedTransactionMessage};
 use ic_pocket_canister_runtime::JsonRpcResponse;
@@ -32,6 +32,7 @@ use spl_token_2022_interface::{
 use spl_token_interface::state::Mint;
 
 pub const MINT: Address = address!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+pub const OTHER_MINT: Address = address!("So11111111111111111111111111111111111111112");
 pub const DECIMALS: u8 = 6;
 pub const MINIMUM_DEPOSIT_AMOUNT: u64 = 1_000_000;
 pub const BALANCE_ABOVE_MINIMUM: u64 = MINIMUM_DEPOSIT_AMOUNT + 1;
@@ -134,33 +135,52 @@ pub async fn setup_with_registered_mint(token_program: Address) -> Setup {
     setup
 }
 
+pub fn add_spl_token_args(ledger_id: Principal, token_program: Address) -> AddSplTokenArgs {
+    AddSplTokenArgs {
+        mint: MINT.into(),
+        token_program: token_program.into(),
+        decimals: DECIMALS,
+        ledger_id,
+        minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
+        paused: false,
+    }
+}
+
+/// Registers [`MINT`] on the ledger. The mint account read uses RPC IDs 0 to 3.
 pub async fn register_token(setup: &Setup, ledger_id: Principal, token_program: Address) {
-    setup
-        .minter()
-        .with_http_mocks(
-            MockBuilder::new()
-                .get_account_info(&MINT, Some(account_info(mint_data(), token_program)))
-                .build(),
-        )
-        .add_spl_token(AddSplTokenArgs {
-            mint: MINT.into(),
-            token_program: token_program.into(),
-            decimals: DECIMALS,
-            ledger_id,
-            minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
-            paused: false,
-        })
+    try_register_token(setup, add_spl_token_args(ledger_id, token_program), 0)
         .await
         .expect("add_spl_token should register the token");
 }
 
-/// Uses the recorded message, with an outcome where the full source balance reached
-/// a newly created treasury ATA and the minter paid its fee and rent.
+/// Registers the token of the arguments, answering the read of its mint account with
+/// RPC IDs `start_id` to `start_id + 3`. The mint account has [`DECIMALS`] decimals.
+pub async fn try_register_token(
+    setup: &Setup,
+    args: AddSplTokenArgs,
+    start_id: u64,
+) -> Result<(), AddSplTokenError> {
+    let token_program = Address::from(args.token_program.clone());
+    let mint = Address::from(args.mint.clone());
+    setup
+        .minter()
+        .with_http_mocks(
+            MockBuilder::with_start_id(start_id)
+                .get_account_info(&mint, Some(account_info(mint_data(), token_program)))
+                .build(),
+        )
+        .add_spl_token(args)
+        .await
+}
+
+/// Uses the recorded message, with an outcome where the given amount moved from the
+/// source to a newly created treasury ATA and the minter paid its fee and rent.
 pub fn sweep_transaction_response(
     signature: &Signature,
     transaction: VersionedTransactionMessage,
     owner: &Address,
     token_program: &Address,
+    amount: u64,
 ) -> JsonRpcResponse {
     let bytes = assert_matches!(transaction, VersionedTransactionMessage::Legacy(bytes) => bytes);
     let message: solana_message::Message = bincode::deserialize(&bytes).unwrap();
@@ -213,10 +233,10 @@ pub fn sweep_transaction_response(
                 "fee": fee,
                 "preBalances": pre_balances,
                 "postBalances": post_balances,
-                "preTokenBalances": [token_balance(source_index, owner, BALANCE_ABOVE_MINIMUM)],
+                "preTokenBalances": [token_balance(source_index, owner, amount)],
                 "postTokenBalances": [
                     token_balance(source_index, owner, 0),
-                    token_balance(destination_index, &MINTER_ADDRESS, BALANCE_ABOVE_MINIMUM)
+                    token_balance(destination_index, &MINTER_ADDRESS, amount)
                 ],
                 "innerInstructions": [],
                 "logMessages": [],
@@ -319,6 +339,7 @@ pub async fn queue_deposit(
     setup: &Setup,
     account: Account,
     token_program: Address,
+    extensions: &[ExtensionType],
     start_id: u64,
 ) -> DepositSplId {
     let owner: Address = setup.minter().get_deposit_address(account).await.into();
@@ -328,7 +349,10 @@ pub async fn queue_deposit(
             MockBuilder::with_start_id(start_id)
                 .get_account_info(
                     &associated_token_address(&owner, &token_program),
-                    Some(account_info(token_account_data(&owner, &[]), token_program)),
+                    Some(account_info(
+                        token_account_data(&owner, extensions),
+                        token_program,
+                    )),
                 )
                 .get_account_info(
                     &associated_token_address(&MINTER_ADDRESS, &token_program),
@@ -387,6 +411,28 @@ pub async fn finalize_sweep(
     token_program: &Address,
     start_id: u64,
 ) {
+    finalize_sweep_with_amount(
+        setup,
+        signature,
+        transaction,
+        owner,
+        token_program,
+        BALANCE_ABOVE_MINIMUM,
+        start_id,
+    )
+    .await;
+}
+
+/// Like [`finalize_sweep`], with the given amount moved instead of the recorded balance.
+pub async fn finalize_sweep_with_amount(
+    setup: &Setup,
+    signature: &Signature,
+    transaction: VersionedTransactionMessage,
+    owner: &Address,
+    token_program: &Address,
+    amount: u64,
+    start_id: u64,
+) {
     setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
     setup
         .execute_http_mocks(
@@ -394,7 +440,13 @@ pub async fn finalize_sweep(
                 .finalize_transaction(SUBMISSION_BLOCK_HEIGHT)
                 .get_transaction(
                     signature,
-                    sweep_transaction_response(signature, transaction, owner, token_program),
+                    sweep_transaction_response(
+                        signature,
+                        transaction,
+                        owner,
+                        token_program,
+                        amount,
+                    ),
                 )
                 .build(),
         )
