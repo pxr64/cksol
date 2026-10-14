@@ -509,6 +509,18 @@ type EventType = variant {
         // The identifier of the SPL deposit whose pending mint was quarantined.
         deposit_id: DepositSplId;
     };
+    // The token ledger minted a deposit fee into the minter's fee subaccount.
+    MintedSplDepositFee : record {
+        // The identifier of the deposit whose fee was minted.
+        deposit_id: DepositSplId;
+        // The fee mint transaction index on the token ledger.
+        mint_block_index: nat64;
+    };
+    // A deposit fee mint cannot be safely retried and requires manual resolution.
+    QuarantinedPendingSplFeeMint : record {
+        // The identifier of the deposit whose pending fee mint was quarantined.
+        deposit_id: DepositSplId;
+    };
     // A batch failed on chain and its SPL deposits were requeued for individual sweeps.
     SplitFailedSplSweep : record {
         // The signature of the confirmed failed batch transaction.
@@ -619,6 +631,7 @@ service : (MinterArg) -> {
 
     // Queues a finalized SPL balance for sweeping to the minter and minting on its token ledger.
     // The token fee quoted at acceptance is deducted from the ledger mint.
+    // Once the user mint succeeds, that fee is minted into the minter's fee subaccount.
     // New deposits cover two account reads and a consolidation fee in cycles; the fee is
     // charged only when both source and destination checks succeed. Repeated requests for
     // an in-flight account and mint return the existing ID without a charge, also when paused.

@@ -12,7 +12,8 @@ use crate::{
     storage::{reset_events, with_event_iter},
     test_fixtures::{
         BLOCK_INDEX, DEFAULT_BLOCK_HEIGHT, EventsAssert, account, queued_spl_deposit,
-        runtime::TestCanisterRuntime, schnorr_master_key, signature, spl_token, valid_init_args,
+        runtime::TestCanisterRuntime, schnorr_master_key, signature, spl_fee_mint_arg, spl_token,
+        valid_init_args,
     },
 };
 use candid::Nat;
@@ -206,6 +207,8 @@ async fn should_mint_to_each_registered_token_ledger_and_replay() {
     }
     read_state(|state| {
         assert!(state.spl_deposits().pending_mints().is_empty());
+        assert!(state.spl_deposits().pending_fee_mints().is_empty());
+        assert!(state.spl_deposits().minted_fees().is_empty());
         assert_eq!(state.balance(), 0);
     });
     assert_eq!(runtime.set_timer_call_count(), 0);
@@ -377,4 +380,172 @@ async fn should_not_reschedule_a_round_of_transient_spl_mint_failures() {
             MAX_PENDING_MINTS_PER_ROUND + 1
         )
     });
+}
+
+#[tokio::test]
+async fn should_retry_only_the_fee_mint_and_preserve_new_deposit_lock() {
+    const FEE: u64 = 25;
+    const MINTED_AT: u64 = CREDITED_AT + 1;
+    let (_, pending) = setup_pending_with_fee(1, FEE).remove(0);
+    let first = TestCanisterRuntime::new()
+        .with_time(MINTED_AT)
+        .add_stub_response::<MintResult>(Ok(BLOCK_INDEX.into()))
+        .add_stub_error(IcError::CallPerformFailed);
+    process_pending_spl_mints(first.clone()).await;
+    let calls = first.sent_update_calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].canister_id, calls[1].canister_id);
+    let fee_arg = spl_fee_mint_arg(0, pending.sweep_signature(), MINTED_AT, FEE);
+    assert_eq!(calls[1].single_arg::<TransferArg>(), fee_arg);
+    assert_ne!(fee_arg.memo, calls[0].single_arg::<TransferArg>().memo);
+    read_state(|state| {
+        assert!(state.spl_deposits().pending_mints().is_empty());
+        assert_eq!(state.spl_deposits().pending_fee_mints()[&0].amount, FEE);
+        assert!(state.spl_deposits().minted_fees().is_empty());
+        assert_eq!(
+            *state.spl_deposits().minted()[&0].mint_block_index.get(),
+            BLOCK_INDEX
+        );
+    });
+    assert_replay_matches();
+
+    let deposit = pending.deposit.deposit;
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::QueuedSplDeposit {
+                deposit_id: 1,
+                account: deposit.account,
+                mint: deposit.mint,
+                address: deposit.address,
+                balance: deposit.balance,
+                fee: deposit.fee,
+            },
+            &first,
+        );
+    });
+    let retry = mint_runtime([Err(TransferError::Duplicate {
+        duplicate_of: (BLOCK_INDEX + 1).into(),
+    })]);
+    process_pending_spl_mints(retry.clone()).await;
+    assert_eq!(retry.sent_update_calls().len(), 1);
+    assert_eq!(
+        retry.sent_update_calls()[0].single_arg::<TransferArg>(),
+        fee_arg
+    );
+    read_state(|state| {
+        assert!(state.spl_deposits().pending_fee_mints().is_empty());
+        assert_eq!(
+            *state.spl_deposits().minted_fees()[&0].get(),
+            BLOCK_INDEX + 1
+        );
+        assert_eq!(
+            state
+                .spl_deposits()
+                .in_flight_id(&deposit.account, &deposit.mint),
+            Some(1)
+        );
+        assert_eq!(
+            *state.spl_deposits().minted()[&0].mint_block_index.get(),
+            BLOCK_INDEX
+        );
+    });
+    assert_replay_matches();
+    let idle = TestCanisterRuntime::new();
+    process_pending_spl_mints(idle.clone()).await;
+    assert!(idle.sent_update_calls().is_empty());
+}
+
+#[tokio::test]
+async fn should_not_mint_fee_before_the_user_mint_succeeds() {
+    for error in [TransferError::TemporarilyUnavailable, TransferError::TooOld] {
+        setup_pending_with_fee(1, 25);
+        let runtime = mint_runtime([Err(error)]);
+        process_pending_spl_mints(runtime.clone()).await;
+        assert_eq!(runtime.sent_update_calls().len(), 1);
+        read_state(|state| {
+            assert!(state.spl_deposits().pending_fee_mints().is_empty());
+            assert!(state.spl_deposits().minted_fees().is_empty());
+        });
+        assert_replay_matches();
+    }
+}
+
+#[tokio::test]
+async fn should_quarantine_unsafe_fee_mint_without_changing_user_mint() {
+    for failure in 0..3 {
+        let (id, pending) = setup_pending_with_fee(1, 25).remove(0);
+        process_pending_spl_mint(
+            &TestCanisterRuntime::new()
+                .with_time(CREDITED_AT)
+                .add_stub_response::<MintResult>(Ok(BLOCK_INDEX.into())),
+            id,
+            pending.clone(),
+        )
+        .await;
+        let fee = read_state(|state| state.spl_deposits().pending_fee_mints()[&id].clone());
+        assert_replay_matches();
+        let runtime = match failure {
+            0 => TestCanisterRuntime::new()
+                .with_time(CREDITED_AT + LEDGER_DEDUPLICATION_WINDOW.as_nanos() as u64 + 1),
+            1 => mint_runtime([Err(TransferError::TooOld)]),
+            _ => mint_runtime([Ok(Nat::from(u128::MAX))]),
+        };
+        let result = AssertUnwindSafe(process_pending_spl_mints(runtime.clone()))
+            .catch_unwind()
+            .await;
+        assert_eq!(result.is_err(), failure == 2);
+        assert_eq!(runtime.sent_update_calls().len(), usize::from(failure != 0));
+        read_state(|state| {
+            assert!(state.spl_deposits().pending_fee_mints().is_empty());
+            assert!(state.spl_deposits().minted_fees().is_empty());
+            assert_eq!(state.spl_deposits().quarantined_fee_mints()[&id], fee);
+            assert_eq!(
+                *state.spl_deposits().minted()[&id].mint_block_index.get(),
+                BLOCK_INDEX
+            );
+            assert!(
+                state
+                    .spl_deposits()
+                    .in_flight_id(&pending.account(), &pending.deposit.deposit.mint)
+                    .is_none()
+            );
+        });
+        assert_replay_matches();
+    }
+}
+
+#[tokio::test]
+async fn should_reschedule_remaining_fee_mints() {
+    let runtime = TestCanisterRuntime::new().with_time(CREDITED_AT + 1);
+    for (id, _) in setup_pending_with_fee(MAX_PENDING_MINTS_PER_ROUND + 1, 25) {
+        mutate_state(|state| {
+            process_event(
+                state,
+                EventType::MintedSweptSplDeposit {
+                    deposit_id: id,
+                    mint_block_index: id.into(),
+                },
+                &runtime,
+            )
+        });
+    }
+    let first = mint_runtime((0..MAX_PENDING_MINTS_PER_ROUND).map(|id| Ok(id.into())));
+    process_pending_spl_mints(first.clone()).await;
+    assert_eq!(first.sent_update_calls().len(), MAX_PENDING_MINTS_PER_ROUND);
+    assert_eq!(first.set_timer_call_count(), 1);
+    read_state(|state| assert_eq!(state.spl_deposits().pending_fee_mints().len(), 1));
+    assert_replay_matches();
+    let second = mint_runtime([Ok(BLOCK_INDEX.into())]);
+    process_pending_spl_mints(second.clone()).await;
+    assert_eq!(second.sent_update_calls().len(), 1);
+    assert_eq!(second.set_timer_call_count(), 0);
+    read_state(|state| {
+        assert!(state.spl_deposits().pending_fee_mints().is_empty());
+        assert_eq!(
+            state.spl_deposits().minted_fees().len(),
+            MAX_PENDING_MINTS_PER_ROUND + 1
+        );
+    });
+    assert_replay_matches();
 }

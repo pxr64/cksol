@@ -1,6 +1,6 @@
 use crate::{
     address::{MINTER_DERIVATION_PATH, account_address, associated_token_address, derivation_path},
-    constants::RENT_EXEMPTION_THRESHOLD,
+    constants::{RENT_EXEMPTION_THRESHOLD, SPL_FEE_SUBACCOUNT},
     rpc::BlockHeight,
     state::{
         DepositBalance, QueuedDeposit, QueuedSplDeposit, SchnorrPublicKey, SplSweep, State,
@@ -11,13 +11,17 @@ use crate::{
     storage::with_event_iter,
 };
 use candid::Principal;
-use cksol_types::{DepositSolId, DepositSplId};
+use cksol_types::{DepositSolId, DepositSplId, Memo, MintMemo};
 use cksol_types_internal::{Ed25519KeyName, InitArgs, SolanaNetwork};
 use ic_cdk_management_canister::SchnorrPublicKeyResult;
 use ic_ed25519::{PocketIcMasterPublicKeyId, PublicKey};
-use icrc_ledger_types::icrc1::account::Account;
+use icrc_ledger_types::icrc1::{
+    account::Account,
+    transfer::{NumTokens, TransferArg},
+};
 use sol_rpc_types::{Lamport, MultiRpcResult};
 use solana_address::{Address, address};
+use solana_signature::Signature;
 use solana_transaction_status_client_types::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
     EncodedTransactionWithStatusMeta, TransactionBinaryEncoding, UiLoadedAddresses,
@@ -1202,5 +1206,25 @@ impl EventsAssert {
 
     pub fn assert_no_more_events(&self) {
         assert!(self.0.is_empty());
+    }
+}
+
+/// The ledger call that mints the fee of a swept SPL deposit into the minter's fee subaccount.
+pub fn spl_fee_mint_arg(
+    deposit_id: DepositSplId,
+    signature: Signature,
+    created_at: u64,
+    amount: u64,
+) -> TransferArg {
+    TransferArg {
+        from_subaccount: None,
+        to: Account {
+            owner: runtime::TEST_CANISTER_ID,
+            subaccount: Some(SPL_FEE_SUBACCOUNT),
+        },
+        fee: None,
+        created_at_time: Some(created_at),
+        memo: Some(Memo::from(MintMemo::sweep_fee(signature, deposit_id)).into()),
+        amount: NumTokens::from(amount),
     }
 }

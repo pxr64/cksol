@@ -41,8 +41,8 @@ use sweep::validate_sweep_transaction;
 
 pub use spl::{SupportedSplToken, TokenProgram};
 pub use spl_deposits::{
-    MintedSplSweep, PendingSplMint, QueuedSplDeposit, SettledSplSweep, SplDeposits, SplSweep,
-    SplSweepRecoveryError, SplSweeps, SplTransfer, SweptSplDeposit,
+    MintedSplSweep, PendingSplFeeMint, PendingSplMint, QueuedSplDeposit, SettledSplSweep,
+    SplDeposits, SplSweep, SplSweepRecoveryError, SplSweeps, SplTransfer, SweptSplDeposit,
 };
 
 pub use deposits::{
@@ -527,8 +527,22 @@ impl State {
         &mut self,
         deposit_id: DepositSplId,
         mint_block_index: &LedgerMintIndex,
+        timestamp: u64,
     ) {
-        self.spl_deposits.mint(deposit_id, *mint_block_index);
+        self.spl_deposits
+            .mint(deposit_id, *mint_block_index, timestamp);
+    }
+
+    fn process_minted_spl_deposit_fee(
+        &mut self,
+        deposit_id: DepositSplId,
+        mint_block_index: &LedgerMintIndex,
+    ) {
+        self.spl_deposits.mint_fee(deposit_id, *mint_block_index);
+    }
+
+    fn process_quarantined_pending_spl_fee_mint(&mut self, deposit_id: DepositSplId) {
+        self.spl_deposits.quarantine_fee_mint(deposit_id);
     }
 
     fn process_quarantined_pending_spl_mint(&mut self, deposit_id: DepositSplId) {

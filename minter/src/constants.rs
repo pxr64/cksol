@@ -1,5 +1,14 @@
 use std::{num::NonZeroUsize, time::Duration};
 
+/// The minter-owned ledger subaccount collecting SPL deposit fees. It is the fee collector
+/// subaccount of the ledgers, `0x0fee`.
+pub const SPL_FEE_SUBACCOUNT: [u8; 32] = {
+    let mut subaccount = [0; 32];
+    subaccount[30] = 0x0f;
+    subaccount[31] = 0xee;
+    subaccount
+};
+
 /// Maximum number of concurrent calls to the SOL RPC canister.
 pub const MAX_CONCURRENT_RPC_CALLS: usize = 10;
 

@@ -1,4 +1,4 @@
-use crate::DepositSolId;
+use crate::{DepositSolId, DepositSplId};
 use derive_more::From;
 use minicbor::{Decode, Encode, Encoder};
 use solana_address::Address;
@@ -60,6 +60,16 @@ pub enum MintMemo {
         #[n(1)]
         deposit_id: DepositSolId,
     },
+    /// The minter minted the fee of a swept SPL deposit into its fee subaccount.
+    #[n(2)]
+    SweepFee {
+        /// The transaction signature of the sweep that moved the deposit.
+        #[cbor(n(0), with = "minicbor::bytes")]
+        signature: [u8; 64],
+        /// The identifier of the swept deposit in the minter.
+        #[n(1)]
+        deposit_id: DepositSplId,
+    },
 }
 
 /// The minter burned some ckSOL tokens.
@@ -93,6 +103,17 @@ impl MintMemo {
         deposit_id: DepositSolId,
     ) -> Self {
         Self::Sweep {
+            signature: <[u8; SIGNATURE_BYTES]>::from(signature.into()),
+            deposit_id,
+        }
+    }
+
+    /// Creates a fee mint memo from the sweep signature and the SPL deposit identifier.
+    pub fn sweep_fee(
+        signature: impl Into<solana_signature::Signature>,
+        deposit_id: DepositSplId,
+    ) -> Self {
+        Self::SweepFee {
             signature: <[u8; SIGNATURE_BYTES]>::from(signature.into()),
             deposit_id,
         }

@@ -32,6 +32,8 @@ fn arb_mint_memo() -> impl Strategy<Value = MintMemo> {
                 deposit_id,
             }
         }),
+        (arb_signature(), any::<u64>())
+            .prop_map(|(signature, deposit_id)| { MintMemo::sweep_fee(signature, deposit_id) }),
     ]
 }
 

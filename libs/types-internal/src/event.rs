@@ -109,6 +109,18 @@ pub enum EventType {
         /// The identifier of the SPL deposit whose pending mint was quarantined.
         deposit_id: u64,
     },
+    /// The token ledger minted a deposit fee into the minter's fee subaccount.
+    MintedSplDepositFee {
+        /// The identifier of the deposit whose fee was minted.
+        deposit_id: u64,
+        /// The fee mint transaction index on the token ledger.
+        mint_block_index: u64,
+    },
+    /// A deposit fee mint cannot be safely retried and requires manual resolution.
+    QuarantinedPendingSplFeeMint {
+        /// The identifier of the deposit whose pending fee mint was quarantined.
+        deposit_id: u64,
+    },
     /// A finalized SPL sweep was validated and its deposits queued for ledger minting.
     CreditedSplSweep {
         /// The signature of the finalized sweep transaction.

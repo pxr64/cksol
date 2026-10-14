@@ -556,9 +556,9 @@ mod lifecycle {
         monitor::finalize_transactions,
         state::{
             SplSweep, SupportedSplToken, TokenProgram,
-            audit::replay_events,
+            audit::{process_event, replay_events},
             event::{CreditedSplDeposit, Event, EventType, TransactionPurpose},
-            read_state, reset_state,
+            mutate_state, read_state, reset_state,
         },
         storage::{reset_events, total_event_count, with_event_iter},
         test_fixtures::{
@@ -569,6 +569,7 @@ mod lifecycle {
             runtime::{SentUpdateCall, TestCanisterRuntime},
             schnorr_master_key,
             signer::{sign_as_minter, sign_for},
+            spl_fee_mint_arg,
             spl_sweep::balanced_outcome,
             spl_token, valid_init_args,
         },
@@ -595,6 +596,7 @@ mod lifecycle {
     const DESTINATION_LAMPORTS: u64 = 2_039_280;
     const SLOT: u64 = 300_000_000;
     const CREDITED_AT: u64 = 1_000;
+    const MINTED_AT: u64 = CREDITED_AT + 1;
 
     fn setup() {
         reset_state();
@@ -780,7 +782,7 @@ mod lifecycle {
 
     /// Runs one mint round with a ledger block index per pending mint, in id order.
     async fn mint(count: usize) -> Vec<SentUpdateCall> {
-        let mut runtime = TestCanisterRuntime::new().with_increasing_time();
+        let mut runtime = TestCanisterRuntime::new().with_time(MINTED_AT);
         for index in 0..count {
             runtime =
                 runtime.add_stub_response::<Result<BlockIndex, TransferError>>(Ok((BLOCK_INDEX
@@ -877,6 +879,77 @@ mod lifecycle {
             read_state(|state| state.minter_public_key().cloned()).unwrap(),
         );
         read_state(|state| assert_eq!(state, &replayed));
+    }
+
+    #[tokio::test]
+    async fn should_sweep_full_balance_and_deduct_recorded_fee_once() {
+        const BALANCE: u64 = 1_000;
+        const FEE: u64 = 25;
+        for token_2022 in [false, true] {
+            setup();
+            let token = register_token(token_2022);
+            let owner = account_address(&schnorr_master_key(), &DEPOSITOR_ACCOUNT);
+            // The production estimator currently quotes zero. Record a nonzero quote to
+            // exercise the sweep, settlement and mint paths before enabling an oracle.
+            mutate_state(|state| {
+                process_event(
+                    state,
+                    EventType::QueuedSplDeposit {
+                        deposit_id: 0,
+                        account: DEPOSITOR_ACCOUNT,
+                        mint: token.mint,
+                        address: associated_token_address(
+                            &owner,
+                            &token.mint,
+                            &token.token_program.id(),
+                        ),
+                        balance: BALANCE,
+                        fee: FEE,
+                    },
+                    &TestCanisterRuntime::new().with_increasing_time(),
+                )
+            });
+            assert_replay_matches();
+
+            let sweep = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+            assert_eq!(sweep.plan.deposits()[&0].balance, BALANCE);
+            let created_at = settle(&sweep).await;
+            read_state(|state| {
+                let pending = &state.spl_deposits().pending_mints()[&0];
+                assert_eq!(pending.deposit.deposit.fee, FEE);
+                assert_eq!(pending.amount_to_mint, BALANCE - FEE);
+            });
+
+            let calls = mint(2).await;
+            assert_eq!(calls.len(), 2);
+            assert_eq!(
+                calls[0].single_arg::<TransferArg>(),
+                mint_arg(
+                    DEPOSITOR_ACCOUNT,
+                    created_at,
+                    sweep.signature,
+                    0,
+                    BALANCE - FEE
+                )
+            );
+            assert_eq!(
+                calls[1].single_arg::<TransferArg>(),
+                spl_fee_mint_arg(0, sweep.signature, MINTED_AT, FEE)
+            );
+            assert_eq!(calls[1].canister_id, token.ledger_id);
+            read_state(|state| {
+                assert!(state.spl_deposits().pending_fee_mints().is_empty());
+                assert_eq!(
+                    *state.spl_deposits().minted_fees()[&0].get(),
+                    BLOCK_INDEX + 1
+                );
+                assert_eq!(
+                    state.spl_deposits().minted()[&0].minted_amount,
+                    BALANCE - FEE
+                );
+            });
+            assert_replay_matches();
+        }
     }
 
     #[tokio::test]

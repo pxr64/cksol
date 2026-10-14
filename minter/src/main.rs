@@ -268,6 +268,16 @@ fn get_events(
             EventType::QuarantinedPendingSplMint { deposit_id } => {
                 event::EventType::QuarantinedPendingSplMint { deposit_id }
             }
+            EventType::MintedSplDepositFee {
+                deposit_id,
+                mint_block_index,
+            } => event::EventType::MintedSplDepositFee {
+                deposit_id,
+                mint_block_index: *mint_block_index.get(),
+            },
+            EventType::QuarantinedPendingSplFeeMint { deposit_id } => {
+                event::EventType::QuarantinedPendingSplFeeMint { deposit_id }
+            }
             EventType::MintedSweptDeposit {
                 deposit_id,
                 mint_block_index,

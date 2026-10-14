@@ -251,6 +251,23 @@ pub enum EventType {
         #[cbor(n(0), with = "cbor::signature")]
         signature: Signature,
     },
+    /// The token ledger minted a deposit fee into the minter's fee subaccount.
+    #[n(22)]
+    MintedSplDepositFee {
+        /// The identifier of the deposit whose fee was minted.
+        #[n(0)]
+        deposit_id: DepositSplId,
+        /// The fee mint transaction index on the token ledger.
+        #[cbor(n(1), with = "cbor::id")]
+        mint_block_index: LedgerMintIndex,
+    },
+    /// A deposit fee mint cannot be safely retried and requires manual resolution.
+    #[n(23)]
+    QuarantinedPendingSplFeeMint {
+        /// The identifier of the deposit whose pending fee mint was quarantined.
+        #[n(0)]
+        deposit_id: DepositSplId,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

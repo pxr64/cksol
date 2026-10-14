@@ -28,6 +28,9 @@ pub struct SplDeposits {
     dropped: BTreeMap<DepositSplId, SweptSplDeposit>,
     quarantined: BTreeMap<DepositSplId, SweptSplDeposit>,
     in_flight_ids: BTreeMap<(Account, Address), DepositSplId>,
+    pending_fee_mints: BTreeMap<DepositSplId, PendingSplFeeMint>,
+    minted_fees: BTreeMap<DepositSplId, LedgerMintIndex>,
+    quarantined_fee_mints: BTreeMap<DepositSplId, PendingSplFeeMint>,
 }
 
 impl SplDeposits {
@@ -65,6 +68,18 @@ impl SplDeposits {
 
     pub fn minted(&self) -> &BTreeMap<DepositSplId, MintedSplSweep> {
         &self.minted
+    }
+
+    pub fn pending_fee_mints(&self) -> &BTreeMap<DepositSplId, PendingSplFeeMint> {
+        &self.pending_fee_mints
+    }
+
+    pub fn minted_fees(&self) -> &BTreeMap<DepositSplId, LedgerMintIndex> {
+        &self.minted_fees
+    }
+
+    pub fn quarantined_fee_mints(&self) -> &BTreeMap<DepositSplId, PendingSplFeeMint> {
+        &self.quarantined_fee_mints
     }
 
     pub fn in_flight_id(&self, account: &Account, mint: &Address) -> Option<DepositSplId> {
@@ -247,7 +262,12 @@ impl SplDeposits {
             }));
     }
 
-    pub(super) fn mint(&mut self, deposit_id: DepositSplId, mint_block_index: LedgerMintIndex) {
+    pub(super) fn mint(
+        &mut self,
+        deposit_id: DepositSplId,
+        mint_block_index: LedgerMintIndex,
+        timestamp: u64,
+    ) {
         let pending = self.pending_mints.remove(&deposit_id).unwrap_or_else(|| {
             panic!("Attempted to mint SPL deposit {deposit_id} that has no pending mint")
         });
@@ -257,6 +277,22 @@ impl SplDeposits {
             Some(deposit_id),
             "BUG: SPL deposit {deposit_id} is not in flight"
         );
+        if deposit.fee > 0 {
+            assert!(
+                self.pending_fee_mints
+                    .insert(
+                        deposit_id,
+                        PendingSplFeeMint {
+                            mint: deposit.mint,
+                            amount: deposit.fee,
+                            signature: pending.deposit.signature,
+                            created_at_time: timestamp,
+                        },
+                    )
+                    .is_none(),
+                "Attempted to queue the fee mint of SPL deposit {deposit_id} twice"
+            );
+        }
         self.minted.insert(
             deposit_id,
             MintedSplSweep {
@@ -265,6 +301,25 @@ impl SplDeposits {
                 mint_block_index,
             },
         );
+    }
+
+    pub(super) fn mint_fee(&mut self, deposit_id: DepositSplId, mint_block_index: LedgerMintIndex) {
+        self.pending_fee_mints.remove(&deposit_id).unwrap_or_else(|| {
+            panic!("Attempted to mint the fee of SPL deposit {deposit_id} that has no pending fee mint")
+        });
+        assert!(
+            self.minted_fees
+                .insert(deposit_id, mint_block_index)
+                .is_none(),
+            "Attempted to mint the fee of SPL deposit {deposit_id} twice"
+        );
+    }
+
+    pub(super) fn quarantine_fee_mint(&mut self, deposit_id: DepositSplId) {
+        let pending = self.pending_fee_mints.remove(&deposit_id).unwrap_or_else(|| {
+            panic!("Attempted to quarantine the fee of SPL deposit {deposit_id} that has no pending fee mint")
+        });
+        self.quarantined_fee_mints.insert(deposit_id, pending);
     }
 
     pub(super) fn quarantine_pending_mint(&mut self, deposit_id: DepositSplId) {
@@ -339,6 +394,16 @@ pub struct PendingSplMint {
     pub deposit: SweptSplDeposit,
     pub amount_to_mint: u64,
     /// The credit event's timestamp, reused by ledger retries for deduplication.
+    pub created_at_time: u64,
+}
+
+/// A deposit fee waiting to be minted after the user's mint completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSplFeeMint {
+    pub mint: Address,
+    pub amount: u64,
+    pub signature: Signature,
+    /// The user mint event's timestamp, reused by fee retries for deduplication.
     pub created_at_time: u64,
 }
 
