@@ -12,7 +12,8 @@ use icrc_ledger_types::{
 };
 use pocket_ic::nonblocking::PocketIc;
 use serde_json::json;
-use sol_rpc_types::Lamport;
+use sol_rpc_types::{AccountInfo, Lamport};
+use solana_account_decoder_client_types::UiAccount;
 use solana_address::{Address, address};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -137,6 +138,14 @@ impl MockBuilder {
     /// Mock for `getBalance` returning the given balance for any address.
     pub fn get_balance(self, balance: Lamport) -> Self {
         self.expect(get_balance_request(), get_balance_response(balance))
+    }
+
+    /// Mock for a finalized account read, including a missing account.
+    pub fn get_account_info(self, address: &Address, account: Option<AccountInfo>) -> Self {
+        self.expect(
+            get_account_info_request(address),
+            get_account_info_response(account),
+        )
     }
 
     /// Mocks for a timer submitting a transaction built on the block at `block_height`:
@@ -270,6 +279,22 @@ fn get_balance_response(balance: Lamport) -> JsonRpcResponse {
     JsonRpcResponse::from(json!({
         "jsonrpc": "2.0",
         "result": { "context": { "apiVersion": "2.0.15", "slot": 341_197_053 }, "value": balance },
+        "id": 1
+    }))
+}
+
+fn get_account_info_request(address: &Address) -> JsonRpcRequestMatcher {
+    JsonRpcRequestMatcher::with_method("getAccountInfo").with_params(json!([
+        address.to_string(),
+        { "encoding": "base64", "commitment": "finalized" }
+    ]))
+}
+
+fn get_account_info_response(account: Option<AccountInfo>) -> JsonRpcResponse {
+    let account = account.map(UiAccount::from);
+    JsonRpcResponse::from(json!({
+        "jsonrpc": "2.0",
+        "result": { "context": { "slot": MOCK_SLOT }, "value": account },
         "id": 1
     }))
 }

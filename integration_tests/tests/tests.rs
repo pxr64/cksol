@@ -740,6 +740,197 @@ mod withdrawal_tests {
     }
 }
 
+mod deposit_spl_tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use cksol_int_tests::fixtures::MINTER_ADDRESS;
+    use cksol_types::{AddSplTokenArgs, DepositSplArgs};
+    use sol_rpc_types::{AccountData, AccountEncoding, AccountInfo};
+    use solana_address::{Address, address};
+    use solana_program_pack::Pack;
+    use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
+    use spl_token_2022_interface::{
+        extension::{
+            BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+            immutable_owner::ImmutableOwner,
+        },
+        state::{Account as TokenAccount, AccountState},
+    };
+    use spl_token_interface::state::Mint;
+
+    const MINT: Address = address!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+    const DECIMALS: u8 = 6;
+    const MINIMUM_DEPOSIT_AMOUNT: u64 = 1_000_000;
+    const BALANCE_ABOVE_MINIMUM: u64 = MINIMUM_DEPOSIT_AMOUNT + 1;
+    const RENT_EXEMPT_LAMPORTS: Lamport = 2_039_280;
+
+    fn associated_token_address(owner: &Address, token_program: &Address) -> Address {
+        get_associated_token_address_with_program_id(
+            &owner.to_bytes().into(),
+            &MINT.to_bytes().into(),
+            &token_program.to_bytes().into(),
+        )
+        .to_bytes()
+        .into()
+    }
+
+    fn account_info(data: Vec<u8>, token_program: Address) -> AccountInfo {
+        AccountInfo {
+            lamports: RENT_EXEMPT_LAMPORTS,
+            space: data.len() as u64,
+            data: AccountData::Binary(STANDARD.encode(data), AccountEncoding::Base64),
+            owner: token_program.to_string(),
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    fn mint_data() -> Vec<u8> {
+        let mut data = vec![0; Mint::LEN];
+        Mint::pack(
+            Mint {
+                supply: BALANCE_ABOVE_MINIMUM,
+                decimals: DECIMALS,
+                is_initialized: true,
+                ..Mint::default()
+            },
+            &mut data,
+        )
+        .unwrap();
+        data
+    }
+
+    /// Both token programs share the base layout, so one builder serves both.
+    fn token_account_data(owner: &Address, extensions: &[ExtensionType]) -> Vec<u8> {
+        let mut data =
+            vec![0; ExtensionType::try_calculate_account_len::<TokenAccount>(extensions).unwrap()];
+        let mut account =
+            StateWithExtensionsMut::<TokenAccount>::unpack_uninitialized(&mut data).unwrap();
+        for extension in extensions {
+            match extension {
+                ExtensionType::ImmutableOwner => {
+                    account.init_extension::<ImmutableOwner>(false).unwrap();
+                }
+                _ => unimplemented!("{extension:?}"),
+            }
+        }
+        account.base = TokenAccount {
+            mint: MINT.to_bytes().into(),
+            owner: owner.to_bytes().into(),
+            amount: BALANCE_ABOVE_MINIMUM,
+            state: AccountState::Initialized,
+            ..TokenAccount::default()
+        };
+        account.pack_base();
+        account.init_account_type().unwrap();
+        data
+    }
+
+    #[tokio::test]
+    async fn should_queue_deposit_for_caller_if_owner_is_omitted() {
+        queue_deposit_for_caller(spl_token_interface::id().to_bytes().into(), &[]).await;
+    }
+
+    #[tokio::test]
+    async fn should_queue_token_2022_deposit_with_immutable_owner() {
+        queue_deposit_for_caller(
+            spl_token_2022_interface::id().to_bytes().into(),
+            &[ExtensionType::ImmutableOwner],
+        )
+        .await;
+    }
+
+    /// Registers the mint on a fresh SPL ledger, then queues a deposit from the caller's
+    /// associated token account and checks the recorded events.
+    async fn queue_deposit_for_caller(token_program: Address, extensions: &[ExtensionType]) {
+        let setup = SetupBuilder::new()
+            .with_proxy_canister()
+            .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
+            .build()
+            .await;
+        let ledger = setup.install_spl_ledger(DECIMALS).await;
+        let subaccount = Some([1; 32]);
+        let owner: Address = setup
+            .minter()
+            .get_deposit_address(GetDepositAddressArgs {
+                owner: None,
+                subaccount,
+            })
+            .await
+            .into();
+        let source = associated_token_address(&owner, &token_program);
+        let destination = associated_token_address(&MINTER_ADDRESS, &token_program);
+        setup
+            .minter()
+            .with_http_mocks(
+                MockBuilder::new()
+                    .get_account_info(&MINT, Some(account_info(mint_data(), token_program)))
+                    .build(),
+            )
+            .add_spl_token(AddSplTokenArgs {
+                mint: MINT.into(),
+                token_program: token_program.into(),
+                decimals: DECIMALS,
+                ledger_id: ledger.canister_id(),
+                minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
+                paused: false,
+            })
+            .await
+            .expect("add_spl_token should register the token");
+
+        let deposit_id = setup
+            .minter()
+            .with_http_mocks(
+                MockBuilder::with_start_id(4)
+                    .get_account_info(
+                        &source,
+                        Some(account_info(
+                            token_account_data(&owner, extensions),
+                            token_program,
+                        )),
+                    )
+                    .get_account_info(&destination, None)
+                    .build(),
+            )
+            .deposit_spl(DepositSplArgs {
+                owner: None,
+                subaccount,
+                mint: MINT.into(),
+            })
+            .await
+            .expect("deposit_spl should queue a sweep");
+
+        assert_eq!(deposit_id, 0);
+        setup.minter().assert_that_events().await.satisfy(|events| {
+            check!(
+                events[1..]
+                    == [
+                        EventType::AddedSplToken {
+                            mint: MINT.into(),
+                            token_program: token_program.into(),
+                            decimals: DECIMALS,
+                            ledger_id: ledger.canister_id(),
+                            minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
+                            paused: false,
+                        },
+                        EventType::QueuedSplDeposit {
+                            deposit_id,
+                            account: Account {
+                                owner: setup.proxy_canister_id(),
+                                subaccount,
+                            },
+                            mint: MINT.into(),
+                            address: source.into(),
+                            balance: BALANCE_ABOVE_MINIMUM,
+                        },
+                    ]
+            );
+        });
+
+        setup.drop().await;
+    }
+}
+
 mod deposit_sol_tests {
     use super::*;
 

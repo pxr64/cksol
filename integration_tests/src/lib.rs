@@ -1,10 +1,14 @@
-use crate::{events::MinterEventAssert, ledger_init_args::ledger_init_args};
+use crate::{
+    events::MinterEventAssert,
+    ledger_init_args::{ledger_init_args, spl_ledger_init_args},
+};
 use candid::{CandidType, Decode, Encode, Nat, Principal, utils::ArgumentEncoder};
 use canlog::{Log, LogEntry};
 use cksol_types::{
-    Address, DepositSolArgs, DepositSolError, DepositSolId, DepositSolStatus,
-    GetDepositAddressArgs, MinterInfo, WithdrawalArgs, WithdrawalError, WithdrawalOk,
-    WithdrawalStatus, WithdrawalStatusArgs,
+    AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
+    DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, GetDepositAddressArgs,
+    MinterInfo, WithdrawalArgs, WithdrawalError, WithdrawalOk, WithdrawalStatus,
+    WithdrawalStatusArgs,
 };
 use cksol_types_internal::{
     MinterArg,
@@ -48,6 +52,7 @@ pub struct SetupBuilder {
     sol_rpc_install_args: Option<sol_rpc_types::InstallArgs>,
     initial_ledger_balances: Option<Vec<(Account, Nat)>>,
     proxy_canister: bool,
+    ledger_suite_orchestrator_id: Option<Principal>,
 }
 
 impl SetupBuilder {
@@ -78,12 +83,18 @@ impl SetupBuilder {
         self
     }
 
+    pub fn with_ledger_suite_orchestrator(mut self, principal: Principal) -> Self {
+        self.ledger_suite_orchestrator_id = Some(principal);
+        self
+    }
+
     pub async fn build(self) -> Setup {
         Setup::new(
             self.make_live.unwrap_or_default(),
             self.sol_rpc_install_args.unwrap_or_default(),
             self.initial_ledger_balances,
             self.proxy_canister,
+            self.ledger_suite_orchestrator_id,
         )
         .await
     }
@@ -104,6 +115,7 @@ impl Setup {
     pub const DEFAULT_CONTROLLER: Principal = Principal::from_slice(&[0x9d, 0xf7, 0x01]);
     pub const DEFAULT_MINIMUM_DEPOSIT_AMOUNT: Lamport = 20_000_000; // 0.02 SOL
     pub const DEFAULT_DEPOSIT_SOL_REQUIRED_CYCLES: u128 = 1_000_000_000_000;
+    pub const DEFAULT_DEPOSIT_SPL_REQUIRED_CYCLES: u128 = 1_000_000_000_000;
     pub const DEFAULT_MINIMUM_WITHDRAWAL_AMOUNT: Lamport = 2_000_000; // 0.002 SOL
     pub const DEFAULT_CALLER: Principal =
         Principal::from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x0, 0x3, 0x1, 0x1]);
@@ -113,6 +125,7 @@ impl Setup {
         sol_rpc_install_args: sol_rpc_types::InstallArgs,
         initial_ledger_balances: Option<Vec<(Account, Nat)>>,
         with_proxy_canister: bool,
+        ledger_suite_orchestrator_id: Option<Principal>,
     ) -> Self {
         let env = PocketIcBuilder::new()
             .with_nns_subnet() //make_live requires NNS subnet.
@@ -156,6 +169,7 @@ impl Setup {
             Encode!(&cksol_minter_init_args(
                 sol_rpc_canister_id,
                 ledger_canister_id,
+                ledger_suite_orchestrator_id,
             ))
             .unwrap(),
             Some(Self::DEFAULT_CONTROLLER),
@@ -288,6 +302,33 @@ impl Setup {
         })
     }
 
+    /// Installs a separate SPL ledger with the minter as its minting account.
+    pub async fn install_spl_ledger(&self, decimals: u8) -> Ledger<'_> {
+        let env = self.env.as_ref().unwrap();
+        let ledger_canister_id = env
+            .create_canister_with_settings(
+                None,
+                Some(CanisterSettings {
+                    controllers: Some(vec![Self::DEFAULT_CONTROLLER]),
+                    ..CanisterSettings::default()
+                }),
+            )
+            .await;
+        env.add_cycles(ledger_canister_id, u64::MAX as u128).await;
+        env.install_canister(
+            ledger_canister_id,
+            ledger_wasm().await,
+            Encode!(&spl_ledger_init_args(self.minter_canister_id, decimals)).unwrap(),
+            Some(Self::DEFAULT_CONTROLLER),
+        )
+        .await;
+
+        Ledger(Canister {
+            runtime: self.runtime(Self::DEFAULT_CALLER),
+            id: ledger_canister_id,
+        })
+    }
+
     pub fn proxy(&self) -> Canister<'_> {
         Canister {
             runtime: self.runtime(Setup::DEFAULT_CALLER),
@@ -378,6 +419,23 @@ impl<'a> Deref for CkSolMinter<'a> {
 }
 
 impl CkSolMinter<'_> {
+    pub async fn add_spl_token(
+        &self,
+        args: impl Into<AddSplTokenArgs>,
+    ) -> Result<(), AddSplTokenError> {
+        self.try_add_spl_token(args)
+            .await
+            .expect("add_spl_token failed")
+    }
+
+    pub async fn try_add_spl_token(
+        &self,
+        args: impl Into<AddSplTokenArgs>,
+    ) -> Result<Result<(), AddSplTokenError>, String> {
+        self.try_update_call("add_spl_token", (args.into(),), 0)
+            .await
+    }
+
     pub async fn get_deposit_address(&self, args: impl Into<GetDepositAddressArgs>) -> Address {
         self.try_get_deposit_address(args)
             .await
@@ -425,6 +483,42 @@ impl CkSolMinter<'_> {
         cycles: u128,
     ) -> Result<Result<DepositSolId, DepositSolError>, String> {
         self.try_update_call("deposit_sol", (args.into(),), cycles)
+            .await
+    }
+
+    pub async fn deposit_spl(
+        &self,
+        args: impl Into<DepositSplArgs>,
+    ) -> Result<DepositSplId, DepositSplError> {
+        self.try_deposit_spl(args)
+            .await
+            .expect("deposit_spl failed")
+    }
+
+    pub async fn deposit_spl_with_cycles(
+        &self,
+        args: impl Into<DepositSplArgs>,
+        cycles: u128,
+    ) -> Result<DepositSplId, DepositSplError> {
+        self.try_deposit_spl_with_cycles(args, cycles)
+            .await
+            .expect("deposit_spl failed")
+    }
+
+    pub async fn try_deposit_spl(
+        &self,
+        args: impl Into<DepositSplArgs>,
+    ) -> Result<Result<DepositSplId, DepositSplError>, String> {
+        self.try_deposit_spl_with_cycles(args, Setup::DEFAULT_DEPOSIT_SPL_REQUIRED_CYCLES)
+            .await
+    }
+
+    pub async fn try_deposit_spl_with_cycles(
+        &self,
+        args: impl Into<DepositSplArgs>,
+        cycles: u128,
+    ) -> Result<Result<DepositSplId, DepositSplError>, String> {
+        self.try_update_call("deposit_spl", (args.into(),), cycles)
             .await
     }
 
@@ -523,6 +617,10 @@ impl<'a> Deref for Ledger<'a> {
 }
 
 impl Ledger<'_> {
+    pub fn canister_id(&self) -> Principal {
+        self.0.id
+    }
+
     pub async fn balance_of(&self, account: Account) -> u64 {
         self.update_call::<_, Nat>("icrc1_balance_of", (account,), 0)
             .await
@@ -681,10 +779,11 @@ fn cksol_minter_wasm() -> Vec<u8> {
 fn cksol_minter_init_args(
     sol_rpc_canister_id: Principal,
     ledger_canister_id: Principal,
+    ledger_suite_orchestrator_id: Option<Principal>,
 ) -> MinterArg {
     use cksol_types_internal::{Ed25519KeyName, InitArgs, MinterArg, SolanaNetwork};
     MinterArg::Init(InitArgs {
-        ledger_suite_orchestrator_id: None,
+        ledger_suite_orchestrator_id,
         sol_rpc_canister_id,
         ledger_canister_id,
         automated_deposit_fee: Setup::DEFAULT_AUTOMATED_DEPOSIT_FEE,
