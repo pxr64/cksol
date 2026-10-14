@@ -54,7 +54,9 @@ fn should_reject_unrepresentable_minimum_with_fee() {
 
 mod balance_reading {
     use crate::{
-        address::{account_address, associated_token_address, minter_address},
+        address::{
+            account_address, associated_token_address, get_spl_deposit_address, minter_address,
+        },
         constants::GET_ACCOUNT_INFO_CYCLES,
         deposit::spl::deposit_spl,
         guard::deposit_spl_guard,
@@ -70,7 +72,7 @@ mod balance_reading {
     };
     use assert_matches::assert_matches;
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use cksol_types::{DepositSplError, InsufficientCyclesError};
+    use cksol_types::{DepositSplError, GetSplDepositAddressError, InsufficientCyclesError};
     use ic_canister_runtime::IcError;
     use sol_rpc_types::{AccountData, AccountEncoding, AccountInfo, MultiRpcResult};
     use solana_program_pack::Pack;
@@ -543,6 +545,39 @@ mod balance_reading {
         assert!(runtime.sent_update_calls().is_empty());
         assert!(runtime.msg_cycles_accepted().is_empty());
         assert_eq!(total_event_count(), 2);
+    }
+
+    #[test]
+    fn should_return_the_token_account_of_the_deposit_address() {
+        let classic = init_token(false);
+        let token_2022 = register(SupportedSplToken {
+            minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
+            ..spl_token([3; 32].into(), TokenProgram::Token2022)
+        });
+        let master_key = read_state(|state| state.minter_public_key().cloned()).unwrap();
+        let owner = account_address(&master_key, &DEPOSITOR_ACCOUNT);
+        for token in [classic, token_2022] {
+            assert_eq!(
+                get_spl_deposit_address(&DEPOSITOR_ACCOUNT, &token.mint),
+                Ok(associated_token_address(
+                    &owner,
+                    &token.mint,
+                    &token.token_program.id()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_token_account_of_unsupported_mint() {
+        let token = init_token(false);
+        let mint = [9; 32].into();
+        assert_ne!(mint, token.mint);
+
+        assert_eq!(
+            get_spl_deposit_address(&DEPOSITOR_ACCOUNT, &mint),
+            Err(GetSplDepositAddressError::UnsupportedToken { mint: mint.into() })
+        );
     }
 }
 

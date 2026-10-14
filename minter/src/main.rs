@@ -3,7 +3,7 @@ use canlog::{Log, Sort};
 use cksol_minter::{
     address::lazy_get_schnorr_master_key,
     deposit::{
-        spl::process_pending_spl_mints,
+        spl::{process_pending_spl_mints, sweep_queued_spl_deposits},
         sweep::{
             PROCESS_PENDING_MINTS_DELAY, SWEEP_DEPOSITS_DELAY, process_pending_mints,
             sweep_queued_deposits,
@@ -20,8 +20,8 @@ use cksol_minter::{
 use cksol_types::{
     AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
     DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, GetDepositAddressArgs,
-    MinterInfo, WithdrawalArgs, WithdrawalError, WithdrawalOk, WithdrawalStatus,
-    WithdrawalStatusArgs,
+    GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo, WithdrawalArgs,
+    WithdrawalError, WithdrawalOk, WithdrawalStatus, WithdrawalStatusArgs,
 };
 use cksol_types_internal::{MinterArg, log::Priority};
 use ic_http_types::{HttpRequest, HttpResponse, HttpResponseBuilder};
@@ -93,6 +93,14 @@ async fn add_spl_token(args: AddSplTokenArgs) -> Result<(), AddSplTokenError> {
 async fn deposit_spl(args: DepositSplArgs) -> Result<DepositSplId, DepositSplError> {
     let account = resolve_account(args.owner, args.subaccount);
     cksol_minter::deposit::spl::deposit_spl(&IcCanisterRuntime::new(), account, args.mint).await
+}
+
+#[ic_cdk::query]
+fn get_spl_deposit_address(
+    args: GetSplDepositAddressArgs,
+) -> Result<Address, GetSplDepositAddressError> {
+    let account = assert_valid_deposit_account(args.owner, args.subaccount);
+    cksol_minter::address::get_spl_deposit_address(&account, &args.mint.into()).map(Address::from)
 }
 
 #[ic_cdk::update]
@@ -467,6 +475,9 @@ fn setup_timers() {
     });
     ic_cdk_timers::set_timer_interval(SWEEP_DEPOSITS_DELAY, async || {
         sweep_queued_deposits(IcCanisterRuntime::new()).await;
+    });
+    ic_cdk_timers::set_timer_interval(SWEEP_DEPOSITS_DELAY, async || {
+        sweep_queued_spl_deposits(IcCanisterRuntime::new()).await;
     });
     ic_cdk_timers::set_timer_interval(PROCESS_PENDING_MINTS_DELAY, async || {
         process_pending_mints(IcCanisterRuntime::new()).await;

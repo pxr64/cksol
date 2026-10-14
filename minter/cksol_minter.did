@@ -181,6 +181,22 @@ type DepositSplError = variant {
 };
 type DepositSplResult = variant { Ok: DepositSplId; Err: DepositSplError };
 
+// Arguments for a request to the get_spl_deposit_address endpoint.
+type GetSplDepositAddressArgs = record {
+    // The principal to deposit tokens to. Defaults to the caller when omitted.
+    // The resolved owner must be a non-anonymous principal.
+    owner: opt principal;
+    // The subaccount to deposit tokens to.
+    subaccount: opt blob;
+    // The Solana mint address identifying the SPL token to deposit.
+    mint: Address;
+};
+type GetSplDepositAddressError = variant {
+    // The requested mint is not registered as a supported SPL token.
+    UnsupportedToken: record { mint: Address };
+};
+type GetSplDepositAddressResult = variant { Ok: Address; Err: GetSplDepositAddressError };
+
 // Orchestrator-supplied configuration, checked against a finalized SPL mint.
 // Supports classic SPL Token and Token-2022 mints without extensions.
 type AddSplTokenArgs = record {
@@ -636,6 +652,14 @@ service : (MinterArg) -> {
     // charged only when both source and destination checks succeed. Repeated requests for
     // an in-flight account and mint return the existing ID without a charge, also when paused.
     deposit_spl: (DepositSplArgs) -> (DepositSplResult);
+
+    // Returns the token account to which the owner should send the SPL tokens of the
+    // given mint: the associated token account of the deposit address under the token
+    // program registered for the mint.
+    //
+    // If the owner is not set, it defaults to the caller's principal.
+    // The resolved owner must be a non-anonymous principal.
+    get_spl_deposit_address: (GetSplDepositAddressArgs) -> (GetSplDepositAddressResult) query;
 
     // Registers an SPL token and its IC ledger. Only the configured orchestrator can
     // call it, and Token-2022 mints with extensions are rejected.

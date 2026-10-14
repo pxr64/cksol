@@ -7,8 +7,8 @@ use canlog::{Log, LogEntry};
 use cksol_types::{
     AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
     DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, GetDepositAddressArgs,
-    MinterInfo, WithdrawalArgs, WithdrawalError, WithdrawalOk, WithdrawalStatus,
-    WithdrawalStatusArgs,
+    GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo, WithdrawalArgs,
+    WithdrawalError, WithdrawalOk, WithdrawalStatus, WithdrawalStatusArgs,
 };
 use cksol_types_internal::{
     MinterArg,
@@ -448,6 +448,15 @@ impl CkSolMinter<'_> {
     ) -> Result<Address, String> {
         self.try_query_call("get_deposit_address", (args.into(),))
             .await
+    }
+
+    pub async fn get_spl_deposit_address(
+        &self,
+        args: impl Into<GetSplDepositAddressArgs>,
+    ) -> Result<Address, GetSplDepositAddressError> {
+        self.try_query_call("get_spl_deposit_address", (args.into(),))
+            .await
+            .expect("get_spl_deposit_address failed")
     }
 
     pub async fn deposit_sol(

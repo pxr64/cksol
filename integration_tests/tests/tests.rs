@@ -744,7 +744,7 @@ mod deposit_spl_tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use cksol_int_tests::fixtures::MINTER_ADDRESS;
-    use cksol_types::{AddSplTokenArgs, DepositSplArgs};
+    use cksol_types::{AddSplTokenArgs, DepositSplArgs, GetSplDepositAddressArgs};
     use sol_rpc_types::{AccountData, AccountEncoding, AccountInfo};
     use solana_address::{Address, address};
     use solana_program_pack::Pack;
@@ -877,6 +877,17 @@ mod deposit_spl_tests {
             })
             .await
             .expect("add_spl_token should register the token");
+        assert_eq!(
+            setup
+                .minter()
+                .get_spl_deposit_address(GetSplDepositAddressArgs {
+                    owner: None,
+                    subaccount,
+                    mint: MINT.into(),
+                })
+                .await,
+            Ok(source.into())
+        );
 
         let deposit_id = setup
             .minter()

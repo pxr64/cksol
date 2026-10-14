@@ -165,6 +165,29 @@ pub struct DepositSplArgs {
 /// Identifies a deposit queued by the `deposit_spl` endpoint.
 pub type DepositSplId = u64;
 
+/// Arguments for a request to the `get_spl_deposit_address` ckSOL minter endpoint.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
+pub struct GetSplDepositAddressArgs {
+    /// The principal to deposit tokens to. Defaults to the caller when omitted.
+    /// The resolved owner must be a non-anonymous principal.
+    pub owner: Option<Principal>,
+    /// The subaccount to deposit tokens to.
+    pub subaccount: Option<Subaccount>,
+    /// The Solana mint address identifying the SPL token to deposit.
+    pub mint: Address,
+}
+
+/// An error from the `get_spl_deposit_address` endpoint.
+#[derive(Debug, Clone, PartialEq, CandidType, Deserialize, Error)]
+pub enum GetSplDepositAddressError {
+    /// The requested mint is not registered as a supported SPL token.
+    #[error("Unsupported SPL token: {mint}")]
+    UnsupportedToken {
+        /// The mint that is not registered.
+        mint: Address,
+    },
+}
+
 /// Configuration supplied when registering an SPL token.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
 pub struct AddSplTokenArgs {

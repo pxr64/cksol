@@ -2,6 +2,7 @@ use crate::{
     runtime::CanisterRuntime,
     state::{SchnorrPublicKey, mutate_state, read_state},
 };
+use cksol_types::GetSplDepositAddressError;
 use ic_cdk_management_canister::{SchnorrAlgorithm, SchnorrKeyId, SchnorrPublicKeyArgs};
 use ic_ed25519::{DerivationIndex, DerivationPath as IcDerivationPath, PublicKey};
 use icrc_ledger_types::icrc1::account::Account;
@@ -25,6 +26,25 @@ pub fn get_deposit_address(account: &Account) -> Address {
     let master_key = read_state(|s| s.minter_public_key().cloned())
         .unwrap_or_else(|| ic_cdk::trap("master key not yet initialized"));
     account_address(&master_key, account)
+}
+
+/// Implementation of the `get_spl_deposit_address` canister endpoint: the associated token
+/// account of the deposit address for a registered mint, under the mint's token program.
+pub fn get_spl_deposit_address(
+    account: &Account,
+    mint: &Address,
+) -> Result<Address, GetSplDepositAddressError> {
+    let token_program =
+        read_state(|s| s.supported_spl_token(mint).map(|token| token.token_program)).ok_or_else(
+            || GetSplDepositAddressError::UnsupportedToken {
+                mint: (*mint).into(),
+            },
+        )?;
+    Ok(associated_token_address(
+        &get_deposit_address(account),
+        mint,
+        &token_program.id(),
+    ))
 }
 
 /// The minter's main Solana address, holding the consolidated funds:
