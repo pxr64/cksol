@@ -76,6 +76,7 @@ fn submitted_spl_sweep() -> (TestCanisterRuntime, Signature, SplSweep) {
                     mint: deposit.mint,
                     address: deposit.address,
                     balance: deposit.balance,
+                    fee: deposit.fee,
                 },
                 &runtime,
             );
@@ -789,6 +790,17 @@ fn should_reject_zero_balance() {
 }
 
 #[test]
+#[should_panic(expected = "fee at or above its balance")]
+fn should_reject_fee_consuming_entire_deposit() {
+    let mut deposits = SplDeposits::default();
+    let deposit = QueuedSplDeposit {
+        fee: 1_000_000,
+        ..deposit(account(1), [1; 32].into())
+    };
+    deposits.queue(0, deposit);
+}
+
+#[test]
 #[should_panic(expected = "unsupported SPL mint")]
 fn should_reject_queued_deposit_for_unsupported_mint() {
     let runtime = TestCanisterRuntime::new().with_increasing_time();
@@ -804,6 +816,7 @@ fn should_reject_queued_deposit_for_unsupported_mint() {
                 mint: queued.mint,
                 address: queued.address,
                 balance: queued.balance,
+                fee: queued.fee,
             },
             &runtime,
         )
@@ -832,6 +845,7 @@ fn should_replay_queued_spl_deposit_from_stable_events() {
                 mint: queued.mint,
                 address: queued.address,
                 balance: queued.balance,
+                fee: queued.fee,
             },
             &runtime,
         );

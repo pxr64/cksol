@@ -5,7 +5,7 @@ use cksol_types::DepositSplError;
 fn should_reject_balance_below_minimum() {
     for balance in [0, 99] {
         assert_eq!(
-            balance_above_minimum(balance, 100),
+            balance_above_minimum(balance, 100, 0),
             Err(DepositSplError::ValueTooSmall {
                 balance,
                 minimum_deposit_amount: 100,
@@ -17,15 +17,39 @@ fn should_reject_balance_below_minimum() {
 #[test]
 fn should_accept_balance_at_minimum() {
     for minimum in [1, 100, u64::MAX] {
-        assert_eq!(balance_above_minimum(minimum, minimum), Ok(minimum));
+        assert_eq!(balance_above_minimum(minimum, minimum, 0), Ok(minimum));
     }
 }
 
 #[test]
 fn should_accept_balance_above_minimum() {
     for balance in [101, u64::MAX] {
-        assert_eq!(balance_above_minimum(balance, 100), Ok(balance));
+        assert_eq!(balance_above_minimum(balance, 100, 0), Ok(balance));
     }
+}
+
+#[test]
+fn should_require_the_minimum_deposit_after_deducting_the_fee() {
+    for balance in [24, 25, 124] {
+        assert_eq!(
+            balance_above_minimum(balance, 100, 25),
+            Err(DepositSplError::ValueTooSmall {
+                balance,
+                minimum_deposit_amount: 125,
+            })
+        );
+    }
+    for balance in [125, u64::MAX] {
+        assert_eq!(balance_above_minimum(balance, 100, 25), Ok(balance));
+    }
+}
+
+#[test]
+fn should_reject_unrepresentable_minimum_with_fee() {
+    assert!(matches!(
+        balance_above_minimum(u64::MAX, u64::MAX, 1),
+        Err(DepositSplError::TemporarilyUnavailable(_))
+    ));
 }
 
 mod balance_reading {
@@ -176,6 +200,7 @@ mod balance_reading {
                 associated_token_address(&owner, &token.mint, &token.token_program.id())
             );
             assert_eq!(queued.balance, balance);
+            assert_eq!(queued.fee, 0);
             assert_eq!(
                 state
                     .spl_deposits()
@@ -505,6 +530,7 @@ mod balance_reading {
                     mint: token.mint,
                     address: [4; 32].into(),
                     balance: MINIMUM_DEPOSIT_AMOUNT,
+                    fee: 0,
                 },
                 &TestCanisterRuntime::new().with_increasing_time(),
             )
@@ -929,6 +955,7 @@ mod lifecycle {
                         mint: deposit.mint,
                         address: deposit.address,
                         balance: deposit.balance,
+                        fee: deposit.fee,
                     },
                     EventType::SubmittedTransaction {
                         signature,

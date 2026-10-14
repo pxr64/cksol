@@ -174,6 +174,8 @@ pub enum EventType {
         address: Address,
         /// The token-account balance when the deposit was queued, in the mint's smallest units.
         balance: u64,
+        /// The fee deducted from the ledger mint, in the mint's smallest units.
+        fee: u64,
     },
     /// A validated SPL token was registered with its IC ledger.
     AddedSplToken {

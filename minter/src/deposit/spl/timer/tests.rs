@@ -780,6 +780,7 @@ fn queue_deposits(
                     mint,
                     address: deposit.address,
                     balance: deposit.balance,
+                    fee: deposit.fee,
                 },
                 &runtime,
             );
@@ -963,6 +964,7 @@ fn should_pack_more_deposits_when_owners_and_mints_are_shared() {
                         mint,
                         address: deposit.address,
                         balance: deposit.balance,
+                        fee: deposit.fee,
                     },
                     &runtime,
                 )

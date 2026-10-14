@@ -167,7 +167,8 @@ type DepositSplError = variant {
     // A concurrent request for the same IC account and mint is processing.
     AlreadyProcessing;
     InsufficientCycles: InsufficientCyclesError;
-    // Amounts are in the mint's smallest units.
+    // The required balance includes the configured minimum plus the deposit fee,
+    // in the mint's smallest units.
     ValueTooSmall: record { balance: nat64; minimum_deposit_amount: nat64 };
     // The requested mint is not registered as a supported SPL token.
     UnsupportedToken: record { mint: Address };
@@ -493,6 +494,8 @@ type EventType = variant {
         address: Address;
         // The token-account balance when the deposit was queued, in the mint's smallest units.
         balance: nat64;
+        // The fee deducted from the ledger mint, in the mint's smallest units.
+        fee: nat64;
     };
     // The token ledger minted a swept SPL deposit.
     MintedSweptSplDeposit : record {
@@ -615,6 +618,7 @@ service : (MinterArg) -> {
     deposit_sol: (DepositSolArgs) -> (DepositSolResult);
 
     // Queues a finalized SPL balance for sweeping to the minter and minting on its token ledger.
+    // The token fee quoted at acceptance is deducted from the ledger mint.
     // New deposits cover two account reads and a consolidation fee in cycles; the fee is
     // charged only when both source and destination checks succeed. Repeated requests for
     // an in-flight account and mint return the existing ID without a charge, also when paused.

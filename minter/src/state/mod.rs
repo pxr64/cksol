@@ -464,6 +464,7 @@ impl State {
         mint: &Address,
         address: &Address,
         balance: u64,
+        fee: u64,
     ) {
         assert!(
             self.supported_spl_tokens.contains_key(mint),
@@ -476,6 +477,7 @@ impl State {
                 mint: *mint,
                 address: *address,
                 balance,
+                fee,
             },
         );
     }

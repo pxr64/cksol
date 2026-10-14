@@ -88,6 +88,10 @@ impl SplDeposits {
             deposit.balance > 0,
             "Attempted to queue SPL deposit {deposit_id} with a zero balance"
         );
+        assert!(
+            deposit.fee < deposit.balance,
+            "Attempted to queue SPL deposit {deposit_id} with a fee at or above its balance"
+        );
         self.in_flight_ids.insert(key, deposit_id);
         self.queued.insert(deposit_id, deposit);
         self.next_id += 1;
@@ -203,8 +207,9 @@ impl SplDeposits {
                 )
             });
             assert_eq!(
-                mint.amount_to_mint, deposit.balance,
-                "Attempted to credit SPL deposit {} with an amount different from its transferred balance",
+                mint.amount_to_mint,
+                deposit.amount_to_mint(),
+                "Attempted to credit SPL deposit {} with an amount different from its transferred balance minus the fee",
                 mint.deposit_id
             );
             let pending = PendingSplMint {
@@ -309,6 +314,16 @@ pub struct QueuedSplDeposit {
     pub address: Address,
     /// The token-account balance when the deposit was queued, in the mint's smallest units.
     pub balance: u64,
+    /// The fee quoted at acceptance, deducted from the ledger mint in the mint's smallest units.
+    pub fee: u64,
+}
+
+impl QueuedSplDeposit {
+    pub fn amount_to_mint(&self) -> u64 {
+        self.balance
+            .checked_sub(self.fee)
+            .expect("BUG: a queued SPL deposit fee must not exceed its balance")
+    }
 }
 
 /// A deposit together with the sweep transaction submitted to move its tokens.

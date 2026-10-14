@@ -237,7 +237,7 @@ impl SplSweep {
             .into_iter()
             .map(|(deposit_id, deposit)| CreditedSplDeposit {
                 deposit_id,
-                amount_to_mint: deposit.balance,
+                amount_to_mint: deposit.amount_to_mint(),
             })
             .collect();
         Ok(SettledSplSweep {

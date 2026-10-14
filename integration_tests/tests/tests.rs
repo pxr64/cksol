@@ -922,6 +922,7 @@ mod deposit_spl_tests {
                             mint: MINT.into(),
                             address: source.into(),
                             balance: BALANCE_ABOVE_MINIMUM,
+                            fee: 0,
                         },
                     ]
             );

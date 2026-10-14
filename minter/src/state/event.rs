@@ -203,6 +203,9 @@ pub enum EventType {
         address: Address,
         #[n(4)]
         balance: u64,
+        /// The fee deducted from the ledger mint, in the mint's smallest units.
+        #[n(5)]
+        fee: u64,
     },
     /// A finalized SPL sweep was validated and its deposits queued for ledger minting.
     #[n(17)]
@@ -265,7 +268,7 @@ pub struct CreditedDeposit {
 pub struct CreditedSplDeposit {
     #[n(0)]
     pub deposit_id: DepositSplId,
-    /// The transferred token amount in the mint's smallest units.
+    /// The transferred token amount minus the fee, in the mint's smallest units.
     #[n(1)]
     pub amount_to_mint: u64,
 }

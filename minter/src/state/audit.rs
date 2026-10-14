@@ -112,8 +112,9 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
             mint,
             address,
             balance,
+            fee,
         } => {
-            state.process_queued_spl_deposit(*deposit_id, account, mint, address, *balance);
+            state.process_queued_spl_deposit(*deposit_id, account, mint, address, *balance, *fee);
         }
     }
 }

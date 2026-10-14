@@ -284,12 +284,14 @@ fn get_events(
                 mint,
                 address,
                 balance,
+                fee,
             } => event::EventType::QueuedSplDeposit {
                 deposit_id,
                 account,
                 mint: mint.into(),
                 address: address.into(),
                 balance,
+                fee,
             },
             EventType::AddedSplToken(token) => event::EventType::AddedSplToken {
                 mint: token.mint.into(),

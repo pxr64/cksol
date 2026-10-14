@@ -216,12 +216,13 @@ pub enum DepositSplError {
     /// Insufficient cycles attached to read the token balance.
     #[error(transparent)]
     InsufficientCycles(#[from] InsufficientCyclesError),
-    /// The token balance is below the configured minimum, in the mint's smallest units.
+    /// The token balance is below the configured minimum plus the deposit fee, in the mint's
+    /// smallest units.
     #[error("Balance {balance} is below the minimum deposit amount {minimum_deposit_amount}")]
     ValueTooSmall {
         /// The token balance in the mint's smallest units.
         balance: u64,
-        /// The minimum deposit in the mint's smallest units.
+        /// The required balance, including the deposit fee, in the mint's smallest units.
         minimum_deposit_amount: u64,
     },
     /// The requested mint is not registered as a supported SPL token.

@@ -27,6 +27,10 @@ type MintResult = Result<BlockIndex, TransferError>;
 const CREDITED_AT: u64 = 1_234;
 
 fn setup_pending(count: usize) -> Vec<(DepositSplId, PendingSplMint)> {
+    setup_pending_with_fee(count, 0)
+}
+
+fn setup_pending_with_fee(count: usize, fee: u64) -> Vec<(DepositSplId, PendingSplMint)> {
     reset_state();
     reset_events();
     let runtime = TestCanisterRuntime::new().with_increasing_time();
@@ -51,7 +55,10 @@ fn setup_pending(count: usize) -> Vec<(DepositSplId, PendingSplMint)> {
         };
         let mint = [id as u8 % 2 + 1; 32].into();
         let token = spl_token(mint, program);
-        let deposit = queued_spl_deposit(account(id / 2 + 1), mint, program);
+        let deposit = crate::state::QueuedSplDeposit {
+            fee,
+            ..queued_spl_deposit(account(id / 2 + 1), mint, program)
+        };
         let sweep = crate::state::SplSweep::plan(
             [(id as u64, deposit.clone())],
             &BTreeMap::from([(mint, token)]),
@@ -68,6 +75,7 @@ fn setup_pending(count: usize) -> Vec<(DepositSplId, PendingSplMint)> {
                     mint,
                     address: deposit.address,
                     balance: deposit.balance,
+                    fee: deposit.fee,
                 },
                 &runtime,
             );
@@ -96,7 +104,7 @@ fn setup_pending(count: usize) -> Vec<(DepositSplId, PendingSplMint)> {
                     lamports_spent: 5_000,
                     mints: vec![CreditedSplDeposit {
                         deposit_id: id as u64,
-                        amount_to_mint: deposit.balance,
+                        amount_to_mint: deposit.amount_to_mint(),
                     }],
                 },
                 &TestCanisterRuntime::new().add_times([CREDITED_AT; 2]),
@@ -251,6 +259,7 @@ async fn should_release_only_the_minted_account_and_token_pair() {
                 mint: deposit.mint,
                 address: deposit.address,
                 balance: deposit.balance,
+                fee: deposit.fee,
             },
             &runtime,
         )

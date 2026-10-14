@@ -205,6 +205,7 @@ pub fn queued_spl_deposit(
         mint,
         address: associated_token_address(&owner, &mint, &token_program.id()),
         balance: 1_000_000,
+        fee: 0,
     }
 }
 

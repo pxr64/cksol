@@ -71,6 +71,7 @@ fn finalize_sweep(index: usize) -> (Signature, SplSweep) {
                     mint: deposit.mint,
                     address: deposit.address,
                     balance: deposit.balance,
+                    fee: deposit.fee,
                 },
                 &runtime,
             )

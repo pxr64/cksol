@@ -7,6 +7,7 @@ use crate::{
     guard::deposit_spl_guard,
     rpc::{get_spl_token_account, get_spl_token_balance},
     runtime::CanisterRuntime,
+    spl_fee::{FeeEstimator, NoPriceOracle},
     state::{audit::process_event, event::EventType, mutate_state, read_state},
     utils::{assert_valid_deposit_owner, assert_valid_deposit_token},
 };
@@ -48,13 +49,17 @@ pub async fn deposit_spl<R: CanisterRuntime>(
         2 * GET_ACCOUNT_INFO_CYCLES + deposit_consolidation_fee,
     )?;
 
+    let fee = FeeEstimator::new(NoPriceOracle)
+        .estimate_fee(mint)
+        .await
+        .map_err(DepositSplError::TemporarilyUnavailable)?;
     let master_key = lazy_get_schnorr_master_key(runtime).await;
     let owner = account_address(&master_key, &account);
     let address = associated_token_address(&owner, &token.mint, &token.token_program.id());
     let result = get_spl_token_balance(runtime, address, owner, token.mint, token.token_program)
         .await
         .map_err(DepositSplError::from)
-        .and_then(|balance| balance_above_minimum(balance, token.minimum_deposit_amount));
+        .and_then(|balance| balance_above_minimum(balance, token.minimum_deposit_amount, fee));
     charge_rpc_call(
         runtime,
         RpcCallCharge {
@@ -93,6 +98,7 @@ pub async fn deposit_spl<R: CanisterRuntime>(
                 mint,
                 address,
                 balance,
+                fee,
             },
             runtime,
         );
@@ -100,7 +106,7 @@ pub async fn deposit_spl<R: CanisterRuntime>(
     });
     log!(
         Priority::Info,
-        "Queued SPL deposit {deposit_id} for account {account:?}: {balance} units of mint {mint} sweepable from {address}"
+        "Queued SPL deposit {deposit_id} for account {account:?}: {balance} units of mint {mint} sweepable from {address}, with a fee of {fee} units"
     );
     Ok(deposit_id)
 }
@@ -108,7 +114,13 @@ pub async fn deposit_spl<R: CanisterRuntime>(
 fn balance_above_minimum(
     balance: u64,
     minimum_deposit_amount: u64,
+    fee: u64,
 ) -> Result<u64, DepositSplError> {
+    let minimum_deposit_amount = minimum_deposit_amount.checked_add(fee).ok_or_else(|| {
+        DepositSplError::TemporarilyUnavailable(
+            "SPL deposit fee and minimum deposit amount exceed u64::MAX".to_string(),
+        )
+    })?;
     if balance < minimum_deposit_amount {
         return Err(DepositSplError::ValueTooSmall {
             balance,
