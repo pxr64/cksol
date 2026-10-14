@@ -19,9 +19,9 @@ use cksol_minter::{
 };
 use cksol_types::{
     AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
-    DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, GetDepositAddressArgs,
-    GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo, WithdrawalArgs,
-    WithdrawalError, WithdrawalOk, WithdrawalStatus, WithdrawalStatusArgs,
+    DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, DepositSplStatus,
+    GetDepositAddressArgs, GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo,
+    WithdrawalArgs, WithdrawalError, WithdrawalOk, WithdrawalStatus, WithdrawalStatusArgs,
 };
 use cksol_types_internal::{MinterArg, log::Priority};
 use ic_http_types::{HttpRequest, HttpResponse, HttpResponseBuilder};
@@ -80,6 +80,11 @@ async fn deposit_sol(args: DepositSolArgs) -> Result<DepositSolId, DepositSolErr
 #[ic_cdk::query]
 fn deposit_status(deposit_id: DepositSolId) -> DepositSolStatus {
     cksol_minter::deposit::sweep::deposit_status(deposit_id)
+}
+
+#[ic_cdk::query]
+fn deposit_spl_status(deposit_id: DepositSplId) -> DepositSplStatus {
+    cksol_minter::deposit::spl::deposit_spl_status(deposit_id)
 }
 
 #[ic_cdk::update]

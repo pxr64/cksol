@@ -586,7 +586,9 @@ mod lifecycle {
     use crate::{
         address::{account_address, associated_token_address},
         constants::FEE_PER_SIGNATURE,
-        deposit::spl::{deposit_spl, process_pending_spl_mints, sweep_queued_spl_deposits},
+        deposit::spl::{
+            deposit_spl, deposit_spl_status, process_pending_spl_mints, sweep_queued_spl_deposits,
+        },
         lifecycle,
         monitor::finalize_transactions,
         state::{
@@ -610,7 +612,7 @@ mod lifecycle {
         },
     };
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use cksol_types::{DepositSplId, Memo, MintMemo};
+    use cksol_types::{DepositSplId, DepositSplStatus, Memo, MintMemo, SplFeeMintStatus};
     use ic_stable_structures::Storable;
     use icrc_ledger_types::icrc1::{
         account::Account,
@@ -988,6 +990,52 @@ mod lifecycle {
     }
 
     #[tokio::test]
+    async fn should_report_the_status_of_each_stage() {
+        setup();
+        let token = register_token(false);
+        assert_eq!(deposit_spl_status(0), DepositSplStatus::NotFound);
+
+        let deposit_id = deposit(&token, DEPOSITOR_ACCOUNT, MINIMUM_DEPOSIT_AMOUNT).await;
+        assert_eq!(
+            deposit_spl_status(deposit_id),
+            DepositSplStatus::Queued {
+                balance: MINIMUM_DEPOSIT_AMOUNT,
+                fee: 0,
+            }
+        );
+
+        let sweep = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+        assert_eq!(
+            deposit_spl_status(deposit_id),
+            DepositSplStatus::Swept {
+                signature: sweep.signature.into(),
+            }
+        );
+
+        settle(&sweep).await;
+        assert_eq!(
+            deposit_spl_status(deposit_id),
+            DepositSplStatus::Finalized {
+                signature: sweep.signature.into(),
+            }
+        );
+
+        mint(1).await;
+        assert_eq!(
+            deposit_spl_status(deposit_id),
+            DepositSplStatus::Minted {
+                block_index: BLOCK_INDEX,
+                minted_amount: MINIMUM_DEPOSIT_AMOUNT,
+                fee: SplFeeMintStatus::None,
+            }
+        );
+        assert_eq!(
+            deposit_spl_status(deposit_id + 1),
+            DepositSplStatus::NotFound
+        );
+    }
+
+    #[tokio::test]
     async fn should_process_spl_deposit_through_sweep_credit_and_mint() {
         for token_2022 in [false, true] {
             setup();
@@ -1203,6 +1251,12 @@ mod lifecycle {
             ),
         )
         .await;
+        assert_eq!(
+            deposit_spl_status(first),
+            DepositSplStatus::Dropped {
+                signature: failed.signature.into(),
+            }
+        );
 
         let failed_fee = 2 * FEE_PER_SIGNATURE;
         read_state(|state| {
@@ -1284,6 +1338,12 @@ mod lifecycle {
         EventsAssert::from_recorded().expect_contains_event_eq(EventType::QuarantinedSplSweep {
             signature: sweep.signature,
         });
+        assert_eq!(
+            deposit_spl_status(deposit_id),
+            DepositSplStatus::Quarantined {
+                signature: sweep.signature.into(),
+            }
+        );
         read_state(|state| {
             assert_eq!(
                 state.spl_deposits().quarantined()[&deposit_id].signature,

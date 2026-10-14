@@ -6,9 +6,9 @@ use candid::{CandidType, Decode, Encode, Nat, Principal, utils::ArgumentEncoder}
 use canlog::{Log, LogEntry};
 use cksol_types::{
     AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
-    DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, GetDepositAddressArgs,
-    GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo, WithdrawalArgs,
-    WithdrawalError, WithdrawalOk, WithdrawalStatus, WithdrawalStatusArgs,
+    DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, DepositSplStatus,
+    GetDepositAddressArgs, GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo,
+    WithdrawalArgs, WithdrawalError, WithdrawalOk, WithdrawalStatus, WithdrawalStatusArgs,
 };
 use cksol_types_internal::{
     MinterArg,
@@ -541,6 +541,10 @@ impl CkSolMinter<'_> {
 
     pub async fn deposit_status(&self, deposit_id: DepositSolId) -> DepositSolStatus {
         self.query_call("deposit_status", (deposit_id,)).await
+    }
+
+    pub async fn deposit_spl_status(&self, deposit_id: DepositSplId) -> DepositSplStatus {
+        self.query_call("deposit_spl_status", (deposit_id,)).await
     }
 
     pub async fn withdraw(&self, args: WithdrawalArgs) -> Result<WithdrawalOk, WithdrawalError> {

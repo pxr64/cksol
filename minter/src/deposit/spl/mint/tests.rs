@@ -17,6 +17,7 @@ use crate::{
     },
 };
 use candid::Nat;
+use cksol_types::{DepositSplStatus, SplFeeMintStatus};
 use futures::FutureExt;
 use ic_canister_runtime::IcError;
 use ic_stable_structures::Storable;
@@ -401,6 +402,14 @@ async fn should_retry_only_the_fee_mint_and_preserve_new_deposit_lock() {
     read_state(|state| {
         assert!(state.spl_deposits().pending_mints().is_empty());
         assert_eq!(state.spl_deposits().pending_fee_mints()[&0].amount, FEE);
+        assert_eq!(
+            state.spl_deposits().status(0),
+            DepositSplStatus::Minted {
+                block_index: BLOCK_INDEX,
+                minted_amount: pending.amount_to_mint,
+                fee: SplFeeMintStatus::Pending,
+            }
+        );
         assert!(state.spl_deposits().minted_fees().is_empty());
         assert_eq!(
             *state.spl_deposits().minted()[&0].mint_block_index.get(),
@@ -438,6 +447,16 @@ async fn should_retry_only_the_fee_mint_and_preserve_new_deposit_lock() {
         assert_eq!(
             *state.spl_deposits().minted_fees()[&0].get(),
             BLOCK_INDEX + 1
+        );
+        assert_eq!(
+            state.spl_deposits().status(0),
+            DepositSplStatus::Minted {
+                block_index: BLOCK_INDEX,
+                minted_amount: pending.amount_to_mint,
+                fee: SplFeeMintStatus::Minted {
+                    block_index: BLOCK_INDEX + 1,
+                },
+            }
         );
         assert_eq!(
             state
@@ -500,6 +519,14 @@ async fn should_quarantine_unsafe_fee_mint_without_changing_user_mint() {
             assert!(state.spl_deposits().pending_fee_mints().is_empty());
             assert!(state.spl_deposits().minted_fees().is_empty());
             assert_eq!(state.spl_deposits().quarantined_fee_mints()[&id], fee);
+            assert_eq!(
+                state.spl_deposits().status(id),
+                DepositSplStatus::Minted {
+                    block_index: BLOCK_INDEX,
+                    minted_amount: pending.amount_to_mint,
+                    fee: SplFeeMintStatus::Quarantined,
+                }
+            );
             assert_eq!(
                 *state.spl_deposits().minted()[&id].mint_block_index.get(),
                 BLOCK_INDEX

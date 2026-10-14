@@ -11,8 +11,8 @@ use cksol_int_tests::{
     validator::FEE_PER_SIGNATURE,
 };
 use cksol_types::{
-    AddSplTokenArgs, AddSplTokenError, DepositSplArgs, DepositSplError, GetSplDepositAddressArgs,
-    GetSplDepositAddressError, Memo, MintMemo,
+    AddSplTokenArgs, AddSplTokenError, DepositSplArgs, DepositSplError, DepositSplStatus,
+    GetSplDepositAddressArgs, GetSplDepositAddressError, Memo, MintMemo, SplFeeMintStatus,
 };
 use cksol_types_internal::{
     UpgradeArgs,
@@ -77,11 +77,34 @@ async fn sweep_finalize_and_mint(token_program: Address, extensions: &[Extension
     );
     let deposit_id = queue_deposit(&setup, account, token_program, extensions, 4).await;
     assert_eq!(ledger.balance_of(account).await, 0);
+    assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Queued {
+            balance: BALANCE_ABOVE_MINIMUM,
+            fee: 0,
+        }
+    );
+    assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id + 1).await,
+        DepositSplStatus::NotFound
+    );
 
     let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 12).await;
     assert_eq!(ledger.balance_of(account).await, 0);
+    assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Swept {
+            signature: signature.clone()
+        }
+    );
 
     finalize_sweep(&setup, &signature, transaction, &owner, &token_program, 24).await;
+    assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Finalized {
+            signature: signature.clone()
+        }
+    );
     setup.minter().assert_that_events().await.satisfy(|events| {
         check!(events.contains(&EventType::CreditedSplSweep {
             signature: signature.clone(),
@@ -96,6 +119,14 @@ async fn sweep_finalize_and_mint(token_program: Address, extensions: &[Extension
 
     run_mint_timer(&setup).await;
     assert_eq!(ledger.balance_of(account).await, BALANCE_ABOVE_MINIMUM);
+    assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Minted {
+            block_index: 0,
+            minted_amount: BALANCE_ABOVE_MINIMUM,
+            fee: SplFeeMintStatus::None,
+        }
+    );
     assert_eq!(
         ledger
             .balance_of(Account {
@@ -159,6 +190,12 @@ async fn should_quarantine_deposit_when_finalized_sweep_does_not_match_its_plan(
                 .any(|event| matches!(event, EventType::CreditedSplSweep { .. }))
         );
     });
+    assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Quarantined {
+            signature: signature.clone()
+        }
+    );
     // The pair stays locked, so a new request returns the quarantined deposit.
     assert_eq!(
         setup
@@ -391,6 +428,14 @@ async fn should_keep_in_flight_deposit_and_mint_it_after_upgrade() {
 
     run_mint_timer(&setup).await;
     assert_eq!(ledger.balance_of(account).await, BALANCE_ABOVE_MINIMUM);
+    assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Minted {
+            block_index: 0,
+            minted_amount: BALANCE_ABOVE_MINIMUM,
+            fee: SplFeeMintStatus::None,
+        }
+    );
     setup.minter().assert_that_events().await.satisfy(|events| {
         check!(events.contains(&EventType::MintedSweptSplDeposit {
             deposit_id,
@@ -431,6 +476,12 @@ async fn should_drop_deposit_and_release_account_after_sweep_expires() {
         )));
     });
     assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Dropped {
+            signature: signature.clone()
+        }
+    );
+    assert_eq!(
         queue_deposit(&setup, account, token_program, &[], 36).await,
         deposit_id + 1
     );
@@ -467,6 +518,12 @@ async fn should_drop_deposit_and_release_account_when_sweep_fails_on_chain() {
             EventType::SplitFailedSplSweep { .. } | EventType::CreditedSplSweep { .. }
         )));
     });
+    assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Dropped {
+            signature: signature.clone()
+        }
+    );
     assert_eq!(
         queue_deposit(&setup, account, token_program, &[], 36).await,
         deposit_id + 1

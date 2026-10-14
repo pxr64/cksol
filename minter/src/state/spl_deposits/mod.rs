@@ -3,7 +3,7 @@ use crate::state::{
     SupportedSplToken,
     event::{CreditedSplDeposit, Signer, VersionedMessage},
 };
-use cksol_types::DepositSplId;
+use cksol_types::{DepositSplId, DepositSplStatus, SplFeeMintStatus};
 use icrc_ledger_types::icrc1::account::Account;
 use solana_address::Address;
 use solana_signature::Signature;
@@ -84,6 +84,67 @@ impl SplDeposits {
 
     pub fn in_flight_id(&self, account: &Account, mint: &Address) -> Option<DepositSplId> {
         self.in_flight_ids.get(&(*account, *mint)).copied()
+    }
+
+    pub fn status(&self, deposit_id: DepositSplId) -> DepositSplStatus {
+        if let Some(deposit) = self
+            .queued
+            .get(&deposit_id)
+            .or_else(|| self.retrying.get(&deposit_id))
+        {
+            return DepositSplStatus::Queued {
+                balance: deposit.balance,
+                fee: deposit.fee,
+            };
+        }
+        if let Some((signature, _)) = self.swept.deposit(deposit_id) {
+            return DepositSplStatus::Swept {
+                signature: (*signature).into(),
+            };
+        }
+        if let Some((signature, _)) = self.finalized.deposit(deposit_id) {
+            return DepositSplStatus::Finalized {
+                signature: (*signature).into(),
+            };
+        }
+        if let Some(pending) = self.pending_mints.get(&deposit_id) {
+            return DepositSplStatus::Finalized {
+                signature: pending.sweep_signature().into(),
+            };
+        }
+        if let Some(minted) = self.minted.get(&deposit_id) {
+            return DepositSplStatus::Minted {
+                block_index: *minted.mint_block_index.get(),
+                minted_amount: minted.minted_amount,
+                fee: self.fee_status(deposit_id),
+            };
+        }
+        if let Some(dropped) = self.dropped.get(&deposit_id) {
+            return DepositSplStatus::Dropped {
+                signature: dropped.signature.into(),
+            };
+        }
+        if let Some(quarantined) = self.quarantined.get(&deposit_id) {
+            return DepositSplStatus::Quarantined {
+                signature: quarantined.signature.into(),
+            };
+        }
+        DepositSplStatus::NotFound
+    }
+
+    fn fee_status(&self, deposit_id: DepositSplId) -> SplFeeMintStatus {
+        if self.pending_fee_mints.contains_key(&deposit_id) {
+            return SplFeeMintStatus::Pending;
+        }
+        if let Some(block_index) = self.minted_fees.get(&deposit_id) {
+            return SplFeeMintStatus::Minted {
+                block_index: *block_index.get(),
+            };
+        }
+        if self.quarantined_fee_mints.contains_key(&deposit_id) {
+            return SplFeeMintStatus::Quarantined;
+        }
+        SplFeeMintStatus::None
     }
 
     pub(super) fn queue(&mut self, deposit_id: DepositSplId, deposit: QueuedSplDeposit) {

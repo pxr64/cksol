@@ -188,6 +188,73 @@ pub enum GetSplDepositAddressError {
     },
 }
 
+/// The status of a deposit queued by the `deposit_spl` ckSOL minter endpoint.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
+pub enum DepositSplStatus {
+    /// No deposit with this identifier was queued.
+    NotFound,
+    /// The token account is queued for a sweep to the minter's treasury token account.
+    Queued {
+        /// The recorded balance that will be swept, in the mint's smallest units.
+        balance: u64,
+        /// The fee quoted at acceptance, in the mint's smallest units.
+        fee: u64,
+    },
+    /// A Solana transaction sweeping the token account to the treasury has been submitted
+    /// but is not yet finalized.
+    Swept {
+        /// The signature of the sweep transaction.
+        signature: Signature,
+    },
+    /// The sweep transaction was finalized successfully, so the tokens reached the
+    /// treasury, but the ckSPL mint has not landed yet.
+    Finalized {
+        /// The signature of the sweep transaction.
+        signature: Signature,
+    },
+    /// The minter minted ckSPL for the deposit on its token ledger.
+    Minted {
+        /// The mint transaction index on the token ledger.
+        block_index: LedgerMintIndex,
+        /// The minted amount: the swept balance minus the fee, in the mint's smallest units.
+        minted_amount: u64,
+        /// The outcome of the fee mint into the minter's fee subaccount.
+        fee: SplFeeMintStatus,
+    },
+    /// The sweep transaction failed, or expired without ever being seen on chain, so no
+    /// ckSPL is owed. Calling `deposit_spl` again queues a new sweep of whatever balance
+    /// the token account holds.
+    Dropped {
+        /// The signature of the sweep transaction.
+        signature: Signature,
+    },
+    /// Either the sweep was finalized but its outcome did not match the plan, so no ckSPL
+    /// was minted, or the mint could not be retried safely, so the mint outcome requires
+    /// manual verification. Releasing or crediting the deposit requires a minter upgrade.
+    /// Meanwhile the account and mint pair stays in flight, so `deposit_spl` keeps
+    /// returning this identifier.
+    Quarantined {
+        /// The signature of the sweep transaction.
+        signature: Signature,
+    },
+}
+
+/// The outcome of the fee mint of a minted SPL deposit.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
+pub enum SplFeeMintStatus {
+    /// The deposit was quoted a zero fee, so there is no fee mint.
+    None,
+    /// The fee mint is queued on the token ledger.
+    Pending,
+    /// The fee was minted into the minter's fee subaccount.
+    Minted {
+        /// The fee mint transaction index on the token ledger.
+        block_index: LedgerMintIndex,
+    },
+    /// The fee mint cannot be retried safely and requires manual resolution.
+    Quarantined,
+}
+
 /// Configuration supplied when registering an SPL token.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
 pub struct AddSplTokenArgs {

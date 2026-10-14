@@ -12,7 +12,7 @@ use crate::{
     utils::{assert_valid_deposit_owner, assert_valid_deposit_token},
 };
 use canlog::log;
-use cksol_types::{DepositSplError, DepositSplId};
+use cksol_types::{DepositSplError, DepositSplId, DepositSplStatus};
 use cksol_types_internal::log::Priority;
 use icrc_ledger_types::icrc1::account::Account;
 use solana_address::Address;
@@ -109,6 +109,10 @@ pub async fn deposit_spl<R: CanisterRuntime>(
         "Queued SPL deposit {deposit_id} for account {account:?}: {balance} units of mint {mint} sweepable from {address}, with a fee of {fee} units"
     );
     Ok(deposit_id)
+}
+
+pub fn deposit_spl_status(deposit_id: DepositSplId) -> DepositSplStatus {
+    read_state(|state| state.spl_deposits().status(deposit_id))
 }
 
 fn balance_above_minimum(
