@@ -40,6 +40,11 @@ pub const FINALIZE_TRANSACTIONS_DELAY: Duration = Duration::from_mins(2);
 pub const RESUBMIT_TRANSACTIONS_DELAY: Duration = Duration::from_mins(3);
 /// Height of the block whose blockhash the mocks hand a timer for a first submission.
 pub const SUBMISSION_BLOCK_HEIGHT: u64 = 100_000_000;
+/// Number of blocks a blockhash stays valid for, as the minter counts them.
+const MAX_BLOCKHASH_AGE_IN_BLOCKS: u64 = 150;
+/// First height at which the blockhash of a transaction submitted at
+/// [`SUBMISSION_BLOCK_HEIGHT`] is no longer accepted.
+pub const EXPIRY_BLOCK_HEIGHT: u64 = SUBMISSION_BLOCK_HEIGHT + MAX_BLOCKHASH_AGE_IN_BLOCKS + 1;
 
 /// The slot the mocked `getSlot` reports. A test says which block height the mocked
 /// `getBlock` then reports, since that is what the minter records and what it judges
@@ -190,6 +195,13 @@ impl MockBuilder {
     pub fn finalize_transaction(self, block_height: u64) -> Self {
         self.get_current_block(block_height, IGNORED_BLOCKHASH)
             .check_signature_statuses(get_signature_statuses_finalized_response())
+    }
+
+    /// Mocks for `finalize_transactions` finding the pending transaction finalized with an
+    /// on-chain error: `getSlot` → `getBlock` → `getSignatureStatuses`.
+    pub fn fail_transaction(self, block_height: u64) -> Self {
+        self.get_current_block(block_height, IGNORED_BLOCKHASH)
+            .check_signature_statuses(get_signature_statuses_failed_response())
     }
 
     /// Mock for `getTransaction` for a sweep of [`DEFAULT_CALLER_DEPOSIT_ADDRESS`] under the
@@ -376,6 +388,26 @@ fn get_signature_statuses_finalized_response() -> JsonRpcResponse {
                 "confirmations": null,
                 "status": { "Ok": null },
                 "err": null,
+                "confirmationStatus": "finalized"
+            }]
+        },
+        "id": 1
+    }))
+}
+
+/// Response to a `getSignatureStatuses` request for the single pending transaction,
+/// reporting that its first token transfer failed on chain.
+fn get_signature_statuses_failed_response() -> JsonRpcResponse {
+    let error = json!({ "InstructionError": [1, { "Custom": 1 }] });
+    JsonRpcResponse::from(json!({
+        "jsonrpc": "2.0",
+        "result": {
+            "context": { "slot": 0 },
+            "value": [{
+                "slot": 350_000_000_u64,
+                "confirmations": null,
+                "status": { "Err": error },
+                "err": error,
                 "confirmationStatus": "finalized"
             }]
         },

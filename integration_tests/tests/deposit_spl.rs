@@ -3,13 +3,16 @@ use assert2::check;
 use cksol_int_tests::{
     Setup, SetupBuilder,
     fixtures::{
-        DEFAULT_CALLER_DEPOSIT_ADDRESS, FINALIZE_TRANSACTIONS_DELAY, MINTER_ADDRESS, MockBuilder,
-        PROCESS_PENDING_MINTS_DELAY, SUBMISSION_BLOCK_HEIGHT, SWEEP_DEPOSITS_DELAY, get_memo,
+        DEFAULT_CALLER_DEPOSIT_ADDRESS, EXPIRY_BLOCK_HEIGHT, FINALIZE_TRANSACTIONS_DELAY,
+        MINTER_ADDRESS, MockBuilder, SUBMISSION_BLOCK_HEIGHT, get_memo,
     },
     validator::FEE_PER_SIGNATURE,
 };
 use cksol_types::{DepositSplArgs, DepositSplError, GetSplDepositAddressArgs, Memo, MintMemo};
-use cksol_types_internal::event::{CreditedSplDeposit, EventType, TransactionPurpose};
+use cksol_types_internal::{
+    UpgradeArgs,
+    event::{CreditedSplDeposit, EventType},
+};
 use icrc_ledger_types::icrc1::account::Account;
 use sol_rpc_types::{
     CommitmentLevel, ConsensusStrategy, GetAccountInfoEncoding, GetAccountInfoParams, RpcConfig,
@@ -21,8 +24,9 @@ mod fixtures;
 
 use fixtures::spl::{
     BALANCE_ABOVE_MINIMUM, DECIMALS, MINIMUM_DEPOSIT_AMOUNT, MINT, RENT_EXEMPT_LAMPORTS,
-    account_info, associated_token_address, frozen_token_account_data, queue_deposit_for_caller,
-    register_token, setup_with_registered_mint, sweep_transaction_response, token_account_data,
+    account_info, associated_token_address, finalize_sweep, frozen_token_account_data,
+    queue_deposit, queue_deposit_for_caller, register_token, run_mint_timer,
+    setup_with_registered_mint, sweep_queued_deposit, token_account_data,
     token_account_data_with_amount,
 };
 
@@ -77,45 +81,10 @@ async fn should_sweep_finalize_and_mint_queued_deposit_after_timers() {
         .expect("deposit_spl should queue a sweep");
     assert_eq!(ledger.balance_of(account).await, 0);
 
-    setup.advance_time(SWEEP_DEPOSITS_DELAY).await;
-    setup
-        .execute_http_mocks(
-            // getSlot, getBlock and sendTransaction use RPC IDs 12 to 23.
-            MockBuilder::with_start_id(12)
-                .submit_transaction(SUBMISSION_BLOCK_HEIGHT)
-                .build(),
-        )
-        .await;
-    let (signature, transaction) = setup
-        .minter()
-        .get_all_events()
-        .await
-        .into_iter()
-        .find_map(|event| match event.payload {
-            EventType::SubmittedTransaction {
-                signature,
-                transaction,
-                purpose: TransactionPurpose::SweepSplDeposits { deposit_ids },
-                ..
-            } if deposit_ids == [deposit_id] => Some((signature, transaction)),
-            _ => None,
-        })
-        .expect("the SPL sweep timer should submit the queued deposit");
+    let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 12).await;
     assert_eq!(ledger.balance_of(account).await, 0);
 
-    setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
-    setup
-        .execute_http_mocks(
-            // The finalization calls use RPC IDs 24 to 39.
-            MockBuilder::with_start_id(24)
-                .finalize_transaction(SUBMISSION_BLOCK_HEIGHT)
-                .get_transaction(
-                    &signature,
-                    sweep_transaction_response(&signature, transaction, &owner, &token_program),
-                )
-                .build(),
-        )
-        .await;
+    finalize_sweep(&setup, &signature, transaction, &owner, &token_program, 24).await;
     setup.minter().assert_that_events().await.satisfy(|events| {
         check!(events.contains(&EventType::CreditedSplSweep {
             signature: signature.clone(),
@@ -129,11 +98,7 @@ async fn should_sweep_finalize_and_mint_queued_deposit_after_timers() {
         }));
     });
 
-    setup.advance_time(PROCESS_PENDING_MINTS_DELAY).await;
-    // Run ten PocketIC rounds to complete the ledger call and its reply.
-    for _ in 0..10 {
-        setup.tick().await;
-    }
+    run_mint_timer(&setup).await;
     assert_eq!(ledger.balance_of(account).await, BALANCE_ABOVE_MINIMUM);
     assert_eq!(
         ledger
@@ -161,6 +126,157 @@ async fn should_sweep_finalize_and_mint_queued_deposit_after_timers() {
     assert_eq!(
         memo,
         Memo::from(MintMemo::sweep(signature.clone(), deposit_id))
+    );
+    setup.drop().await;
+}
+
+#[tokio::test]
+async fn should_keep_in_flight_deposit_and_mint_it_after_upgrade() {
+    let token_program = spl_token_interface::id().to_bytes().into();
+    let setup = SetupBuilder::new()
+        .with_proxy_canister()
+        .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
+        .build()
+        .await;
+    let ledger = setup.install_spl_ledger(DECIMALS).await;
+    // The mint account read uses RPC IDs 0 to 3.
+    register_token(&setup, ledger.canister_id(), token_program).await;
+    let account = Account {
+        owner: setup.proxy_canister_id(),
+        subaccount: Some([1; 32]),
+    };
+    let owner: Address = setup.minter().get_deposit_address(account).await.into();
+    let source = associated_token_address(&owner, &token_program);
+    let deposit_id = queue_deposit(&setup, account, token_program, 4).await;
+    let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 12).await;
+    finalize_sweep(&setup, &signature, transaction, &owner, &token_program, 24).await;
+    let events_before_upgrade = setup.minter().get_all_events().await;
+    check!(
+        events_before_upgrade
+            .iter()
+            .any(|event| matches!(event.payload, EventType::CreditedSplSweep { .. }))
+    );
+
+    setup
+        .minter()
+        .upgrade(UpgradeArgs::default())
+        .await
+        .expect("upgrade failed");
+    // The init timer fetches the master key again.
+    setup.tick().await;
+
+    let events = setup.minter().get_all_events().await;
+    assert_eq!(
+        events[..events_before_upgrade.len()],
+        events_before_upgrade[..]
+    );
+    assert_eq!(events.len(), events_before_upgrade.len() + 1);
+    assert_matches!(events.last().unwrap().payload, EventType::Upgrade(_));
+    assert_eq!(
+        setup
+            .minter()
+            .get_spl_deposit_address(GetSplDepositAddressArgs {
+                owner: None,
+                subaccount: account.subaccount,
+                mint: MINT.into(),
+            })
+            .await,
+        Ok(source.into())
+    );
+    assert_eq!(
+        setup
+            .minter()
+            .deposit_spl(DepositSplArgs {
+                owner: None,
+                subaccount: account.subaccount,
+                mint: MINT.into(),
+            })
+            .await,
+        Ok(deposit_id)
+    );
+    assert_eq!(ledger.balance_of(account).await, 0);
+
+    run_mint_timer(&setup).await;
+    assert_eq!(ledger.balance_of(account).await, BALANCE_ABOVE_MINIMUM);
+    setup.minter().assert_that_events().await.satisfy(|events| {
+        check!(events.contains(&EventType::MintedSweptSplDeposit {
+            deposit_id,
+            mint_block_index: 0
+        }));
+    });
+    setup.drop().await;
+}
+
+#[tokio::test]
+async fn should_drop_deposit_and_release_account_after_sweep_expires() {
+    let token_program = spl_token_interface::id().to_bytes().into();
+    let setup = setup_with_registered_mint(token_program).await;
+    let account = Account {
+        owner: setup.proxy_canister_id(),
+        subaccount: Some([1; 32]),
+    };
+    let deposit_id = queue_deposit(&setup, account, token_program, 4).await;
+    let (signature, _) = sweep_queued_deposit(&setup, deposit_id, 12).await;
+
+    setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
+    setup
+        .execute_http_mocks(
+            // getSlot, getBlock and getSignatureStatuses use RPC IDs 24 to 35.
+            MockBuilder::with_start_id(24)
+                .mark_transaction_expired(EXPIRY_BLOCK_HEIGHT)
+                .build(),
+        )
+        .await;
+
+    setup.minter().assert_that_events().await.satisfy(|events| {
+        check!(events.contains(&EventType::ExpiredTransaction {
+            signature: signature.clone()
+        }));
+        check!(!events.iter().any(|event| matches!(
+            event,
+            EventType::ResubmittedTransaction { .. } | EventType::FailedTransaction { .. }
+        )));
+    });
+    assert_eq!(
+        queue_deposit(&setup, account, token_program, 36).await,
+        deposit_id + 1
+    );
+    setup.drop().await;
+}
+
+#[tokio::test]
+async fn should_drop_deposit_and_release_account_when_sweep_fails_on_chain() {
+    let token_program = spl_token_interface::id().to_bytes().into();
+    let setup = setup_with_registered_mint(token_program).await;
+    let account = Account {
+        owner: setup.proxy_canister_id(),
+        subaccount: Some([1; 32]),
+    };
+    let deposit_id = queue_deposit(&setup, account, token_program, 4).await;
+    let (signature, _) = sweep_queued_deposit(&setup, deposit_id, 12).await;
+
+    setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
+    setup
+        .execute_http_mocks(
+            // getSlot, getBlock and getSignatureStatuses use RPC IDs 24 to 35.
+            MockBuilder::with_start_id(24)
+                .fail_transaction(SUBMISSION_BLOCK_HEIGHT)
+                .build(),
+        )
+        .await;
+
+    setup.minter().assert_that_events().await.satisfy(|events| {
+        check!(events.contains(&EventType::FailedTransaction {
+            signature: signature.clone()
+        }));
+        check!(!events.iter().any(|event| matches!(
+            event,
+            EventType::SplitFailedSplSweep { .. } | EventType::CreditedSplSweep { .. }
+        )));
+    });
+    assert_eq!(
+        queue_deposit(&setup, account, token_program, 36).await,
+        deposit_id + 1
     );
     setup.drop().await;
 }

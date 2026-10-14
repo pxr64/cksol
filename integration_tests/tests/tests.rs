@@ -5,7 +5,7 @@ use cksol_int_tests::{
     CkSolMinter, Setup, SetupBuilder,
     fixtures::{
         DEFAULT_CALLER_ACCOUNT, DEFAULT_CALLER_DEPOSIT_ADDRESS, DEPOSIT_AMOUNT,
-        FINALIZE_TRANSACTIONS_DELAY, MockBuilder, PROCESS_PENDING_MINTS_DELAY,
+        EXPIRY_BLOCK_HEIGHT, FINALIZE_TRANSACTIONS_DELAY, MockBuilder, PROCESS_PENDING_MINTS_DELAY,
         RENT_EXEMPTION_THRESHOLD, RESUBMIT_TRANSACTIONS_DELAY, SUBMISSION_BLOCK_HEIGHT,
         SWEEP_DEPOSITS_DELAY, SharedMockHttpOutcalls, WITHDRAWAL_PROCESSING_DELAY,
     },
@@ -24,12 +24,6 @@ use icrc_ledger_types::icrc1::account::{Account, Subaccount};
 use sol_rpc_types::{CommitmentLevel, ConsensusStrategy, RpcConfig};
 use std::time::Duration;
 use tokio::join;
-
-/// Number of blocks a blockhash stays valid for, as the minter counts them.
-const MAX_BLOCKHASH_AGE_IN_BLOCKS: u64 = 150;
-/// First height at which the blockhash of a transaction submitted at
-/// [`SUBMISSION_BLOCK_HEIGHT`] is no longer accepted.
-const EXPIRY_BLOCK_HEIGHT: u64 = SUBMISSION_BLOCK_HEIGHT + MAX_BLOCKHASH_AGE_IN_BLOCKS + 1;
 
 /// Deposits funds into the minter via `deposit_sol`, sweeps them, and finalizes
 /// and credits the sweep so the minter's internal balance is credited.

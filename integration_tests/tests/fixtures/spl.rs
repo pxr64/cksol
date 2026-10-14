@@ -4,14 +4,17 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use candid::Principal;
 use cksol_int_tests::{
     Setup, SetupBuilder,
-    fixtures::{MINTER_ADDRESS, MockBuilder},
+    fixtures::{
+        FINALIZE_TRANSACTIONS_DELAY, MINTER_ADDRESS, MockBuilder, PROCESS_PENDING_MINTS_DELAY,
+        SUBMISSION_BLOCK_HEIGHT, SWEEP_DEPOSITS_DELAY,
+    },
     validator::FEE_PER_SIGNATURE,
 };
 use cksol_types::{
-    AddSplTokenArgs, DepositSplArgs, GetDepositAddressArgs, GetSplDepositAddressArgs, Lamport,
-    Signature,
+    AddSplTokenArgs, DepositSplArgs, DepositSplId, GetDepositAddressArgs, GetSplDepositAddressArgs,
+    Lamport, Signature,
 };
-use cksol_types_internal::event::{EventType, VersionedTransactionMessage};
+use cksol_types_internal::event::{EventType, TransactionPurpose, VersionedTransactionMessage};
 use ic_pocket_canister_runtime::JsonRpcResponse;
 use icrc_ledger_types::icrc1::account::Account;
 use serde_json::json;
@@ -308,4 +311,100 @@ pub async fn queue_deposit_for_caller(token_program: Address, extensions: &[Exte
     });
 
     setup.drop().await;
+}
+
+/// Queues a deposit of the full test balance for the account, with an absent treasury
+/// account. The two account reads use RPC IDs `start_id` to `start_id + 7`.
+pub async fn queue_deposit(
+    setup: &Setup,
+    account: Account,
+    token_program: Address,
+    start_id: u64,
+) -> DepositSplId {
+    let owner: Address = setup.minter().get_deposit_address(account).await.into();
+    setup
+        .minter()
+        .with_http_mocks(
+            MockBuilder::with_start_id(start_id)
+                .get_account_info(
+                    &associated_token_address(&owner, &token_program),
+                    Some(account_info(token_account_data(&owner, &[]), token_program)),
+                )
+                .get_account_info(
+                    &associated_token_address(&MINTER_ADDRESS, &token_program),
+                    None,
+                )
+                .build(),
+        )
+        .deposit_spl(DepositSplArgs {
+            owner: None,
+            subaccount: account.subaccount,
+            mint: MINT.into(),
+        })
+        .await
+        .expect("deposit_spl should queue a sweep")
+}
+
+/// Runs the sweep timer and answers its getSlot, getBlock and sendTransaction calls with
+/// RPC IDs `start_id` to `start_id + 11`. Returns the signature and message of the sweep.
+pub async fn sweep_queued_deposit(
+    setup: &Setup,
+    deposit_id: DepositSplId,
+    start_id: u64,
+) -> (Signature, VersionedTransactionMessage) {
+    setup.advance_time(SWEEP_DEPOSITS_DELAY).await;
+    setup
+        .execute_http_mocks(
+            MockBuilder::with_start_id(start_id)
+                .submit_transaction(SUBMISSION_BLOCK_HEIGHT)
+                .build(),
+        )
+        .await;
+    setup
+        .minter()
+        .get_all_events()
+        .await
+        .into_iter()
+        .find_map(|event| match event.payload {
+            EventType::SubmittedTransaction {
+                signature,
+                transaction,
+                purpose: TransactionPurpose::SweepSplDeposits { deposit_ids },
+                ..
+            } if deposit_ids == [deposit_id] => Some((signature, transaction)),
+            _ => None,
+        })
+        .expect("the SPL sweep timer should submit the queued deposit")
+}
+
+/// Runs the finalization timer and reports the sweep as finalized with the full token
+/// transfer. The finalization calls use RPC IDs `start_id` to `start_id + 15`.
+pub async fn finalize_sweep(
+    setup: &Setup,
+    signature: &Signature,
+    transaction: VersionedTransactionMessage,
+    owner: &Address,
+    token_program: &Address,
+    start_id: u64,
+) {
+    setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
+    setup
+        .execute_http_mocks(
+            MockBuilder::with_start_id(start_id)
+                .finalize_transaction(SUBMISSION_BLOCK_HEIGHT)
+                .get_transaction(
+                    signature,
+                    sweep_transaction_response(signature, transaction, owner, token_program),
+                )
+                .build(),
+        )
+        .await;
+}
+
+/// Runs the mint timer and enough PocketIC rounds to complete the ledger calls.
+pub async fn run_mint_timer(setup: &Setup) {
+    setup.advance_time(PROCESS_PENDING_MINTS_DELAY).await;
+    for _ in 0..10 {
+        setup.tick().await;
+    }
 }
