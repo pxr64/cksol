@@ -30,7 +30,7 @@ use spl_token_interface::state::Mint;
 
 pub const MINT: Address = address!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 pub const DECIMALS: u8 = 6;
-const MINIMUM_DEPOSIT_AMOUNT: u64 = 1_000_000;
+pub const MINIMUM_DEPOSIT_AMOUNT: u64 = 1_000_000;
 pub const BALANCE_ABOVE_MINIMUM: u64 = MINIMUM_DEPOSIT_AMOUNT + 1;
 pub const RENT_EXEMPT_LAMPORTS: Lamport = 2_039_280;
 
@@ -70,8 +70,30 @@ fn mint_data() -> Vec<u8> {
     data
 }
 
-/// Both token programs share the base layout, so one builder serves both.
 pub fn token_account_data(owner: &Address, extensions: &[ExtensionType]) -> Vec<u8> {
+    token_account(
+        owner,
+        extensions,
+        BALANCE_ABOVE_MINIMUM,
+        AccountState::Initialized,
+    )
+}
+
+pub fn token_account_data_with_amount(owner: &Address, amount: u64) -> Vec<u8> {
+    token_account(owner, &[], amount, AccountState::Initialized)
+}
+
+pub fn frozen_token_account_data(owner: &Address) -> Vec<u8> {
+    token_account(owner, &[], BALANCE_ABOVE_MINIMUM, AccountState::Frozen)
+}
+
+/// Both token programs share the base layout, so one builder serves both.
+fn token_account(
+    owner: &Address,
+    extensions: &[ExtensionType],
+    amount: u64,
+    state: AccountState,
+) -> Vec<u8> {
     let mut data =
         vec![0; ExtensionType::try_calculate_account_len::<TokenAccount>(extensions).unwrap()];
     let mut account =
@@ -87,13 +109,26 @@ pub fn token_account_data(owner: &Address, extensions: &[ExtensionType]) -> Vec<
     account.base = TokenAccount {
         mint: MINT.to_bytes().into(),
         owner: owner.to_bytes().into(),
-        amount: BALANCE_ABOVE_MINIMUM,
-        state: AccountState::Initialized,
+        amount,
+        state,
         ..TokenAccount::default()
     };
     account.pack_base();
     account.init_account_type().unwrap();
     data
+}
+
+/// Installs a token ledger and registers the mint on it. The mint account read uses
+/// RPC IDs 0 to 3.
+pub async fn setup_with_registered_mint(token_program: Address) -> Setup {
+    let setup = SetupBuilder::new()
+        .with_proxy_canister()
+        .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
+        .build()
+        .await;
+    let ledger = setup.install_spl_ledger(DECIMALS).await;
+    register_token(&setup, ledger.canister_id(), token_program).await;
+    setup
 }
 
 pub async fn register_token(setup: &Setup, ledger_id: Principal, token_program: Address) {
