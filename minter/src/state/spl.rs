@@ -1,7 +1,7 @@
 use candid::Principal;
 use cksol_types::{AddSplTokenArgs, AddSplTokenError};
 use minicbor::{Decode, Encode};
-use solana_address::Address;
+use solana_address::{Address, address};
 
 /// The Solana program that owns a mint and its token accounts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decode, Encode)]
@@ -12,11 +12,13 @@ pub enum TokenProgram {
     Token2022,
 }
 
+const TOKEN_2022_PROGRAM_ID: Address = address!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
 impl TokenProgram {
     pub fn id(self) -> Address {
         match self {
             Self::Classic => spl_token_interface::id().to_bytes().into(),
-            Self::Token2022 => spl_token_2022_interface::id().to_bytes().into(),
+            Self::Token2022 => TOKEN_2022_PROGRAM_ID,
         }
     }
 }

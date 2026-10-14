@@ -4,6 +4,10 @@ use crate::{
         GET_SIGNATURE_STATUSES_CYCLES, GET_TRANSACTION_CYCLES, MAX_HTTP_OUTCALL_RESPONSE_BYTES,
     },
     runtime::CanisterRuntime,
+    spl::token_2022::{
+        TOKEN_2022_ACCOUNT_TYPE_ACCOUNT, TOKEN_2022_EXTENSION_IMMUTABLE_OWNER,
+        TOKEN_2022_EXTENSION_MEMO_TRANSFER, split_token_2022_account, token_2022_extensions,
+    },
     state::{TokenProgram, read_state},
 };
 use cksol_types::{DepositSolError, DepositSplError};
@@ -21,13 +25,6 @@ use solana_program_pack::Pack;
 use solana_signature::Signature;
 use solana_transaction::Transaction;
 use solana_transaction_status_client_types::EncodedConfirmedTransactionWithStatusMeta;
-use spl_token_2022_interface::{
-    extension::{
-        BaseStateWithExtensions, ExtensionType, StateWithExtensions,
-        immutable_owner::ImmutableOwner, memo_transfer::MemoTransfer,
-    },
-    state::Account as Token2022Account,
-};
 use spl_token_interface::state::Account as TokenAccount;
 use thiserror::Error;
 
@@ -182,18 +179,10 @@ pub async fn get_spl_token_account<R: CanisterRuntime>(
         .map_err(GetSplTokenBalanceError::InvalidTokenAccount)?;
     let account = match token_program {
         TokenProgram::Token2022 => parse_token_2022_account(&data)?,
-        TokenProgram::Classic => {
-            let account = TokenAccount::unpack(&data)
-                .map_err(|error| GetSplTokenBalanceError::InvalidTokenAccount(error.to_string()))?;
-            SplTokenAccount {
-                owner: account.owner.to_bytes().into(),
-                mint: account.mint.to_bytes().into(),
-                amount: account.amount,
-                frozen: account.is_frozen(),
-            }
-        }
+        TokenProgram::Classic => TokenAccount::unpack(&data)
+            .map_err(|error| GetSplTokenBalanceError::InvalidTokenAccount(error.to_string()))?,
     };
-    Ok(Some(account))
+    Ok(Some(account.into()))
 }
 
 /// The fields of a token account that the minter checks.
@@ -204,6 +193,17 @@ pub struct SplTokenAccount {
     /// The amount in the mint's smallest units.
     pub amount: u64,
     pub frozen: bool,
+}
+
+impl From<TokenAccount> for SplTokenAccount {
+    fn from(account: TokenAccount) -> Self {
+        Self {
+            owner: account.owner.to_bytes().into(),
+            mint: account.mint.to_bytes().into(),
+            amount: account.amount,
+            frozen: account.is_frozen(),
+        }
+    }
 }
 
 impl SplTokenAccount {
@@ -223,37 +223,31 @@ impl SplTokenAccount {
     }
 }
 
-fn parse_token_2022_account(data: &[u8]) -> Result<SplTokenAccount, GetSplTokenBalanceError> {
-    let account = StateWithExtensions::<Token2022Account>::unpack(data)
+fn parse_token_2022_account(data: &[u8]) -> Result<TokenAccount, GetSplTokenBalanceError> {
+    let (base, tlv) =
+        split_token_2022_account(data, TokenAccount::LEN, TOKEN_2022_ACCOUNT_TYPE_ACCOUNT)
+            .map_err(GetSplTokenBalanceError::InvalidTokenAccount)?;
+    let account = TokenAccount::unpack(base)
         .map_err(|error| GetSplTokenBalanceError::InvalidTokenAccount(error.to_string()))?;
-    for extension in account
-        .get_extension_types()
-        .map_err(|error| GetSplTokenBalanceError::InvalidTokenAccount(error.to_string()))?
+    for (extension, value) in
+        token_2022_extensions(tlv).map_err(GetSplTokenBalanceError::InvalidTokenAccount)?
     {
-        match extension {
-            ExtensionType::ImmutableOwner => {
-                account.get_extension::<ImmutableOwner>().map_err(|error| {
-                    GetSplTokenBalanceError::InvalidTokenAccount(error.to_string())
-                })?;
-            }
-            ExtensionType::MemoTransfer => {
-                account.get_extension::<MemoTransfer>().map_err(|error| {
-                    GetSplTokenBalanceError::InvalidTokenAccount(error.to_string())
-                })?;
-            }
+        let value_len = match extension {
+            TOKEN_2022_EXTENSION_IMMUTABLE_OWNER => 0,
+            TOKEN_2022_EXTENSION_MEMO_TRANSFER => 1,
             _ => {
                 return Err(GetSplTokenBalanceError::InvalidTokenAccount(
                     "Unsupported Token-2022 token account extension".to_string(),
                 ));
             }
+        };
+        if value.len() != value_len {
+            return Err(GetSplTokenBalanceError::InvalidTokenAccount(
+                "Invalid Token-2022 extension length".to_string(),
+            ));
         }
     }
-    Ok(SplTokenAccount {
-        owner: account.base.owner.to_bytes().into(),
-        mint: account.base.mint.to_bytes().into(),
-        amount: account.base.amount,
-        frozen: account.base.is_frozen(),
-    })
+    Ok(account)
 }
 
 /// Reads the finalized state of an account. A missing account is `None`.

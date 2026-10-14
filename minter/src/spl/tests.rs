@@ -11,9 +11,12 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use cksol_types::DepositSplError;
 use ic_stable_structures::Storable;
 use sol_rpc_types::{AccountData, AccountEncoding, AccountInfo, MultiRpcResult};
-use spl_token_2022_interface::extension::{
-    BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
-    mint_close_authority::MintCloseAuthority,
+use spl_token_2022_interface::{
+    extension::{
+        BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+        mint_close_authority::MintCloseAuthority,
+    },
+    state::Mint as Mint2022,
 };
 
 fn args() -> AddSplTokenArgs {

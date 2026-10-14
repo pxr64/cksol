@@ -9,11 +9,10 @@ use crate::{
 use candid::Principal;
 use cksol_types::{AddSplTokenArgs, AddSplTokenError};
 use solana_program_pack::Pack;
-use spl_token_2022_interface::{
-    extension::{BaseStateWithExtensions, StateWithExtensions},
-    state::Mint as Mint2022,
-};
 use spl_token_interface::state::Mint;
+use token_2022::{TOKEN_2022_ACCOUNT_TYPE_MINT, split_token_2022_account, token_2022_extensions};
+
+pub mod token_2022;
 
 #[cfg(test)]
 mod tests;
@@ -79,17 +78,20 @@ fn validate_config(
 fn validate_mint_data(data: &[u8], token: &SupportedSplToken) -> Result<(), AddSplTokenError> {
     let decimals = match token.token_program {
         TokenProgram::Token2022 => {
-            let mint = StateWithExtensions::<Mint2022>::unpack(data)
+            let (base, tlv) =
+                split_token_2022_account(data, Mint::LEN, TOKEN_2022_ACCOUNT_TYPE_MINT)
+                    .map_err(AddSplTokenError::InvalidToken)?;
+            let mint = Mint::unpack(base)
                 .map_err(|error| AddSplTokenError::InvalidToken(error.to_string()))?;
-            let extensions = mint
-                .get_extension_types()
-                .map_err(|error| AddSplTokenError::InvalidToken(error.to_string()))?;
-            if !extensions.is_empty() {
+            if !token_2022_extensions(tlv)
+                .map_err(AddSplTokenError::InvalidToken)?
+                .is_empty()
+            {
                 return Err(AddSplTokenError::InvalidToken(
                     "Token-2022 mint extensions are not supported".to_string(),
                 ));
             }
-            mint.base.decimals
+            mint.decimals
         }
         TokenProgram::Classic => {
             Mint::unpack(data)

@@ -348,19 +348,19 @@ impl SplSweep {
                     ),
                 );
             }
-            instructions.push(
-                spl_token_2022_interface::instruction::transfer_checked(
-                    &token_program.to_bytes().into(),
-                    &deposit.address.to_bytes().into(),
-                    &deposit.mint.to_bytes().into(),
-                    &destination.to_bytes().into(),
-                    &transfer.owner.to_bytes().into(),
-                    &[],
-                    deposit.balance,
-                    transfer.decimals,
-                )
-                .expect("BUG: supported SPL token program must accept transfer_checked"),
-            );
+            let mut transfer_checked = spl_token_interface::instruction::transfer_checked(
+                &spl_token_interface::id(),
+                &deposit.address.to_bytes().into(),
+                &deposit.mint.to_bytes().into(),
+                &destination.to_bytes().into(),
+                &transfer.owner.to_bytes().into(),
+                &[],
+                deposit.balance,
+                transfer.decimals,
+            )
+            .expect("BUG: the classic SPL token program accepts transfer_checked");
+            transfer_checked.program_id = token_program.to_bytes().into();
+            instructions.push(transfer_checked);
         }
         Message::new_with_blockhash(&instructions, Some(&self.minter_address), &recent_blockhash)
     }
