@@ -1,4 +1,4 @@
-use super::QueueCursor;
+use super::{QueueCursor, QueueCursors};
 use proptest::{collection::btree_set, option, prelude::*};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,6 +39,26 @@ fn should_continue_after_a_removed_cursor_key() {
     cursor.advance(3);
 
     assert_eq!(keys(cursor.round(&queue, 2)), [4, 5]);
+}
+
+#[test]
+fn should_keep_a_cursor_per_queue() {
+    let cursors: QueueCursors<u8, u64> = QueueCursors::new();
+    let first = queue([1, 2, 3]);
+    let second = queue([1, 2, 3]);
+
+    cursors.advance(0, 2);
+    assert_eq!(keys(cursors.round(0, &first, 2)), [3, 1]);
+    assert_eq!(keys(cursors.round(1, &second, 2)), [1, 2]);
+
+    cursors.clear(0);
+    cursors.advance(1, 3);
+    assert_eq!(keys(cursors.round(0, &first, 2)), [1, 2]);
+    assert_eq!(keys(cursors.round(1, &second, 2)), [1, 2]);
+
+    cursors.advance(1, 1);
+    cursors.reset();
+    assert_eq!(keys(cursors.round(1, &second, 2)), [1, 2]);
 }
 
 #[test]

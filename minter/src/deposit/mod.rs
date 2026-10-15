@@ -1,5 +1,9 @@
 mod finalize;
 mod mint;
-pub use mint::reset_cursors;
 pub mod spl;
 pub mod sweep;
+
+pub fn reset_cursors() {
+    mint::reset_cursors();
+    finalize::reset_cursors();
+}

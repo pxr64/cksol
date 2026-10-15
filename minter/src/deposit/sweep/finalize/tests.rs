@@ -154,6 +154,72 @@ async fn should_keep_deposits_finalized_until_the_outcome_can_be_read() {
 }
 
 #[tokio::test]
+async fn should_credit_a_later_sweep_after_a_round_of_unavailable_outcomes() {
+    for deviation in 0..3 {
+        setup();
+        let healthy_signature = finalize_devnet_sweep_with_signature(MAX_CONCURRENT_RPC_CALLS);
+        for index in 0..MAX_CONCURRENT_RPC_CALLS {
+            let deposit_id = (devnet_sweep::DEPOSITS.len() + index) as DepositSolId;
+            queue_deposit(deposit_id, account(deposit_id as usize + 1), 25_000_000);
+            let signature = signature(index);
+            submit_sweep(signature, vec![deposit_id]);
+            succeed_transaction(signature);
+        }
+        let unavailable = || match deviation {
+            0 => GetTransactionResult::Consistent(Ok(None)),
+            1 => GetTransactionResult::Inconsistent(vec![]),
+            _ => {
+                let mut outcome = devnet_sweep::outcome();
+                outcome.transaction.meta = None;
+                transaction_response(outcome)
+            }
+        };
+        let mut first = TestCanisterRuntime::new().with_increasing_time();
+        for _ in 0..MAX_CONCURRENT_RPC_CALLS {
+            first = first.add_stub_response(unavailable());
+        }
+        assert!(!credit_finalized_sweeps(&first).await);
+        let first_calls = first.sent_update_calls();
+        assert_eq!(first_calls.len(), MAX_CONCURRENT_RPC_CALLS);
+
+        let mut second = runtime_returning(devnet_sweep::outcome());
+        for _ in 1..MAX_CONCURRENT_RPC_CALLS {
+            second = second.add_stub_response(unavailable());
+        }
+        assert!(credit_finalized_sweeps(&second).await);
+        assert_eq!(second.sent_update_calls().len(), MAX_CONCURRENT_RPC_CALLS);
+        assert_eq!(
+            second.sent_update_calls()[1..],
+            first_calls[..MAX_CONCURRENT_RPC_CALLS - 1]
+        );
+        EventsAssert::from_recorded().expect_contains_event_eq(EventType::CreditedSweep {
+            signature: healthy_signature,
+            amount_received: devnet_sweep::AMOUNT_RECEIVED,
+            mints: devnet_sweep::mints(),
+        });
+        read_state(|state| {
+            assert_eq!(state.deposits().finalized().len(), MAX_CONCURRENT_RPC_CALLS);
+            assert_eq!(
+                state.deposits().pending_mints().len(),
+                devnet_sweep::DEPOSITS.len()
+            );
+            assert!(state.deposits().quarantined().is_empty());
+        });
+
+        let mut third = TestCanisterRuntime::new().with_increasing_time();
+        for _ in 0..MAX_CONCURRENT_RPC_CALLS {
+            third = third.add_stub_response(unavailable());
+        }
+        assert!(!credit_finalized_sweeps(&third).await);
+        let expected: Vec<_> = std::iter::once(first_calls.last().unwrap())
+            .chain(first_calls[..MAX_CONCURRENT_RPC_CALLS - 1].iter())
+            .cloned()
+            .collect();
+        assert_eq!(third.sent_update_calls(), expected);
+    }
+}
+
+#[tokio::test]
 async fn should_quarantine_deposits_if_the_outcome_does_not_match_the_plan() {
     setup();
     let sweep_signature = finalize_devnet_sweep();
@@ -190,11 +256,15 @@ fn setup() {
 
 /// Queues the deposits of the devnet sweep, submits it and finalizes it.
 fn finalize_devnet_sweep() -> Signature {
+    finalize_devnet_sweep_with_signature(DEVNET_SWEEP_SIGNATURE_INDEX)
+}
+
+fn finalize_devnet_sweep_with_signature(index: usize) -> Signature {
     let deposits = devnet_sweep::deposits();
     for (deposit_id, deposit) in &deposits {
         queue(*deposit_id, *deposit);
     }
-    let sweep_signature = signature(DEVNET_SWEEP_SIGNATURE_INDEX);
+    let sweep_signature = signature(index);
     submit_sweep_to(
         sweep_signature,
         deposits.iter().map(|(deposit_id, _)| *deposit_id).collect(),

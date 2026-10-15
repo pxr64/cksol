@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    constants::MAX_CONCURRENT_RPC_CALLS,
     lifecycle,
     monitor::finalize_transactions,
     state::{
@@ -203,6 +204,80 @@ async fn should_retry_unavailable_or_unreadable_spl_outcomes_later() {
             assert!(state.spl_deposits().pending_mints().is_empty());
             assert!(state.spl_deposits().quarantined().is_empty());
         });
+    }
+}
+
+#[tokio::test]
+async fn should_credit_a_later_sweep_after_a_round_of_unavailable_outcomes() {
+    for deviation in 0..3 {
+        setup();
+        let sweeps: Vec<_> = (0..=MAX_CONCURRENT_RPC_CALLS).map(finalize_sweep).collect();
+        let (healthy_signature, healthy_sweep) = sweeps.last().unwrap();
+        let unavailable = || match deviation {
+            0 => GetTransactionResult::Consistent(Ok(None)),
+            1 => GetTransactionResult::Inconsistent(vec![]),
+            _ => {
+                let mut outcome = balanced_outcome(&sweeps[0].1, Hash::default(), false);
+                outcome.transaction.meta = None;
+                response(outcome)
+            }
+        };
+        let mut first = runtime();
+        for _ in 0..MAX_CONCURRENT_RPC_CALLS {
+            first = first.add_stub_response(unavailable());
+        }
+        assert!(!credit_finalized_spl_sweeps(&first).await);
+        let first_calls = first.sent_update_calls();
+        assert_eq!(first_calls.len(), MAX_CONCURRENT_RPC_CALLS);
+        assert_replay_matches();
+
+        let mut second = runtime().add_stub_response(response(balanced_outcome(
+            healthy_sweep,
+            Hash::default(),
+            false,
+        )));
+        for _ in 1..MAX_CONCURRENT_RPC_CALLS {
+            second = second.add_stub_response(unavailable());
+        }
+        assert!(credit_finalized_spl_sweeps(&second).await);
+        assert_eq!(second.sent_update_calls().len(), MAX_CONCURRENT_RPC_CALLS);
+        assert_eq!(
+            second.sent_update_calls()[1..],
+            first_calls[..MAX_CONCURRENT_RPC_CALLS - 1]
+        );
+        EventsAssert::from_recorded().expect_contains_event_eq(EventType::CreditedSplSweep {
+            signature: *healthy_signature,
+            lamports_spent: 5_000,
+            mints: healthy_sweep
+                .deposits()
+                .iter()
+                .map(|(id, deposit)| CreditedSplDeposit {
+                    deposit_id: *id,
+                    amount_to_mint: deposit.balance,
+                })
+                .collect(),
+        });
+        read_state(|state| {
+            assert_eq!(
+                state.spl_deposits().finalized().len(),
+                MAX_CONCURRENT_RPC_CALLS
+            );
+            assert_eq!(state.spl_deposits().pending_mints().len(), 2);
+            assert!(state.spl_deposits().quarantined().is_empty());
+        });
+        assert_replay_matches();
+
+        let mut third = runtime();
+        for _ in 0..MAX_CONCURRENT_RPC_CALLS {
+            third = third.add_stub_response(unavailable());
+        }
+        assert!(!credit_finalized_spl_sweeps(&third).await);
+        let expected: Vec<_> = std::iter::once(first_calls.last().unwrap())
+            .chain(first_calls[..MAX_CONCURRENT_RPC_CALLS - 1].iter())
+            .cloned()
+            .collect();
+        assert_eq!(third.sent_update_calls(), expected);
+        assert_replay_matches();
     }
 }
 

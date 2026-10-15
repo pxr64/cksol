@@ -1,6 +1,5 @@
 use crate::{
-    constants::MAX_CONCURRENT_RPC_CALLS,
-    deposit::finalize::credit_finalized_sweep_round,
+    deposit::finalize::{FinalizedQueue, credit_finalized_sweep_round},
     runtime::CanisterRuntime,
     state::{SplSweep, event::EventType},
 };
@@ -13,17 +12,8 @@ mod tests;
 pub async fn credit_finalized_spl_sweeps<R: CanisterRuntime>(runtime: &R) -> bool {
     credit_finalized_sweep_round(
         runtime,
-        |state| {
-            let finalized = state.spl_deposits().finalized();
-            (
-                finalized.len(),
-                finalized
-                    .iter()
-                    .take(MAX_CONCURRENT_RPC_CALLS)
-                    .map(|(signature, sweep)| (*signature, sweep.clone()))
-                    .collect(),
-            )
-        },
+        FinalizedQueue::Spl,
+        |state| state.spl_deposits().finalized().by_signature(),
         |signature, sweep: SplSweep, outcome| {
             let settled = sweep.settle(outcome)?;
             Ok(EventType::CreditedSplSweep {

@@ -31,6 +31,10 @@ pub struct SplSweeps {
 }
 
 impl SplSweeps {
+    pub fn by_signature(&self) -> &BTreeMap<Signature, SplSweep> {
+        &self.by_signature
+    }
+
     pub fn get(&self, signature: &Signature) -> Option<&SplSweep> {
         self.by_signature.get(signature)
     }

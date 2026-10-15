@@ -32,6 +32,10 @@ pub struct Sweeps {
 }
 
 impl Sweeps {
+    pub fn by_signature(&self) -> &BTreeMap<Signature, Sweep> {
+        &self.by_signature
+    }
+
     pub fn get(&self, signature: &Signature) -> Option<&Sweep> {
         self.by_signature.get(signature)
     }
