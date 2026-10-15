@@ -1,4 +1,5 @@
 use super::*;
+use crate::constants::{FEE_PER_SIGNATURE, RENT_EXEMPTION_THRESHOLD, TOKEN_ACCOUNT_RENT_EXEMPTION};
 use crate::sol_transfer::{MAX_SIGNATURES, MAX_TX_SIZE};
 use crate::{
     address::account_address,
@@ -11,7 +12,8 @@ use crate::{
     },
     storage::{reset_events, with_event_iter},
     test_fixtures::{
-        DEFAULT_BLOCK_HEIGHT, EventsAssert, account, confirmed_block,
+        DEFAULT_BLOCK_HEIGHT, EventsAssert, MINIMUM_WITHDRAWAL_AMOUNT, account, confirmed_block,
+        durable_nonce, events, init_args_with_nonce_account, init_balance_to,
         minter_public_key_fetched_event, minter_signature, minter_signature_nth,
         queued_spl_deposit,
         runtime::TestCanisterRuntime,
@@ -191,6 +193,93 @@ async fn should_drop_frozen_single_sweep_and_allow_a_new_deposit_request() {
             Some(1)
         );
     });
+}
+
+#[test]
+fn should_take_only_the_sweeps_the_balance_covers() {
+    // A lone deposit costs two signatures and one treasury account, above the rent floor.
+    let single_sweep = 2 * FEE_PER_SIGNATURE + TOKEN_ACCOUNT_RENT_EXEMPTION;
+    queue_deposits_with_balance(
+        3,
+        false,
+        false,
+        Some(TokenProgram::Classic),
+        RENT_EXEMPTION_THRESHOLD + single_sweep,
+    );
+
+    let round = read_state(|state| SweepRound::take_from_queue(state, &schnorr_master_key()));
+
+    assert!(round.retries.is_empty());
+    assert_eq!(round.batches.len(), 1);
+    assert_eq!(round.batches[0].deposits().len(), 1);
+    assert!(round.leaves_deposits_queued);
+
+    queue_deposits_with_balance(
+        1,
+        false,
+        false,
+        Some(TokenProgram::Classic),
+        RENT_EXEMPTION_THRESHOLD + single_sweep - 1,
+    );
+
+    let round = read_state(|state| SweepRound::take_from_queue(state, &schnorr_master_key()));
+
+    assert!(round.retries.is_empty());
+    assert!(round.batches.is_empty());
+    assert!(round.leaves_deposits_queued);
+}
+
+#[tokio::test]
+async fn should_leave_deposits_queued_when_a_withdrawal_takes_the_balance_during_signing() {
+    // The balance covers the sweep, until the withdrawal is created during the signing.
+    let single_sweep = 2 * FEE_PER_SIGNATURE + TOKEN_ACCOUNT_RENT_EXEMPTION;
+    queue_deposits_with_balance(
+        1,
+        true,
+        false,
+        Some(TokenProgram::Classic),
+        RENT_EXEMPTION_THRESHOLD + single_sweep,
+    );
+    events::accept_withdrawal(account(9), 1, MINIMUM_WITHDRAWAL_AMOUNT);
+    let before = EventsAssert::from_recorded();
+    let runtime = signing_runtime().add_recent_block(Ok(block().slot));
+
+    let mut round = Box::pin(sweep_queued_spl_deposits(runtime.clone()));
+    // The round suspends in the two block reads, after it selected the sweep.
+    for _ in 0..2 {
+        assert!(futures::poll!(round.as_mut()).is_pending());
+    }
+    events::create_withdrawal_batch_transaction(durable_nonce(1), vec![1]);
+    round.await;
+
+    // Only the withdrawal creation was recorded: the signed sweep was neither recorded nor sent.
+    assert_eq!(EventsAssert::from_recorded().len(), before.len() + 1);
+    assert!(
+        runtime
+            .sent_update_calls()
+            .iter()
+            .all(|call| call.method != "sendTransaction")
+    );
+    assert_eq!(runtime.set_timer_call_count(), 0);
+    read_state(|state| {
+        assert_eq!(state.spl_deposits().queued().len(), 1);
+        assert!(state.spl_deposits().swept().is_empty());
+        assert!(state.submitted_transactions().is_empty());
+    });
+}
+
+#[tokio::test]
+async fn should_not_fetch_a_block_when_the_balance_covers_no_sweep() {
+    queue_deposits_with_balance(1, false, false, Some(TokenProgram::Classic), 0);
+    let before = EventsAssert::from_recorded();
+    let runtime = TestCanisterRuntime::new();
+
+    sweep_queued_spl_deposits(runtime.clone()).await;
+
+    assert_eq!(EventsAssert::from_recorded(), before);
+    assert!(runtime.sent_update_calls().is_empty());
+    assert_eq!(runtime.set_timer_call_count(), 0);
+    assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
 }
 
 #[test]
@@ -639,7 +728,7 @@ fn assert_submission_is_tracked(sweep: &SplSweep, block: Block) {
             }
         );
         assert!(state.failed_transactions().is_empty());
-        assert!(state.succeeded_transactions().is_empty());
+        assert!(!state.succeeded_transactions().contains(&minter_signature()));
         for (deposit_id, deposit) in sweep.deposits() {
             assert_eq!(
                 state
@@ -773,9 +862,27 @@ fn queue_deposits(
     same_mint: bool,
     token_program: Option<TokenProgram>,
 ) {
+    queue_deposits_with_balance(count, same_owner, same_mint, token_program, BALANCE);
+}
+
+/// One SOL covers every round of these tests.
+const BALANCE: u64 = 1_000_000_000;
+
+fn queue_deposits_with_balance(
+    count: usize,
+    same_owner: bool,
+    same_mint: bool,
+    token_program: Option<TokenProgram>,
+    balance: u64,
+) {
+    reset_state();
+    reset_events();
     let runtime = TestCanisterRuntime::new().with_increasing_time();
-    lifecycle::init(valid_init_args(), runtime.clone());
+    lifecycle::init(init_args_with_nonce_account(), runtime.clone());
     mutate_state(|state| process_event(state, minter_public_key_fetched_event(), &runtime));
+    if balance > 0 {
+        init_balance_to(balance);
+    }
     for id in 0..count {
         let mint: solana_address::Address = if same_mint {
             [1; 32]
@@ -964,6 +1071,7 @@ fn should_limit_distinct_owners_and_mints_by_actual_size() {
 fn should_pack_more_deposits_when_owners_and_mints_are_shared() {
     let runtime = TestCanisterRuntime::new().with_increasing_time();
     lifecycle::init(valid_init_args(), runtime.clone());
+    init_balance_to(BALANCE);
     for mint_index in 0..4 {
         let mint = [mint_index as u8 + 1; 32].into();
         let token_program = if mint_index % 2 == 0 {

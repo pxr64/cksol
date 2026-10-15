@@ -1,6 +1,6 @@
 use crate::{
     address::{account_address, associated_token_address, minter_address},
-    constants::FEE_PER_SIGNATURE,
+    constants::{FEE_PER_SIGNATURE, TOKEN_ACCOUNT_RENT_EXEMPTION},
     state::{
         QueuedSplDeposit, SchnorrPublicKey, SupportedSplToken, SweepMismatch, SweepSettlementError,
         TokenProgram, UnreadableOutcome,
@@ -335,7 +335,6 @@ impl SplSweep {
             .collect()
     }
 
-    /// One destination account creation per token, followed by each planned transfer.
     /// The fee of the sweep: one signature per account that signs it.
     pub fn transaction_fee(&self) -> Lamport {
         let signatures = self
@@ -345,6 +344,19 @@ impl SplSweep {
         FEE_PER_SIGNATURE * u64::from(signatures)
     }
 
+    /// The most the minter pays for the sweep: the fee of its signatures and the rent of every
+    /// treasury account it may create.
+    pub fn max_lamports_spent(&self) -> Lamport {
+        let treasury_accounts = self
+            .deposits
+            .values()
+            .map(|deposit| deposit.mint)
+            .collect::<BTreeSet<_>>()
+            .len();
+        self.transaction_fee() + TOKEN_ACCOUNT_RENT_EXEMPTION * treasury_accounts as u64
+    }
+
+    /// One destination account creation per token, followed by each planned transfer.
     pub fn sweep_message(&self, recent_blockhash: Hash) -> Message {
         let mut destinations = BTreeSet::new();
         let mut instructions = Vec::new();

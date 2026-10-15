@@ -925,8 +925,9 @@ pub mod devnet_sweep {
 /// All helpers operate on the global thread-local state via [`mutate_state`].
 pub mod events {
     use super::{
-        DEFAULT_BLOCK_HEIGHT, MINTER_ADDRESS, NONCE_ACCOUNT, WITHDRAWAL_FEE, devnet_sweep,
-        queued_deposit, queued_deposit_of, runtime::TestCanisterRuntime, withdrawal_batch_message,
+        DEFAULT_BLOCK_HEIGHT, MINTER_ADDRESS, NONCE_ACCOUNT, WITHDRAWAL_FEE, account, devnet_sweep,
+        queued_deposit, queued_deposit_of, queued_spl_deposit, runtime::TestCanisterRuntime,
+        schnorr_master_key, spl_token, withdrawal_batch_message,
     };
     use crate::deposit::sweep::deposit_status;
     use crate::{
@@ -934,7 +935,7 @@ pub mod events {
         rpc::BlockHeight,
         sol_transfer::build_batch_withdrawal_message,
         state::{
-            QueuedDeposit, Sweep,
+            QueuedDeposit, SplSweep, Sweep, TokenProgram,
             audit::process_event,
             event::{EventType, Signer, TransactionPurpose, WithdrawalRequest},
             mutate_state, read_state,
@@ -945,6 +946,7 @@ pub mod events {
     use sol_rpc_types::Lamport;
     use solana_address::Address;
     use solana_signature::Signature;
+    use std::collections::BTreeMap;
 
     /// The runtime is only used by [`process_event`] to supply timestamps
     /// for the state transition and for the event log entry.
@@ -1098,6 +1100,47 @@ pub mod events {
         mutate_state(|state| {
             process_event(state, EventType::QuarantinedSweep { signature }, &runtime())
         });
+    }
+
+    /// Registers a classic SPL token, queues one deposit of it and submits its sweep under
+    /// `signature`, which reserves the cost of the sweep from the balance.
+    pub fn submit_spl_sweep(signature: Signature) -> SplSweep {
+        let token = spl_token([0xA5; 32].into(), TokenProgram::Classic);
+        let deposit = queued_spl_deposit(account(0xA5), token.mint, TokenProgram::Classic);
+        let deposit_id = read_state(|state| state.spl_deposits().next_id());
+        let tokens = BTreeMap::from([(token.mint, token.clone())]);
+        let sweep = SplSweep::plan(
+            [(deposit_id, deposit.clone())],
+            &tokens,
+            &schnorr_master_key(),
+        );
+        let message = sweep.sweep_message(solana_hash::Hash::default());
+        let signers = sweep.signers(&message);
+        mutate_state(|state| {
+            for event in [
+                EventType::AddedSplToken(token),
+                EventType::QueuedSplDeposit {
+                    deposit_id,
+                    account: deposit.account,
+                    mint: deposit.mint,
+                    address: deposit.address,
+                    balance: deposit.balance,
+                    fee: deposit.fee,
+                },
+                EventType::SubmittedTransaction {
+                    signature,
+                    message: message.into(),
+                    signers,
+                    purpose: TransactionPurpose::SweepSplDeposits {
+                        deposit_ids: vec![deposit_id],
+                        block_height: DEFAULT_BLOCK_HEIGHT,
+                    },
+                },
+            ] {
+                process_event(state, event, &runtime());
+            }
+        });
+        sweep
     }
 
     pub fn accept_withdrawal(account: Account, burn_index: u64, amount: Lamport) {

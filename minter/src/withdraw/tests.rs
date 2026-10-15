@@ -632,6 +632,35 @@ mod process_pending_withdrawals_tests {
     }
 
     #[tokio::test]
+    async fn should_skip_the_batch_when_an_spl_sweep_takes_the_balance_during_the_nonce_read() {
+        init_state();
+        init_schnorr_master_key();
+        // The balance covers the withdrawal, until the SPL sweep reserves all of it.
+        init_balance_to(
+            RENT_EXEMPTION_THRESHOLD + MINIMUM_WITHDRAWAL_AMOUNT - WITHDRAWAL_FEE
+                + FEE_PER_SIGNATURE,
+        );
+        events::accept_withdrawal(account(1), 1, MINIMUM_WITHDRAWAL_AMOUNT);
+        let events_before = EventsAssert::from_recorded();
+        let runtime = TestCanisterRuntime::new()
+            .with_increasing_time()
+            .add_stub_response(GetAccountInfoResult::Consistent(Ok(Some(
+                nonce_account_info(MINTER_ADDRESS, 1),
+            ))));
+
+        let mut round = Box::pin(process_pending_withdrawals(runtime));
+        // The round suspends in the nonce read, after it selected the batch.
+        assert!(futures::poll!(round.as_mut()).is_pending());
+        events::submit_spl_sweep(signature(0xA5));
+        round.await;
+
+        // Only the three events of the SPL sweep were recorded.
+        assert_eq!(EventsAssert::from_recorded().len(), events_before.len() + 3);
+        assert_eq!(withdrawal_status(1), WithdrawSolStatus::Pending);
+        assert_nonce_account_free();
+    }
+
+    #[tokio::test]
     async fn should_skip_the_batch_when_the_nonce_read_is_stale() {
         init_state();
         init_balance();

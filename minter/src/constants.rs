@@ -95,3 +95,7 @@ pub const FEE_PER_SIGNATURE: u64 = 5_000;
 ///
 /// See <https://solana.com/docs/core/rent#rent-exempt-minimum>.
 pub const RENT_EXEMPTION_THRESHOLD: u64 = 890_880;
+
+/// Rent exemption of an associated token account at the larger Token-2022 size, with the
+/// immutable owner extension. Classic accounts need less; settlement returns the difference.
+pub const TOKEN_ACCOUNT_RENT_EXEMPTION: u64 = 2_074_080;

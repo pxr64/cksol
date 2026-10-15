@@ -1,7 +1,7 @@
 use super::*;
 use crate::state::MinterTransaction;
 use crate::{
-    constants::FEE_PER_SIGNATURE,
+    constants::{FEE_PER_SIGNATURE, TOKEN_ACCOUNT_RENT_EXEMPTION},
     lifecycle,
     state::{
         State, TokenProgram,
@@ -59,6 +59,20 @@ fn retry(deposits: &mut SplDeposits, deposit_id: u64, signature: &Signature) {
 fn submitted_spl_sweep() -> (TestCanisterRuntime, Signature, SplSweep) {
     let runtime = TestCanisterRuntime::new().with_increasing_time();
     lifecycle::init(valid_init_args(), runtime.clone());
+    let (signature, sweep) = submit_spl_sweep(&runtime);
+    (runtime, signature, sweep)
+}
+
+/// Submits the sweep with the balance of [`fund_minter`], so that it reserves its full cost.
+fn funded_spl_sweep() -> (TestCanisterRuntime, Signature, SplSweep, u64) {
+    let runtime = TestCanisterRuntime::new().with_increasing_time();
+    lifecycle::init(valid_init_args(), runtime.clone());
+    let balance = fund_minter();
+    let (signature, sweep) = submit_spl_sweep(&runtime);
+    (runtime, signature, sweep, balance)
+}
+
+fn submit_spl_sweep(runtime: &TestCanisterRuntime) -> (Signature, SplSweep) {
     let mut tokens = BTreeMap::new();
     let mut queued = Vec::new();
     for (deposit_id, token_program) in [TokenProgram::Classic, TokenProgram::Token2022]
@@ -68,7 +82,7 @@ fn submitted_spl_sweep() -> (TestCanisterRuntime, Signature, SplSweep) {
         let token = spl_token([deposit_id as u8 + 1; 32].into(), token_program);
         let deposit = queued_spl_deposit(account(1), token.mint, token_program);
         mutate_state(|state| {
-            process_event(state, EventType::AddedSplToken(token.clone()), &runtime);
+            process_event(state, EventType::AddedSplToken(token.clone()), runtime);
             process_event(
                 state,
                 EventType::QueuedSplDeposit {
@@ -79,7 +93,7 @@ fn submitted_spl_sweep() -> (TestCanisterRuntime, Signature, SplSweep) {
                     balance: deposit.balance,
                     fee: deposit.fee,
                 },
-                &runtime,
+                runtime,
             );
         });
         tokens.insert(token.mint, token);
@@ -101,10 +115,10 @@ fn submitted_spl_sweep() -> (TestCanisterRuntime, Signature, SplSweep) {
                     block_height: DEFAULT_BLOCK_HEIGHT,
                 },
             },
-            &runtime,
+            runtime,
         );
     });
-    (runtime, signature, sweep)
+    (signature, sweep)
 }
 
 fn assert_replay_matches_state() -> State {
@@ -168,11 +182,37 @@ mod credit_sweep {
         Vec<CreditedSplDeposit>,
     ) {
         let (runtime, signature, sweep) = submitted_spl_sweep();
+        finalize(&runtime, signature, sweep)
+    }
+
+    /// Finalizes a sweep that reserved its full cost, and returns the balance before that.
+    fn funded_finalized_sweep() -> (
+        TestCanisterRuntime,
+        Signature,
+        SplSweep,
+        Vec<CreditedSplDeposit>,
+        u64,
+    ) {
+        let (runtime, signature, sweep, balance) = funded_spl_sweep();
+        let (runtime, signature, sweep, mints) = finalize(&runtime, signature, sweep);
+        (runtime, signature, sweep, mints, balance)
+    }
+
+    fn finalize(
+        runtime: &TestCanisterRuntime,
+        signature: Signature,
+        sweep: SplSweep,
+    ) -> (
+        TestCanisterRuntime,
+        Signature,
+        SplSweep,
+        Vec<CreditedSplDeposit>,
+    ) {
         mutate_state(|state| {
             process_event(
                 state,
                 EventType::SucceededTransaction { signature },
-                &runtime,
+                runtime,
             )
         });
         let mints = sweep
@@ -183,7 +223,7 @@ mod credit_sweep {
                 amount_to_mint: deposit.balance,
             })
             .collect();
-        (runtime, signature, sweep, mints)
+        (runtime.clone(), signature, sweep, mints)
     }
 
     fn credit(signature: Signature, mints: Vec<CreditedSplDeposit>, spent: u64) {
@@ -202,11 +242,11 @@ mod credit_sweep {
 
     #[test]
     fn should_credit_and_replay_spl_sweep_with_spend_debited() {
-        let (_, signature, sweep, mints) = finalized_sweep();
-        let initial_balance = fund_minter();
+        let (_, signature, sweep, mints, initial_balance) = funded_finalized_sweep();
         credit(signature, mints, LAMPORTS_SPENT);
         let replayed = assert_replay_matches_state();
         assert_eq!(replayed.balance(), initial_balance - LAMPORTS_SPENT);
+        assert!(replayed.spl_sweep_reservations().is_empty());
         assert!(replayed.spl_deposits().finalized().is_empty());
         assert_eq!(
             replayed.spl_deposits().pending_mints().len(),
@@ -259,19 +299,36 @@ mod credit_sweep {
         credit(signature, mints, LAMPORTS_SPENT);
         let replayed = assert_replay_matches_state();
         assert_eq!(replayed.balance(), 0);
+        assert!(replayed.spl_sweep_reservations().is_empty());
         assert!(replayed.spl_deposits().finalized().is_empty());
         assert_eq!(replayed.spl_deposits().pending_mints().len(), 2);
     }
 
     #[test]
-    fn should_floor_tracked_balance_when_spl_sweep_spend_exceeds_it() {
-        let (_, signature, _, mints) = finalized_sweep();
-        let balance = fund_minter();
-        credit(signature, mints, balance + LAMPORTS_SPENT);
+    fn should_debit_the_spend_above_the_reservation() {
+        let (_, signature, sweep, mints, balance) = funded_finalized_sweep();
+        let spent = sweep.max_lamports_spent() + 1;
+        credit(signature, mints, spent);
         let replayed = assert_replay_matches_state();
-        assert_eq!(replayed.balance(), 0);
+        assert_eq!(replayed.balance(), balance - spent);
+        assert!(replayed.spl_sweep_reservations().is_empty());
         assert!(replayed.spl_deposits().finalized().is_empty());
         assert_eq!(replayed.spl_deposits().pending_mints().len(), 2);
+    }
+
+    #[test]
+    fn should_keep_the_reservation_of_a_quarantined_spl_sweep() {
+        let (runtime, signature, sweep, _, balance) = funded_finalized_sweep();
+        mutate_state(|state| {
+            process_event(
+                state,
+                EventType::QuarantinedSplSweep { signature },
+                &runtime,
+            )
+        });
+        let replayed = assert_replay_matches_state();
+        assert_eq!(replayed.balance(), balance - sweep.max_lamports_spent());
+        assert!(replayed.spl_sweep_reservations().is_empty());
     }
 
     #[test]
@@ -481,12 +538,43 @@ fn should_split_and_replay_failed_spl_batch_without_releasing_accounts() {
 }
 
 #[test]
-fn should_debit_the_fee_of_a_failed_spl_sweep() {
+fn should_reserve_the_maximum_cost_of_a_submitted_spl_sweep() {
+    let (_, signature, sweep, balance) = funded_spl_sweep();
+    let treasury_accounts = sweep
+        .deposits()
+        .values()
+        .map(|deposit| deposit.mint)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64;
+    let expected = 2 * FEE_PER_SIGNATURE + treasury_accounts * TOKEN_ACCOUNT_RENT_EXEMPTION;
+
+    assert_eq!(sweep.max_lamports_spent(), expected);
+    let replayed = assert_replay_matches_state();
+    assert_eq!(replayed.balance(), balance - expected);
+    assert_eq!(
+        replayed.spl_sweep_reservations(),
+        &BTreeMap::from([(signature, expected)])
+    );
+}
+
+#[test]
+fn should_reserve_no_more_than_the_balance() {
+    let (_, signature, _) = submitted_spl_sweep();
+
+    let replayed = assert_replay_matches_state();
+    assert_eq!(replayed.balance(), 0);
+    assert_eq!(
+        replayed.spl_sweep_reservations(),
+        &BTreeMap::from([(signature, 0)])
+    );
+}
+
+#[test]
+fn should_keep_only_the_fee_of_a_failed_spl_sweep_reserved() {
     for split in [false, true] {
         reset_state();
         reset_events();
-        let (runtime, signature, _) = submitted_spl_sweep();
-        let initial_balance = fund_minter();
+        let (runtime, signature, _, initial_balance) = funded_spl_sweep();
         let event = if split {
             EventType::SplitFailedSplSweep { signature }
         } else {
@@ -497,7 +585,22 @@ fn should_debit_the_fee_of_a_failed_spl_sweep() {
 
         let replayed = assert_replay_matches_state();
         assert_eq!(replayed.balance(), initial_balance - 2 * FEE_PER_SIGNATURE);
+        assert!(replayed.spl_sweep_reservations().is_empty());
     }
+}
+
+#[test]
+fn should_release_the_reservation_of_an_expired_spl_sweep() {
+    let (runtime, signature, _, initial_balance) = funded_spl_sweep();
+
+    mutate_state(|state| {
+        process_event(state, EventType::ExpiredTransaction { signature }, &runtime)
+    });
+
+    let replayed = assert_replay_matches_state();
+    assert_eq!(replayed.balance(), initial_balance);
+    assert!(replayed.spl_sweep_reservations().is_empty());
+    assert!(replayed.spl_deposits().swept().is_empty());
 }
 
 #[test]

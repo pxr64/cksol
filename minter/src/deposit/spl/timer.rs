@@ -15,7 +15,7 @@ use crate::{
 };
 use canlog::log;
 use cksol_types_internal::log::Priority;
-use sol_rpc_types::CommitmentLevel;
+use sol_rpc_types::{CommitmentLevel, Lamport};
 use solana_hash::Hash;
 use solana_signature::Signature;
 use std::collections::BTreeMap;
@@ -44,6 +44,20 @@ pub async fn sweep_queued_spl_deposits<R: CanisterRuntime>(runtime: R) {
             return;
         }
     };
+    let SweepRound {
+        retries,
+        batches,
+        leaves_deposits_queued,
+    } = read_state(|state| SweepRound::take_from_queue(state, &master_key));
+    // Deposits are waiting, so an empty round means the balance stopped the selection.
+    if retries.is_empty() && batches.is_empty() {
+        log!(
+            Priority::Info,
+            "The spendable balance of {} lamports does not cover the next SPL sweep",
+            read_state(|state| state.spendable_balance())
+        );
+        return;
+    }
     let block = match get_recent_block(&runtime, SWEEP_BLOCKHASH_COMMITMENT).await {
         Ok(block) => block,
         Err(error) => {
@@ -54,14 +68,6 @@ pub async fn sweep_queued_spl_deposits<R: CanisterRuntime>(runtime: R) {
             return;
         }
     };
-    let SweepRound {
-        retries,
-        batches,
-        leaves_deposits_queued,
-    } = read_state(|state| SweepRound::take_from_queue(state, &master_key));
-    if retries.is_empty() && batches.is_empty() {
-        return;
-    }
 
     let reschedule = scopeguard::guard(runtime.clone(), |runtime| {
         runtime.set_timer(Duration::ZERO, sweep_queued_spl_deposits);
@@ -87,6 +93,10 @@ pub async fn sweep_queued_spl_deposits<R: CanisterRuntime>(runtime: R) {
             Err(SweepError::SubmitTransactionFailed(error)) => log!(
                 Priority::Info,
                 "Failed to submit SPL sweep transaction (awaiting finalization): {error}"
+            ),
+            Err(SweepError::BalanceNoLongerCovers) => log!(
+                Priority::Info,
+                "The balance no longer covers a signed SPL sweep, leaving its deposits queued"
             ),
         }
     }))
@@ -121,26 +131,38 @@ struct SweepRound {
 
 impl SweepRound {
     /// Sweeps each retried deposit alone first, then fills the remaining slots of the round
-    /// with batches of queued deposits.
+    /// with batches of queued deposits, as far as the balance covers their cost.
     fn take_from_queue(state: &State, master_key: &SchnorrPublicKey) -> Self {
-        let retries = Self::take_retries(state, master_key, MAX_CONCURRENT_RPC_CALLS);
-        let batches =
-            Self::take_batches(state, master_key, MAX_CONCURRENT_RPC_CALLS - retries.len());
+        let mut balance = state.spendable_balance();
+        let retries = Self::take_retries(state, master_key, MAX_CONCURRENT_RPC_CALLS, &mut balance);
+        let batches = Self::take_batches(
+            state,
+            master_key,
+            MAX_CONCURRENT_RPC_CALLS - retries.len(),
+            &mut balance,
+        );
         let swept = retries
             .iter()
             .chain(&batches)
             .map(|sweep| sweep.deposits().len())
             .sum::<usize>();
+        let total_pending =
+            state.spl_deposits().queued().len() + state.spl_deposits().retrying().len();
         Self {
             retries,
             batches,
-            leaves_deposits_queued: swept
-                < (state.spl_deposits().queued().len() + state.spl_deposits().retrying().len()),
+            leaves_deposits_queued: swept < total_pending,
         }
     }
 
-    /// One sweep per retried deposit, in id order, up to the given number of sweeps.
-    fn take_retries(state: &State, master_key: &SchnorrPublicKey, slots: usize) -> Vec<SplSweep> {
+    /// One sweep per retried deposit, in id order, up to the given number of sweeps and as
+    /// far as the balance covers them.
+    fn take_retries(
+        state: &State,
+        master_key: &SchnorrPublicKey,
+        slots: usize,
+        balance: &mut Lamport,
+    ) -> Vec<SplSweep> {
         let mut retries = Vec::new();
         for (deposit_id, deposit) in state.spl_deposits().retrying().iter().take(slots) {
             let tokens = BTreeMap::from([(deposit.mint, registered_token(state, deposit))]);
@@ -149,14 +171,23 @@ impl SweepRound {
                 fits_in_one_transaction(&retry),
                 "BUG: SPL deposit {deposit_id} does not fit in a sweep of its own"
             );
+            let Some(remaining) = balance.checked_sub(retry.max_lamports_spent()) else {
+                break;
+            };
+            *balance = remaining;
             retries.push(retry);
         }
         retries
     }
 
-    /// Fills sweeps with queued deposits in id order up to the transaction limits, up to the
-    /// given number of sweeps.
-    fn take_batches(state: &State, master_key: &SchnorrPublicKey, slots: usize) -> Vec<SplSweep> {
+    /// Fills sweeps with queued deposits in id order up to the transaction limits and the
+    /// balance, up to the given number of sweeps.
+    fn take_batches(
+        state: &State,
+        master_key: &SchnorrPublicKey,
+        slots: usize,
+        balance: &mut Lamport,
+    ) -> Vec<SplSweep> {
         let mut batches = Vec::new();
         let mut queued = state.spl_deposits().queued().iter().peekable();
         while batches.len() < slots {
@@ -184,12 +215,18 @@ impl SweepRound {
                     );
                     break;
                 }
+                if candidate.max_lamports_spent() > *balance {
+                    break;
+                }
                 selected.push((**deposit_id, (**deposit).clone()));
                 queued.next();
                 batch = Some(candidate);
             }
             match batch {
-                Some(batch) => batches.push(batch),
+                Some(batch) => {
+                    *balance -= batch.max_lamports_spent();
+                    batches.push(batch);
+                }
                 None => break,
             }
         }
@@ -217,6 +254,8 @@ enum SweepError {
     CreateTransactionFailed(#[from] CreateTransferError),
     #[error("failed to submit transaction: {0}")]
     SubmitTransactionFailed(#[from] SubmitTransactionError),
+    #[error("the balance no longer covers the sweep")]
+    BalanceNoLongerCovers,
 }
 
 async fn submit_spl_sweep_transaction<R: CanisterRuntime>(
@@ -227,6 +266,10 @@ async fn submit_spl_sweep_transaction<R: CanisterRuntime>(
 ) -> Result<Signature, SweepError> {
     let (transaction, signers) =
         sign_spl_sweep_transaction(runtime, &sweep, block.blockhash).await?;
+    // A withdrawal may have taken part of the balance during the signing.
+    if !read_state(|state| state.covers_spl_sweep(&sweep)) {
+        return Err(SweepError::BalanceNoLongerCovers);
+    }
     let signature = transaction.signatures[0];
     mutate_state(|state| {
         process_event(

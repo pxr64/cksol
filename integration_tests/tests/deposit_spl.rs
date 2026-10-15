@@ -57,8 +57,9 @@ async fn sweep_finalize_and_mint(token_program: Address, extensions: &[Extension
         .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
         .build()
         .await;
+    setup.fund_minter().await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
-    register_token(&setup, ledger.canister_id(), token_program).await;
+    register_token(&setup, ledger.canister_id(), token_program, 32).await;
     let account = Account {
         owner: setup.proxy_canister_id(),
         subaccount: Some([1; 32]),
@@ -75,7 +76,7 @@ async fn sweep_finalize_and_mint(token_program: Address, extensions: &[Extension
             .await,
         Ok(associated_token_address(&owner, &token_program).into())
     );
-    let deposit_id = queue_deposit(&setup, account, token_program, extensions, 4).await;
+    let deposit_id = queue_deposit(&setup, account, token_program, extensions, 36).await;
     assert_eq!(ledger.balance_of(account).await, 0);
     assert_eq!(
         setup.minter().deposit_spl_status(deposit_id).await,
@@ -89,7 +90,7 @@ async fn sweep_finalize_and_mint(token_program: Address, extensions: &[Extension
         DepositSplStatus::NotFound
     );
 
-    let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 12).await;
+    let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 44).await;
     assert_eq!(ledger.balance_of(account).await, 0);
     assert_eq!(
         setup.minter().deposit_spl_status(deposit_id).await,
@@ -98,12 +99,17 @@ async fn sweep_finalize_and_mint(token_program: Address, extensions: &[Extension
         }
     );
 
-    finalize_sweep(&setup, &signature, transaction, &owner, &token_program, 24).await;
+    finalize_sweep(&setup, &signature, transaction, &owner, &token_program, 56).await;
     assert_eq!(
         setup.minter().deposit_spl_status(deposit_id).await,
         DepositSplStatus::Finalized {
             signature: signature.clone()
         }
+    );
+    // Settlement returned the reservation minus the fee and rent that Main paid.
+    assert_eq!(
+        setup.minter().get_minter_info().await.balance,
+        Setup::FUNDED_BALANCE - 2 * FEE_PER_SIGNATURE - RENT_EXEMPT_LAMPORTS
     );
     setup.minter().assert_that_events().await.satisfy(|events| {
         check!(events.contains(&EventType::CreditedSplSweep {
@@ -166,8 +172,8 @@ async fn should_quarantine_deposit_when_finalized_sweep_does_not_match_its_plan(
         subaccount: Some([1; 32]),
     };
     let owner: Address = setup.minter().get_deposit_address(account).await.into();
-    let deposit_id = queue_deposit(&setup, account, token_program, &[], 4).await;
-    let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 12).await;
+    let deposit_id = queue_deposit(&setup, account, token_program, &[], 36).await;
+    let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 44).await;
 
     finalize_sweep_with_amount(
         &setup,
@@ -176,7 +182,7 @@ async fn should_quarantine_deposit_when_finalized_sweep_does_not_match_its_plan(
         &owner,
         &token_program,
         BALANCE_ABOVE_MINIMUM - 1,
-        24,
+        56,
     )
     .await;
 
@@ -245,7 +251,7 @@ async fn should_reject_invalid_token_registrations() {
         .await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
     let other_ledger = setup.install_spl_ledger(DECIMALS).await;
-    register_token(&setup, ledger.canister_id(), token_program).await;
+    register_token(&setup, ledger.canister_id(), token_program, 0).await;
     assert_eq!(
         setup
             .minter()
@@ -292,7 +298,7 @@ async fn should_reject_invalid_deposit_requests() {
         .build()
         .await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
-    register_token(&setup, ledger.canister_id(), token_program).await;
+    register_token(&setup, ledger.canister_id(), token_program, 0).await;
     let account = Account {
         owner: setup.proxy_canister_id(),
         subaccount: Some([1; 32]),
@@ -368,18 +374,18 @@ async fn should_keep_in_flight_deposit_and_mint_it_after_upgrade() {
         .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
         .build()
         .await;
+    setup.fund_minter().await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
-    // The mint account read uses RPC IDs 0 to 3.
-    register_token(&setup, ledger.canister_id(), token_program).await;
+    register_token(&setup, ledger.canister_id(), token_program, 32).await;
     let account = Account {
         owner: setup.proxy_canister_id(),
         subaccount: Some([1; 32]),
     };
     let owner: Address = setup.minter().get_deposit_address(account).await.into();
     let source = associated_token_address(&owner, &token_program);
-    let deposit_id = queue_deposit(&setup, account, token_program, &[], 4).await;
-    let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 12).await;
-    finalize_sweep(&setup, &signature, transaction, &owner, &token_program, 24).await;
+    let deposit_id = queue_deposit(&setup, account, token_program, &[], 36).await;
+    let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 44).await;
+    finalize_sweep(&setup, &signature, transaction, &owner, &token_program, 56).await;
     let events_before_upgrade = setup.minter().get_all_events().await;
     check!(
         events_before_upgrade
@@ -453,14 +459,14 @@ async fn should_drop_deposit_and_release_account_after_sweep_expires() {
         owner: setup.proxy_canister_id(),
         subaccount: Some([1; 32]),
     };
-    let deposit_id = queue_deposit(&setup, account, token_program, &[], 4).await;
-    let (signature, _) = sweep_queued_deposit(&setup, deposit_id, 12).await;
+    let deposit_id = queue_deposit(&setup, account, token_program, &[], 36).await;
+    let (signature, _) = sweep_queued_deposit(&setup, deposit_id, 44).await;
 
     setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
     setup
         .execute_http_mocks(
-            // getSlot, getBlock and getSignatureStatuses use RPC IDs 24 to 35.
-            MockBuilder::with_start_id(24)
+            // getSlot, getBlock and getSignatureStatuses use RPC IDs 56 to 67.
+            MockBuilder::with_start_id(56)
                 .mark_transaction_expired(&signature, EXPIRY_BLOCK_HEIGHT)
                 .build(),
         )
@@ -483,7 +489,7 @@ async fn should_drop_deposit_and_release_account_after_sweep_expires() {
         }
     );
     assert_eq!(
-        queue_deposit(&setup, account, token_program, &[], 36).await,
+        queue_deposit(&setup, account, token_program, &[], 68).await,
         deposit_id + 1
     );
     setup.drop().await;
@@ -497,14 +503,14 @@ async fn should_drop_deposit_and_release_account_when_sweep_fails_on_chain() {
         owner: setup.proxy_canister_id(),
         subaccount: Some([1; 32]),
     };
-    let deposit_id = queue_deposit(&setup, account, token_program, &[], 4).await;
-    let (signature, _) = sweep_queued_deposit(&setup, deposit_id, 12).await;
+    let deposit_id = queue_deposit(&setup, account, token_program, &[], 36).await;
+    let (signature, _) = sweep_queued_deposit(&setup, deposit_id, 44).await;
 
     setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
     setup
         .execute_http_mocks(
-            // getSlot, getBlock and getSignatureStatuses use RPC IDs 24 to 35.
-            MockBuilder::with_start_id(24)
+            // getSlot, getBlock and getSignatureStatuses use RPC IDs 56 to 67.
+            MockBuilder::with_start_id(56)
                 .fail_transaction(&signature, SUBMISSION_BLOCK_HEIGHT)
                 .build(),
         )
@@ -526,7 +532,7 @@ async fn should_drop_deposit_and_release_account_when_sweep_fails_on_chain() {
         }
     );
     assert_eq!(
-        queue_deposit(&setup, account, token_program, &[], 36).await,
+        queue_deposit(&setup, account, token_program, &[], 68).await,
         deposit_id + 1
     );
     setup.drop().await;
@@ -536,7 +542,7 @@ async fn should_drop_deposit_and_release_account_when_sweep_fails_on_chain() {
 async fn should_treat_default_subaccount_spellings_as_one_account() {
     let token_program = spl_token_interface::id().to_bytes().into();
     let setup = setup_with_registered_mint(token_program).await;
-    let deposit_id = queue_deposit(&setup, DEFAULT_CALLER_ACCOUNT, token_program, &[], 4).await;
+    let deposit_id = queue_deposit(&setup, DEFAULT_CALLER_ACCOUNT, token_program, &[], 36).await;
 
     let result = setup
         .minter()
@@ -567,7 +573,7 @@ async fn should_fail_for_concurrent_access() {
     let setup = setup_with_registered_mint(token_program).await;
     let owner: Address = DEFAULT_CALLER_DEPOSIT_ADDRESS.parse().unwrap();
     let mocks = SharedMockHttpOutcalls::new(
-        MockBuilder::with_start_id(4)
+        MockBuilder::with_start_id(36)
             .get_account_info(
                 &associated_token_address(&owner, &token_program),
                 Some(account_info(token_account_data(&owner, &[]), token_program)),
@@ -667,7 +673,7 @@ mod cycles {
         let result = setup
             .minter()
             .with_http_mocks(
-                MockBuilder::with_start_id(4)
+                MockBuilder::with_start_id(36)
                     .get_account_info(
                         &source,
                         Some(account_info(token_account_data(&owner, &[]), token_program)),
@@ -702,7 +708,7 @@ mod cycles {
         let result = setup
             .minter()
             .with_http_mocks(
-                MockBuilder::with_start_id(4)
+                MockBuilder::with_start_id(36)
                     .get_account_info(
                         &source,
                         Some(account_info(token_account_data(&owner, &[]), token_program)),
@@ -738,7 +744,7 @@ mod cycles {
         let result = setup
             .minter()
             .with_http_mocks(
-                MockBuilder::with_start_id(4)
+                MockBuilder::with_start_id(36)
                     .get_account_info(
                         &source,
                         Some(account_info(

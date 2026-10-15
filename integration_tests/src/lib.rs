@@ -140,6 +140,7 @@ impl Setup {
     pub const DEFAULT_MINIMUM_DEPOSIT_AMOUNT: Lamport = 20_000_000; // 0.02 SOL
     pub const DEFAULT_DEPOSIT_SOL_REQUIRED_CYCLES: u128 = 1_000_000_000_000;
     pub const DEFAULT_DEPOSIT_SPL_REQUIRED_CYCLES: u128 = 1_000_000_000_000;
+    pub const FUNDED_BALANCE: Lamport = fixtures::DEPOSIT_AMOUNT - validator::FEE_PER_SIGNATURE;
     pub const DEFAULT_MINIMUM_WITHDRAWAL_AMOUNT: Lamport = 2_000_000; // 0.002 SOL
     pub const DEFAULT_CALLER: Principal =
         Principal::from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x0, 0x3, 0x1, 0x1]);
@@ -266,6 +267,48 @@ impl Setup {
             sol_rpc_canister_id,
             proxy_canister_id,
         }
+    }
+
+    /// Credits the minter balance with [`Self::FUNDED_BALANCE`] on a fresh setup: deposits SOL
+    /// through `deposit_sol`, sweeps it and credits the sweep. Needs the proxy canister. The
+    /// calls use RPC IDs 0 to 31.
+    pub async fn fund_minter(&self) {
+        use fixtures::{
+            DEFAULT_CALLER_ACCOUNT, DEPOSIT_AMOUNT, FINALIZE_TRANSACTIONS_DELAY, MockBuilder,
+            RENT_EXEMPTION_THRESHOLD, SUBMISSION_BLOCK_HEIGHT, SWEEP_DEPOSITS_DELAY,
+        };
+        let deposit_id = self
+            .minter()
+            .with_http_mocks(
+                MockBuilder::new()
+                    .get_balance(DEPOSIT_AMOUNT + RENT_EXEMPTION_THRESHOLD)
+                    .build(),
+            )
+            .deposit_sol(DEFAULT_CALLER_ACCOUNT)
+            .await
+            .expect("deposit_sol should queue the funding deposit");
+
+        self.advance_time(SWEEP_DEPOSITS_DELAY).await;
+        self.execute_http_mocks(
+            MockBuilder::with_start_id(4)
+                .submit_transaction(SUBMISSION_BLOCK_HEIGHT)
+                .build(),
+        )
+        .await;
+        let sweep_signature = match self.minter().deposit_sol_status(deposit_id).await {
+            DepositSolStatus::Swept { signature } => signature,
+            status => panic!("the funding deposit should be swept, got {status:?}"),
+        };
+
+        self.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
+        let sweep = self.minter().signed_transaction(&sweep_signature).await;
+        self.execute_http_mocks(
+            MockBuilder::with_start_id(16)
+                .finalize_transaction(&sweep_signature, SUBMISSION_BLOCK_HEIGHT)
+                .get_sweep_transaction(&sweep, DEPOSIT_AMOUNT)
+                .build(),
+        )
+        .await;
     }
 
     async fn mock_sol_rpc_api_keys(env: &PocketIc, sol_rpc_canister_id: Principal) {

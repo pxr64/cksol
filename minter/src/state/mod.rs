@@ -141,6 +141,7 @@ pub struct State {
     nonce_pool: DurableNoncePool,
     active_tasks: BTreeSet<TaskType>,
     balance: Lamport,
+    spl_sweep_reservations: BTreeMap<Signature, Lamport>,
 }
 
 impl State {
@@ -284,7 +285,10 @@ impl State {
             });
         match transaction {
             MinterTransaction::SweepDeposit { .. } => self.deposits.drop_swept(signature),
-            MinterTransaction::SweepSplDeposit { .. } => self.spl_deposits.drop_swept(signature),
+            MinterTransaction::SweepSplDeposit { .. } => {
+                self.spl_deposits.drop_swept(signature);
+                self.release_spl_sweep_cost(signature, 0);
+            }
             MinterTransaction::Withdrawal { .. } => {
                 panic!("BUG: durable-nonce withdrawal transaction {signature} cannot expire")
             }
@@ -309,6 +313,11 @@ impl State {
 
     pub fn nonce_pool_addresses(&self) -> BTreeSet<Address> {
         self.nonce_pool.addresses().copied().collect()
+    }
+
+    /// The lamports of the balance set aside for the in-flight SPL sweeps, by signature.
+    pub fn spl_sweep_reservations(&self) -> &BTreeMap<Signature, Lamport> {
+        &self.spl_sweep_reservations
     }
 
     pub fn sol_rpc_client<R: Runtime>(&self, runtime: R) -> SolRpcClient<R> {
@@ -551,9 +560,41 @@ impl State {
         timestamp: u64,
     ) {
         self.spl_deposits.credit_sweep(signature, mints, timestamp);
-        // Operator top-ups are not tracked, and withdrawals can consume the tracked
-        // balance before settlement, so an on-chain spend may exceed this balance.
-        self.balance = self.balance.saturating_sub(lamports_spent);
+        self.release_spl_sweep_cost(signature, lamports_spent);
+    }
+
+    /// Sets the most the sweep can cost aside, so that withdrawals cannot spend it meanwhile.
+    /// The timer submits only a covered sweep, so the cap on the balance never traps a replay.
+    fn reserve_spl_sweep_cost(&mut self, signature: &Signature) {
+        let reserved = self
+            .submitted_spl_sweep(signature)
+            .max_lamports_spent()
+            .min(self.balance);
+        self.balance -= reserved;
+        self.spl_sweep_reservations.insert(*signature, reserved);
+    }
+
+    /// Returns the reservation to the balance and debits the spend, so that a spend above a
+    /// partial reservation still leaves the balance.
+    fn release_spl_sweep_cost(&mut self, signature: &Signature, spent: Lamport) {
+        let reserved = self
+            .spl_sweep_reservations
+            .remove(signature)
+            .unwrap_or_default();
+        self.balance = self.balance.saturating_add(reserved).saturating_sub(spent);
+    }
+
+    /// A failed sweep paid the fee of its signatures on chain, never the rent.
+    fn release_failed_spl_sweep_cost(&mut self, signature: &Signature) {
+        let fee = self.submitted_spl_sweep(signature).transaction_fee();
+        self.release_spl_sweep_cost(signature, fee);
+    }
+
+    fn submitted_spl_sweep(&self, signature: &Signature) -> &SplSweep {
+        self.spl_deposits
+            .swept()
+            .get(signature)
+            .unwrap_or_else(|| panic!("BUG: SPL sweep {signature} is not submitted"))
     }
 
     fn process_minted_swept_deposit(
@@ -600,6 +641,8 @@ impl State {
 
     fn process_quarantined_spl_sweep(&mut self, signature: &Signature) {
         self.spl_deposits.quarantine_sweep(signature);
+        // The spend is unknown, so the reservation stays out of the balance.
+        self.spl_sweep_reservations.remove(signature);
     }
 
     pub fn withdrawal_status(&self, block_index: u64) -> WithdrawSolStatus {
@@ -639,10 +682,29 @@ impl State {
         &self.created_withdrawal_requests
     }
 
+    /// The balance above the rent exemption of the main account, which withdrawals and SPL
+    /// sweeps may spend.
+    pub fn spendable_balance(&self) -> Lamport {
+        self.balance.saturating_sub(RENT_EXEMPTION_THRESHOLD)
+    }
+
+    pub fn covers_spl_sweep(&self, sweep: &SplSweep) -> bool {
+        self.spendable_balance() >= sweep.max_lamports_spent()
+    }
+
+    pub fn covers_withdrawal_batch(&self, requests: &[WithdrawalRequest]) -> bool {
+        let cost = requests
+            .iter()
+            .fold(BATCH_WITHDRAWAL_TX_FEE, |cost, request| {
+                cost.saturating_add(request.amount_to_transfer)
+            });
+        self.spendable_balance() >= cost
+    }
+
     pub fn withdrawal_batches(&self) -> WithdrawalBatches<'_> {
         WithdrawalBatches {
             pending_requests: self.pending_withdrawal_requests.values().peekable(),
-            available_balance: self.balance.saturating_sub(RENT_EXEMPTION_THRESHOLD),
+            available_balance: self.spendable_balance(),
         }
     }
 
@@ -732,6 +794,7 @@ impl State {
                     &self.supported_spl_tokens,
                     signature,
                 );
+                self.reserve_spl_sweep_cost(signature);
                 MinterTransaction::SweepSplDeposit {
                     block_height: *block_height,
                 }
@@ -747,6 +810,7 @@ impl State {
                     &self.supported_spl_tokens,
                     signature,
                 );
+                self.reserve_spl_sweep_cost(signature);
                 MinterTransaction::SweepSplDeposit {
                     block_height: *block_height,
                 }
@@ -942,7 +1006,7 @@ impl State {
         match &transaction {
             MinterTransaction::SweepDeposit { .. } => self.deposits.drop_swept(signature),
             MinterTransaction::SweepSplDeposit { .. } => {
-                self.debit_spl_sweep_fee(signature);
+                self.release_failed_spl_sweep_cost(signature);
                 self.spl_deposits.drop_swept(signature);
             }
             MinterTransaction::Withdrawal { nonce_account, .. } => {
@@ -954,7 +1018,7 @@ impl State {
 
     fn process_split_failed_spl_sweep(&mut self, signature: &Signature) {
         let transaction = self.take_failed_spl_batch(signature);
-        self.debit_spl_sweep_fee(signature);
+        self.release_failed_spl_sweep_cost(signature);
         self.spl_deposits.retry_individually(signature);
         self.record_failed_transaction(signature, transaction);
     }
@@ -979,17 +1043,6 @@ impl State {
             "Attempted to split a transaction that is not an SPL batch"
         );
         transaction
-    }
-
-    /// The fee is paid even when the sweep fails on chain.
-    fn debit_spl_sweep_fee(&mut self, signature: &Signature) {
-        let fee = self
-            .spl_deposits
-            .swept()
-            .get(signature)
-            .expect("BUG: a failed SPL sweep must be swept")
-            .transaction_fee();
-        self.balance = self.balance.saturating_sub(fee);
     }
 
     fn record_failed_transaction(&mut self, signature: &Signature, transaction: MinterTransaction) {
@@ -1104,6 +1157,7 @@ impl TryFrom<InitArgs> for State {
             nonce_pool,
             active_tasks: BTreeSet::new(),
             balance: 0,
+            spl_sweep_reservations: BTreeMap::new(),
         };
         state.validate()?;
         Ok(state)

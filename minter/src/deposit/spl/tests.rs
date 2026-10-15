@@ -818,7 +818,11 @@ mod lifecycle {
             assert!(state.submitted_transactions().is_empty());
             assert!(state.spl_deposits().swept().is_empty());
             assert!(state.spl_deposits().finalized().is_empty());
-            assert_eq!(state.balance(), balance_before - spent);
+            assert_eq!(
+                state.balance(),
+                balance_before + sweep.plan.max_lamports_spent() - spent
+            );
+            assert!(state.spl_sweep_reservations().is_empty());
             let (first_id, _) = sweep.plan.deposits().first_key_value().unwrap();
             state.spl_deposits().pending_mints()[first_id].created_at_time
         });
@@ -1359,6 +1363,12 @@ mod lifecycle {
                 state.spl_deposits().quarantined()[&deposit_id].signature,
                 sweep.signature
             );
+            // A quarantined sweep keeps its reservation: its spend is unknown.
+            assert_eq!(
+                state.balance(),
+                INITIAL_BALANCE - sweep.plan.max_lamports_spent()
+            );
+            assert!(state.spl_sweep_reservations().is_empty());
             assert!(state.spl_deposits().pending_mints().is_empty());
             assert_eq!(
                 state

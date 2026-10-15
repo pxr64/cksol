@@ -130,8 +130,9 @@ pub async fn setup_with_registered_mint(token_program: Address) -> Setup {
         .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
         .build()
         .await;
+    setup.fund_minter().await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
-    register_token(&setup, ledger.canister_id(), token_program).await;
+    register_token(&setup, ledger.canister_id(), token_program, 32).await;
     setup
 }
 
@@ -146,11 +147,21 @@ pub fn add_spl_token_args(ledger_id: Principal, token_program: Address) -> AddSp
     }
 }
 
-/// Registers [`MINT`] on the ledger. The mint account read uses RPC IDs 0 to 3.
-pub async fn register_token(setup: &Setup, ledger_id: Principal, token_program: Address) {
-    try_register_token(setup, add_spl_token_args(ledger_id, token_program), 0)
-        .await
-        .expect("add_spl_token should register the token");
+/// Registers [`MINT`] on the ledger. The mint account read uses RPC IDs `start_id` to
+/// `start_id + 3`.
+pub async fn register_token(
+    setup: &Setup,
+    ledger_id: Principal,
+    token_program: Address,
+    start_id: u64,
+) {
+    try_register_token(
+        setup,
+        add_spl_token_args(ledger_id, token_program),
+        start_id,
+    )
+    .await
+    .expect("add_spl_token should register the token");
 }
 
 /// Registers the token of the arguments, answering the read of its mint account with
@@ -267,7 +278,7 @@ pub async fn queue_deposit_for_caller(token_program: Address, extensions: &[Exte
         .into();
     let source = associated_token_address(&owner, &token_program);
     let destination = associated_token_address(&MINTER_ADDRESS, &token_program);
-    register_token(&setup, ledger.canister_id(), token_program).await;
+    register_token(&setup, ledger.canister_id(), token_program, 0).await;
     assert_eq!(
         setup
             .minter()

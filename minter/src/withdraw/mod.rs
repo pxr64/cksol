@@ -253,6 +253,14 @@ async fn create_transaction<R: CanisterRuntime>(
         );
         return false;
     }
+    // An SPL sweep may have reserved part of the balance during the nonce read.
+    if !read_state(|state| state.covers_withdrawal_batch(&requests)) {
+        log!(
+            Priority::Info,
+            "The balance no longer covers the withdrawal batch for burn indices {burn_indices:?}, skipping it this round"
+        );
+        return false;
+    }
 
     mutate_state(|state| {
         process_event(

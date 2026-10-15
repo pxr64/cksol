@@ -817,6 +817,7 @@ mod state_from_init_args {
                 nonce_pool: DurableNoncePool::default(),
                 active_tasks: BTreeSet::new(),
                 balance: 0,
+                spl_sweep_reservations: BTreeMap::new(),
             }
         );
     }
