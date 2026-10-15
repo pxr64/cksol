@@ -4,7 +4,7 @@ use crate::{
     guard::TimerGuard,
     lifecycle,
     state::{
-        TokenProgram,
+        TaskType, TokenProgram,
         audit::{process_event, replay_events},
         event::{CreditedSplDeposit, Event, TransactionPurpose},
         mutate_state, reset_state,
@@ -33,6 +33,22 @@ fn setup_pending(count: usize) -> Vec<(DepositSplId, PendingSplMint)> {
 }
 
 fn setup_pending_with_fee(count: usize, fee: u64) -> Vec<(DepositSplId, PendingSplMint)> {
+    setup_pending_with_programs(
+        (0..count).map(|id| {
+            if id % 2 == 0 {
+                TokenProgram::Classic
+            } else {
+                TokenProgram::Token2022
+            }
+        }),
+        fee,
+    )
+}
+
+fn setup_pending_with_programs(
+    programs: impl IntoIterator<Item = TokenProgram>,
+    fee: u64,
+) -> Vec<(DepositSplId, PendingSplMint)> {
     reset_state();
     reset_events();
     let runtime = TestCanisterRuntime::new().with_increasing_time();
@@ -49,17 +65,15 @@ fn setup_pending_with_fee(count: usize, fee: u64) -> Vec<(DepositSplId, PendingS
             )
         });
     }
-    for id in 0..count {
-        let program = if id % 2 == 0 {
-            TokenProgram::Classic
-        } else {
-            TokenProgram::Token2022
+    for (id, program) in programs.into_iter().enumerate() {
+        let mint = match program {
+            TokenProgram::Classic => [1; 32].into(),
+            TokenProgram::Token2022 => [2; 32].into(),
         };
-        let mint = [id as u8 % 2 + 1; 32].into();
         let token = spl_token(mint, program);
         let deposit = crate::state::QueuedSplDeposit {
             fee,
-            ..queued_spl_deposit(account(id / 2 + 1), mint, program)
+            ..queued_spl_deposit(account(id + 1), mint, program)
         };
         let sweep = crate::state::SplSweep::plan(
             [(id as u64, deposit.clone())],
@@ -384,6 +398,72 @@ async fn should_not_reschedule_a_round_of_transient_spl_mint_failures() {
 }
 
 #[tokio::test]
+async fn should_mint_for_a_healthy_ledger_after_a_round_of_ledger_failures() {
+    let pending = setup_pending_with_programs(
+        (0..=MAX_PENDING_MINTS_PER_ROUND).map(|id| {
+            if id < MAX_PENDING_MINTS_PER_ROUND {
+                TokenProgram::Classic
+            } else {
+                TokenProgram::Token2022
+            }
+        }),
+        0,
+    );
+    let first = mint_runtime(
+        (0..MAX_PENDING_MINTS_PER_ROUND).map(|_| Err(TransferError::TemporarilyUnavailable)),
+    );
+    process_pending_spl_mints(first.clone()).await;
+    assert_eq!(first.set_timer_call_count(), 0);
+    let first_calls = first.sent_update_calls();
+    assert_eq!(first_calls.len(), MAX_PENDING_MINTS_PER_ROUND);
+    assert!(
+        first_calls
+            .iter()
+            .all(|call| call.canister_id == first_calls[0].canister_id)
+    );
+
+    let second = mint_runtime(std::iter::once(Ok(BLOCK_INDEX.into())).chain(
+        (0..MAX_PENDING_MINTS_PER_ROUND - 1).map(|_| Err(TransferError::TemporarilyUnavailable)),
+    ));
+    process_pending_spl_mints(second.clone()).await;
+    let calls = second.sent_update_calls();
+    assert_eq!(calls.len(), MAX_PENDING_MINTS_PER_ROUND);
+    let (id, healthy) = &pending[MAX_PENDING_MINTS_PER_ROUND];
+    let healthy_ledger = read_state(|state| {
+        state
+            .supported_spl_token(&healthy.deposit.deposit.mint)
+            .unwrap()
+            .ledger_id
+    });
+    assert_ne!(healthy_ledger, first_calls[0].canister_id);
+    assert_eq!(calls[0].canister_id, healthy_ledger);
+    assert_eq!(calls[0].single_arg::<TransferArg>().to, healthy.account());
+    assert_eq!(calls[1..], first_calls[..MAX_PENDING_MINTS_PER_ROUND - 1]);
+    read_state(|state| {
+        assert_eq!(state.spl_deposits().minted().len(), 1);
+        assert!(state.spl_deposits().minted().contains_key(id));
+        assert_eq!(
+            state.spl_deposits().pending_mints().len(),
+            MAX_PENDING_MINTS_PER_ROUND
+        );
+        assert!(state.spl_deposits().quarantined().is_empty());
+    });
+    assert_replay_matches();
+
+    let third = mint_runtime(
+        (0..MAX_PENDING_MINTS_PER_ROUND).map(|_| Err(TransferError::TemporarilyUnavailable)),
+    );
+    process_pending_spl_mints(third.clone()).await;
+    let expected: Vec<_> = std::iter::once(first_calls.last().unwrap())
+        .chain(first_calls[..MAX_PENDING_MINTS_PER_ROUND - 1].iter())
+        .cloned()
+        .collect();
+    assert_eq!(third.sent_update_calls(), expected);
+    assert_eq!(third.set_timer_call_count(), 0);
+    assert_replay_matches();
+}
+
+#[tokio::test]
 async fn should_retry_only_the_fee_mint_and_preserve_new_deposit_lock() {
     const FEE: u64 = 25;
     const MINTED_AT: u64 = CREDITED_AT + 1;
@@ -540,6 +620,64 @@ async fn should_quarantine_unsafe_fee_mint_without_changing_user_mint() {
         });
         assert_replay_matches();
     }
+}
+
+#[tokio::test]
+async fn should_rotate_past_failed_fee_mints_independently_of_user_mints() {
+    let pending = setup_pending_with_fee(2 * MAX_PENDING_MINTS_PER_ROUND + 1, 25);
+    let runtime = TestCanisterRuntime::new().with_time(CREDITED_AT + 1);
+    for (id, _) in &pending[..=MAX_PENDING_MINTS_PER_ROUND] {
+        mutate_state(|state| {
+            process_event(
+                state,
+                EventType::MintedSweptSplDeposit {
+                    deposit_id: *id,
+                    mint_block_index: (*id).into(),
+                },
+                &runtime,
+            )
+        });
+    }
+    // Both queues have ten failed calls, with different ranges of deposit IDs.
+    let first = mint_runtime(
+        (0..2 * MAX_PENDING_MINTS_PER_ROUND).map(|_| Err(TransferError::TemporarilyUnavailable)),
+    );
+    process_pending_spl_mints(first.clone()).await;
+    assert_eq!(
+        first.sent_update_calls().len(),
+        2 * MAX_PENDING_MINTS_PER_ROUND
+    );
+    assert_eq!(first.set_timer_call_count(), 0);
+
+    let second = mint_runtime(
+        (0..MAX_PENDING_MINTS_PER_ROUND)
+            .map(|_| Err(TransferError::TemporarilyUnavailable))
+            .chain(std::iter::once(Ok(BLOCK_INDEX.into())))
+            .chain(
+                (0..MAX_PENDING_MINTS_PER_ROUND - 1)
+                    .map(|_| Err(TransferError::TemporarilyUnavailable)),
+            ),
+    );
+    process_pending_spl_mints(second.clone()).await;
+    let calls = second.sent_update_calls();
+    assert_eq!(calls.len(), 2 * MAX_PENDING_MINTS_PER_ROUND);
+    let (id, pending) = &pending[MAX_PENDING_MINTS_PER_ROUND];
+    assert_eq!(
+        calls[MAX_PENDING_MINTS_PER_ROUND].single_arg::<TransferArg>(),
+        spl_fee_mint_arg(*id, pending.sweep_signature(), CREDITED_AT + 1, 25)
+    );
+    read_state(|state| {
+        assert_eq!(state.spl_deposits().minted_fees()[id], BLOCK_INDEX.into());
+        assert_eq!(
+            state.spl_deposits().pending_fee_mints().len(),
+            MAX_PENDING_MINTS_PER_ROUND
+        );
+        assert_eq!(
+            state.spl_deposits().pending_mints().len(),
+            MAX_PENDING_MINTS_PER_ROUND
+        );
+    });
+    assert_replay_matches();
 }
 
 #[tokio::test]

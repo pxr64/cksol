@@ -73,6 +73,7 @@ pub fn reset_state() {
     STATE.with(|s| {
         *s.borrow_mut() = None;
     });
+    crate::deposit::reset_cursors();
 }
 
 pub fn mutate_state<F, R>(f: F) -> R

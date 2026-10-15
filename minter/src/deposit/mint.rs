@@ -3,6 +3,7 @@ use crate::{
     guard::TimerGuard,
     ledger::client::{LedgerClient, to_ledger_mint_index},
     numeric::LedgerMintIndex,
+    queue_cursor::QueueCursor,
     runtime::CanisterRuntime,
     state::{State, TaskType, audit::process_event, event::EventType, mutate_state, read_state},
 };
@@ -11,38 +12,73 @@ use cksol_types_internal::log::Priority;
 use ic_canister_runtime::Runtime;
 use icrc_ledger_types::icrc1::transfer::{TransferArg, TransferError};
 use scopeguard::ScopeGuard;
-use std::{collections::BTreeMap, time::Duration};
+use std::{cell::RefCell, collections::BTreeMap, time::Duration};
 
-/// Runs one round of pending mints under the given task. Returns whether the round made
-/// progress with more pending mints than one round holds, so the caller runs again at once.
-pub async fn process_pending_mints_round<R: CanisterRuntime, Id: Copy, Pending: Clone>(
+/// The queues that mint on a timer, each with its own rotation cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MintQueue {
+    Sol,
+    Spl,
+    SplFee,
+}
+
+impl MintQueue {
+    fn task(self) -> TaskType {
+        match self {
+            Self::Sol => TaskType::Mint,
+            Self::Spl | Self::SplFee => TaskType::MintSpl,
+        }
+    }
+}
+
+thread_local! {
+    /// Where the previous round of each queue stopped. The cursors reset on upgrade; the
+    /// mint arguments live in the event log.
+    static CURSORS: RefCell<BTreeMap<MintQueue, QueueCursor<u64>>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+pub fn reset_cursors() {
+    CURSORS.with_borrow_mut(BTreeMap::clear);
+}
+
+/// Runs one bounded round, continuing after the previous attempt and wrapping at the end.
+/// Returns whether the round made progress with more pending mints than one round holds.
+pub async fn process_pending_mints_round<R: CanisterRuntime, Pending: Clone>(
     runtime: &R,
-    task: TaskType,
-    pending_mints: impl Fn(&State) -> &BTreeMap<Id, Pending>,
-    mint: impl AsyncFn(&R, Id, Pending),
+    queue: MintQueue,
+    pending_mints: impl Fn(&State) -> &BTreeMap<u64, Pending>,
+    mint: impl AsyncFn(&R, u64, Pending),
 ) -> bool {
-    let _guard = match TimerGuard::new(task) {
+    let _guard = match TimerGuard::new(queue.task()) {
         Ok(guard) => guard,
         Err(_) => return false,
     };
+    let cursor = CURSORS.with_borrow(|cursors| cursors.get(&queue).copied().unwrap_or_default());
     let (pending_mints_before_round, round) = read_state(|state| {
         let pending = pending_mints(state);
         (
             pending.len(),
-            pending
-                .iter()
-                .take(MAX_PENDING_MINTS_PER_ROUND)
+            cursor
+                .round(pending, MAX_PENDING_MINTS_PER_ROUND)
+                .into_iter()
                 .map(|(deposit_id, pending)| (*deposit_id, pending.clone()))
                 .collect::<Vec<_>>(),
         )
     });
     if round.is_empty() {
+        CURSORS.with_borrow_mut(|cursors| cursors.remove(&queue));
         return false;
     }
     for (deposit_id, pending) in round {
+        // Advance before awaiting the ledger, including when its reply fails or traps.
+        CURSORS.with_borrow_mut(|cursors| cursors.entry(queue).or_default().advance(deposit_id));
         mint(runtime, deposit_id, pending).await;
     }
     let pending_mints_after_round = read_state(|state| pending_mints(state).len());
+    if pending_mints_after_round == 0 {
+        CURSORS.with_borrow_mut(|cursors| cursors.remove(&queue));
+    }
     let round_made_progress = pending_mints_after_round < pending_mints_before_round;
     let more_pending_mints_than_one_round =
         pending_mints_before_round > MAX_PENDING_MINTS_PER_ROUND;

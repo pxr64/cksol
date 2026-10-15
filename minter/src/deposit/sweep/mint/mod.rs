@@ -1,7 +1,7 @@
 use crate::{
-    deposit::mint::{mint_pending_deposit, process_pending_mints_round},
+    deposit::mint::{MintQueue, mint_pending_deposit, process_pending_mints_round},
     runtime::CanisterRuntime,
-    state::{PendingMint, TaskType, event::EventType, read_state},
+    state::{PendingMint, event::EventType, read_state},
 };
 use cksol_types::{DepositSolId, Memo, MintMemo};
 use icrc_ledger_types::icrc1::transfer::{NumTokens, TransferArg};
@@ -13,7 +13,7 @@ mod tests;
 pub async fn process_pending_mints<R: CanisterRuntime>(runtime: R) {
     let run_again = process_pending_mints_round(
         &runtime,
-        TaskType::Mint,
+        MintQueue::Sol,
         |state| state.deposits().pending_mints(),
         process_pending_mint,
     )

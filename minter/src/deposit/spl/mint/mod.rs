@@ -1,9 +1,9 @@
 use crate::{
     constants::SPL_FEE_SUBACCOUNT,
-    deposit::mint::{mint_pending_deposit, process_pending_mints_round},
+    deposit::mint::{MintQueue, mint_pending_deposit, process_pending_mints_round},
     ledger::client::LedgerClient,
     runtime::CanisterRuntime,
-    state::{PendingSplFeeMint, PendingSplMint, TaskType, event::EventType, read_state},
+    state::{PendingSplFeeMint, PendingSplMint, event::EventType, read_state},
 };
 use cksol_types::{DepositSplId, Memo, MintMemo};
 use ic_canister_runtime::Runtime;
@@ -20,14 +20,14 @@ mod tests;
 pub async fn process_pending_spl_mints<R: CanisterRuntime>(runtime: R) {
     let run_again = process_pending_mints_round(
         &runtime,
-        TaskType::MintSpl,
+        MintQueue::Spl,
         |state| state.spl_deposits().pending_mints(),
         process_pending_spl_mint,
     )
     .await;
     let fee_run_again = process_pending_mints_round(
         &runtime,
-        TaskType::MintSpl,
+        MintQueue::SplFee,
         |state| state.spl_deposits().pending_fee_mints(),
         process_pending_spl_fee_mint,
     )
