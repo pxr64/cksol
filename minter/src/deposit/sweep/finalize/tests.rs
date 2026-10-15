@@ -3,11 +3,11 @@ use crate::{
     constants::MAX_CONCURRENT_RPC_CALLS,
     deposit::sweep::deposit_status,
     state::{event::EventType, read_state, reset_state},
-    storage::reset_events,
+    storage::{FailedCreditReason, failed_credit_attempt_count, reset_events},
     test_fixtures::{
         EventsAssert, GetTransactionResult, account, devnet_sweep,
-        events::{queue, queue_deposit, submit_sweep, submit_sweep_to, succeed_transaction},
-        init_schnorr_master_key, init_state,
+        events::{queue, submit_sweep_to, succeed_transaction},
+        init_state,
         runtime::TestCanisterRuntime,
         signature,
     },
@@ -15,9 +15,11 @@ use crate::{
 use cksol_types::{DepositSolId, DepositSolStatus};
 use sol_rpc_types::Lamport;
 use solana_signature::Signature;
-use solana_transaction_status_client_types::EncodedConfirmedTransactionWithStatusMeta;
+use solana_transaction_status_client_types::{
+    EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, TransactionBinaryEncoding,
+};
 
-const DEVNET_SWEEP_SIGNATURE_INDEX: usize = 0;
+const FRESH_SWEEP_SIGNATURE_INDEX: usize = 0x80;
 
 #[tokio::test]
 async fn should_do_nothing_without_finalized_deposits() {
@@ -35,7 +37,7 @@ async fn should_ask_for_another_round_only_after_crediting_with_sweeps_left_over
     let cases = [
         (
             "the devnet sweep was credited",
-            transaction_response(devnet_sweep::outcome()),
+            transaction_response(devnet_sweep::derived_outcome()),
             true,
         ),
         (
@@ -53,13 +55,17 @@ async fn should_ask_for_another_round_only_after_crediting_with_sweeps_left_over
             .add_stub_response(devnet_sweep_response);
         for index in 0..MAX_CONCURRENT_RPC_CALLS {
             let deposit_id = (devnet_sweep::DEPOSITS.len() + index) as DepositSolId;
-            queue_deposit(
+            let account = account(deposit_id as usize + 1);
+            queue(
                 deposit_id,
-                account(deposit_id as usize + 1),
-                SWEEPABLE_AMOUNT,
+                devnet_sweep::fresh_deposit(account, SWEEPABLE_AMOUNT),
             );
-            let sweep_signature = signature(DEVNET_SWEEP_SIGNATURE_INDEX + 1 + index);
-            submit_sweep(sweep_signature, vec![deposit_id]);
+            let sweep_signature = signature(FRESH_SWEEP_SIGNATURE_INDEX + index);
+            submit_sweep_to(
+                sweep_signature,
+                vec![deposit_id],
+                devnet_sweep::minter_main_address(),
+            );
             succeed_transaction(sweep_signature);
             if index + 1 < MAX_CONCURRENT_RPC_CALLS {
                 runtime = runtime.add_stub_response(GetTransactionResult::Consistent(Ok(None)));
@@ -90,7 +96,7 @@ async fn should_credit_the_amount_received_by_the_main_account() {
     setup();
     let sweep_signature = finalize_devnet_sweep();
 
-    credit_finalized_sweeps(&runtime_returning(devnet_sweep::outcome())).await;
+    credit_finalized_sweeps(&runtime_returning(devnet_sweep::derived_outcome())).await;
 
     EventsAssert::from_recorded().expect_contains_event_eq(EventType::CreditedSweep {
         signature: sweep_signature,
@@ -104,26 +110,49 @@ async fn should_credit_the_amount_received_by_the_main_account() {
             devnet_sweep::DEPOSITS.len()
         );
     });
+    for reason in FailedCreditReason::ALL {
+        assert_eq!(failed_credit_attempt_count(reason), 0, "{reason:?}");
+    }
 }
 
 #[tokio::test]
 async fn should_keep_deposits_finalized_until_the_outcome_can_be_read() {
     type Response = fn() -> GetTransactionResult;
-    let cases: [(&str, Response); 3] = [
-        ("the transaction is not returned", || {
-            GetTransactionResult::Consistent(Ok(None))
-        }),
-        ("fetching the transaction fails", || {
-            GetTransactionResult::Inconsistent(vec![])
-        }),
-        ("the metadata cannot be read", || {
-            let mut outcome = devnet_sweep::outcome();
-            outcome.transaction.meta = None;
-            transaction_response(outcome)
-        }),
+    let cases: [(&str, Response, FailedCreditReason); 4] = [
+        (
+            "the transaction is not returned",
+            || GetTransactionResult::Consistent(Ok(None)),
+            FailedCreditReason::NotFound,
+        ),
+        (
+            "fetching the transaction fails",
+            || GetTransactionResult::Inconsistent(vec![]),
+            FailedCreditReason::RpcError,
+        ),
+        (
+            "the providers agree on a transaction that cannot be decoded",
+            || {
+                let mut outcome = devnet_sweep::derived_outcome();
+                outcome.transaction.transaction = EncodedTransaction::Binary(
+                    "not a transaction".to_string(),
+                    TransactionBinaryEncoding::Base64,
+                );
+                transaction_response(outcome)
+            },
+            FailedCreditReason::InvalidResponse,
+        ),
+        (
+            "the metadata cannot be read",
+            || {
+                let mut outcome = devnet_sweep::derived_outcome();
+                outcome.transaction.meta = None;
+                transaction_response(outcome)
+            },
+            FailedCreditReason::Unreadable,
+        ),
     ];
 
-    for (name, response) in cases {
+    for (name, response, expected_reason) in cases {
         setup();
         let sweep_signature = finalize_devnet_sweep();
         let events_before = EventsAssert::from_recorded();
@@ -150,6 +179,7 @@ async fn should_keep_deposits_finalized_until_the_outcome_can_be_read() {
             },
             "{name}"
         );
+        assert_eq!(failed_credit_attempt_count(expected_reason), 1, "{name}");
     }
 }
 
@@ -157,19 +187,26 @@ async fn should_keep_deposits_finalized_until_the_outcome_can_be_read() {
 async fn should_credit_a_later_sweep_after_a_round_of_unavailable_outcomes() {
     for deviation in 0..3 {
         setup();
-        let healthy_signature = finalize_devnet_sweep_with_signature(MAX_CONCURRENT_RPC_CALLS);
+        let healthy_signature = finalize_devnet_sweep();
         for index in 0..MAX_CONCURRENT_RPC_CALLS {
             let deposit_id = (devnet_sweep::DEPOSITS.len() + index) as DepositSolId;
-            queue_deposit(deposit_id, account(deposit_id as usize + 1), 25_000_000);
+            queue(
+                deposit_id,
+                devnet_sweep::fresh_deposit(account(deposit_id as usize + 1), 25_000_000),
+            );
             let signature = signature(index);
-            submit_sweep(signature, vec![deposit_id]);
+            submit_sweep_to(
+                signature,
+                vec![deposit_id],
+                devnet_sweep::minter_main_address(),
+            );
             succeed_transaction(signature);
         }
         let unavailable = || match deviation {
             0 => GetTransactionResult::Consistent(Ok(None)),
             1 => GetTransactionResult::Inconsistent(vec![]),
             _ => {
-                let mut outcome = devnet_sweep::outcome();
+                let mut outcome = devnet_sweep::derived_outcome();
                 outcome.transaction.meta = None;
                 transaction_response(outcome)
             }
@@ -182,7 +219,7 @@ async fn should_credit_a_later_sweep_after_a_round_of_unavailable_outcomes() {
         let first_calls = first.sent_update_calls();
         assert_eq!(first_calls.len(), MAX_CONCURRENT_RPC_CALLS);
 
-        let mut second = runtime_returning(devnet_sweep::outcome());
+        let mut second = runtime_returning(devnet_sweep::derived_outcome());
         for _ in 1..MAX_CONCURRENT_RPC_CALLS {
             second = second.add_stub_response(unavailable());
         }
@@ -223,8 +260,8 @@ async fn should_credit_a_later_sweep_after_a_round_of_unavailable_outcomes() {
 async fn should_quarantine_deposits_if_the_outcome_does_not_match_the_plan() {
     setup();
     let sweep_signature = finalize_devnet_sweep();
-    let mut outcome = devnet_sweep::outcome();
-    devnet_sweep::set_balances(&mut outcome, devnet_sweep::MINTER_ADDRESS, 1, 0);
+    let mut outcome = devnet_sweep::derived_outcome();
+    devnet_sweep::set_balances(&mut outcome, devnet_sweep::minter_main_address(), 1, 0);
 
     credit_finalized_sweeps(&runtime_returning(outcome)).await;
 
@@ -245,30 +282,27 @@ async fn should_quarantine_deposits_if_the_outcome_does_not_match_the_plan() {
             signature: sweep_signature.into()
         }
     );
+    assert_eq!(failed_credit_attempt_count(FailedCreditReason::Mismatch), 1);
 }
 
 fn setup() {
     reset_state();
     reset_events();
     init_state();
-    init_schnorr_master_key();
+    devnet_sweep::init_master_key();
 }
 
 /// Queues the deposits of the devnet sweep, submits it and finalizes it.
 fn finalize_devnet_sweep() -> Signature {
-    finalize_devnet_sweep_with_signature(DEVNET_SWEEP_SIGNATURE_INDEX)
-}
-
-fn finalize_devnet_sweep_with_signature(index: usize) -> Signature {
-    let deposits = devnet_sweep::deposits();
+    let sweep_signature = devnet_sweep::transaction_signature();
+    let deposits = devnet_sweep::derived_deposits();
     for (deposit_id, deposit) in &deposits {
         queue(*deposit_id, *deposit);
     }
-    let sweep_signature = signature(index);
     submit_sweep_to(
         sweep_signature,
         deposits.iter().map(|(deposit_id, _)| *deposit_id).collect(),
-        devnet_sweep::MINTER_ADDRESS,
+        devnet_sweep::minter_main_address(),
     );
     succeed_transaction(sweep_signature);
     sweep_signature

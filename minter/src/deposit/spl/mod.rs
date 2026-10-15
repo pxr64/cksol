@@ -1,7 +1,5 @@
 use crate::{
-    address::{
-        account_address, associated_token_address, lazy_get_schnorr_master_key, minter_address,
-    },
+    address::{account_address, associated_token_address, minter_address, minter_public_key},
     constants::GET_ACCOUNT_INFO_CYCLES,
     cycles::{RpcCallCharge, charge_rpc_call, check_caller_available_cycles},
     guard::deposit_spl_guard,
@@ -43,17 +41,15 @@ pub async fn deposit_spl<R: CanisterRuntime>(
         return Ok(deposit_id);
     }
     let token = assert_valid_deposit_token(&mint)?;
-    let deposit_consolidation_fee = read_state(|state| state.deposit_consolidation_fee());
-    check_caller_available_cycles(
-        runtime,
-        2 * GET_ACCOUNT_INFO_CYCLES + deposit_consolidation_fee,
-    )?;
+    let deposit_fee = read_state(|state| state.deposit_sol_fee());
+    check_caller_available_cycles(runtime, 2 * GET_ACCOUNT_INFO_CYCLES + deposit_fee)?;
 
     let fee = FeeEstimator::new(NoPriceOracle)
         .estimate_fee(mint)
         .await
         .map_err(DepositSplError::TemporarilyUnavailable)?;
-    let master_key = lazy_get_schnorr_master_key(runtime).await;
+    let master_key =
+        minter_public_key().map_err(|e| DepositSplError::TemporarilyUnavailable(e.to_string()))?;
     let owner = account_address(&master_key, &account);
     let address = associated_token_address(&owner, &token.mint, &token.token_program.id());
     let result = get_spl_token_balance(runtime, address, owner, token.mint, token.token_program)
@@ -83,7 +79,7 @@ pub async fn deposit_spl<R: CanisterRuntime>(
         runtime,
         RpcCallCharge {
             attached_cycles: GET_ACCOUNT_INFO_CYCLES,
-            fee_on_success: deposit_consolidation_fee,
+            fee_on_success: deposit_fee,
         },
         &result,
     );

@@ -8,13 +8,17 @@ use crate::{
 use cksol_types::{DepositSolId, DepositSplId};
 use cksol_types_internal::{InitArgs, UpgradeArgs};
 use derive_more::From;
+use ic_ed25519::PublicKey;
 use ic_stable_structures::{Storable, storable::Bound};
 use icrc_ledger_types::icrc1::account::Account;
 use minicbor::{Decode, Encode};
 use sol_rpc_types::Lamport;
 use solana_address::Address;
+use solana_hash::Hash;
 use solana_message::Message;
+use solana_sdk_ids::system_program;
 use solana_signature::Signature;
+use solana_system_interface::instruction::SystemInstruction;
 use std::borrow::Cow;
 
 /// A versioned Solana transaction message, allowing the minter to support
@@ -34,8 +38,32 @@ impl VersionedMessage {
         let VersionedMessage::Legacy(message) = self;
         FEE_PER_SIGNATURE * message.header.num_required_signatures as u64
     }
+
+    /// The nonce account advanced by the first instruction of the message,
+    /// or `None` if the first instruction is not a system-program
+    /// `AdvanceNonceAccount` instruction.
+    pub fn advanced_nonce_account(&self) -> Option<Address> {
+        let VersionedMessage::Legacy(message) = self;
+        let instruction = message.instructions.first()?;
+        let program_id = message
+            .account_keys
+            .get(usize::from(instruction.program_id_index))?;
+        let is_advance_nonce_account = matches!(
+            bincode::deserialize(&instruction.data),
+            Ok(SystemInstruction::AdvanceNonceAccount)
+        );
+        if *program_id != system_program::ID || !is_advance_nonce_account {
+            return None;
+        }
+        let nonce_account_index = instruction.accounts.first()?;
+        message
+            .account_keys
+            .get(usize::from(*nonce_account_index))
+            .copied()
+    }
 }
 
+pub mod candid;
 pub(super) mod cbor;
 
 #[derive(Eq, PartialEq, Debug, Decode, Encode)]
@@ -72,27 +100,10 @@ pub enum EventType {
         /// The signers in signature order (fee payer first).
         #[n(2)]
         signers: Vec<Signer>,
-        /// The purpose of this transaction.
+        /// The purpose of this transaction, with what the minter needs to
+        /// track it until it is finalized.
         #[n(3)]
         purpose: TransactionPurpose,
-        /// The block height of the block whose blockhash the transaction uses.
-        /// The blockhash is valid for 150 blocks after that height.
-        #[n(4)]
-        block_height: BlockHeight,
-    },
-    /// A previously submitted transaction was resubmitted with a new signature.
-    /// The transaction message and signers remain the same.
-    #[n(4)]
-    ResubmittedTransaction {
-        /// The signature of the old transaction being replaced
-        #[cbor(n(0), with = "cbor::signature")]
-        old_signature: Signature,
-        /// The signature of the new transaction
-        #[cbor(n(1), with = "cbor::signature")]
-        new_signature: Signature,
-        /// The block height of the new blockhash used in the resubmitted transaction.
-        #[n(2)]
-        new_block_height: BlockHeight,
     },
     /// A previously submitted Solana transaction has been finalized successfully.
     #[n(5)]
@@ -110,8 +121,7 @@ pub enum EventType {
     },
     /// A previously submitted Solana transaction has an expired blockhash
     /// and a null on-chain status, meaning it will never be executed.
-    /// A withdrawal transaction is marked for resubmission;
-    /// the deposits of a sweep transaction are dropped instead.
+    /// The deposits of the expired sweep transaction are dropped.
     #[n(7)]
     ExpiredTransaction {
         /// The signature of the expired Solana transaction.
@@ -156,9 +166,18 @@ pub enum EventType {
         #[cbor(n(0), with = "cbor::signature")]
         signature: Signature,
     },
+    /// The minter fetched its Schnorr Ed25519 master public key, from which
+    /// its main address and all deposit addresses are derived.
+    #[n(11)]
+    MinterPublicKeyFetched {
+        #[cbor(n(0), with = "cbor::ed25519_public_key")]
+        public_key: PublicKey,
+        #[cbor(n(1), with = "minicbor::bytes")]
+        chain_code: [u8; 32],
+    },
     /// The minter minted ckSOL on the ledger for a swept deposit whose sweep
     /// was credited.
-    #[n(11)]
+    #[n(12)]
     MintedSweptDeposit {
         /// The identifier of the minted deposit.
         #[n(0)]
@@ -180,14 +199,31 @@ pub enum EventType {
     /// must therefore first search the ledger for a mint whose memo carries the
     /// sweep signature before crediting by hand, otherwise a double mint
     /// results.
-    #[n(12)]
+    #[n(13)]
     QuarantinedPendingMint {
         /// The identifier of the deposit whose pending mint was quarantined.
         #[n(0)]
         deposit_id: DepositSolId,
     },
+    /// The minter bound a durable nonce account and its nonce value to the
+    /// withdrawal requests of the given burn indices, before requesting the
+    /// threshold signature. Since each burn index identifies a withdrawal
+    /// request, the binding determines the transaction message, so that a
+    /// signing failure leads to re-signing the identical message and never to
+    /// a second message being signed for the same nonce value.
+    #[n(14)]
+    CreatedWithdrawalTransaction {
+        /// The ledger burn indices of the withdrawal requests served by this transaction.
+        #[cbor(n(0), with = "cbor::id_vec")]
+        burn_indices: Vec<LedgerBurnIndex>,
+        /// The durable nonce account bound to this transaction.
+        #[cbor(n(1), with = "cbor::address")]
+        nonce_account: Address,
+        /// The nonce value the transaction carries in place of a recent blockhash.
+        #[cbor(n(2), with = "cbor::hash")]
+        nonce_value: Hash,
+    },
     /// A validated SPL token was registered with its IC ledger.
-    /// Index 14 is reserved for the `MinterPublicKeyFetched` event of main.
     #[n(15)]
     AddedSplToken(#[n(0)] crate::state::SupportedSplToken),
     /// An SPL token-account balance was accepted for a future sweep.
@@ -332,33 +368,52 @@ impl Signer {
     }
 }
 
+/// The purpose of a submitted transaction, mirroring [`MinterTransaction`]:
+/// each variant carries what the minter needs to track the transaction.
+///
+/// [`MinterTransaction`]: crate::state::MinterTransaction
 #[derive(Clone, Eq, PartialEq, Debug, Decode, Encode)]
 pub enum TransactionPurpose {
-    /// Withdraw SOL to users' Solana addresses.
-    #[n(0)]
-    WithdrawSol {
+    /// Sweep the deposit addresses of deposits queued by `deposit_sol` into
+    /// the minter's main account. The transaction uses a recent blockhash and
+    /// is dropped once the blockhash expires.
+    #[n(2)]
+    SweepDeposit {
+        /// The ids of the swept deposits.
+        #[n(0)]
+        deposit_ids: Vec<DepositSolId>,
+        /// The block height of the block whose blockhash the transaction uses.
+        /// The blockhash is valid for 150 blocks after that height.
+        #[n(1)]
+        block_height: BlockHeight,
+    },
+    /// Withdraw SOL to users' Solana addresses. The transaction carries the
+    /// nonce value of a durable nonce account instead of a recent blockhash,
+    /// so it never expires.
+    #[n(4)]
+    Withdrawal {
         /// The ledger burn indices of the withdrawal requests included in this transaction.
         #[cbor(n(0), with = "cbor::id_vec")]
         burn_indices: Vec<LedgerBurnIndex>,
     },
-    /// Sweep the deposit addresses of deposits queued by `deposit_sol` into the minter's main account.
-    #[n(1)]
-    SweepDeposits {
-        /// The ids of the swept deposits.
-        #[n(0)]
-        deposit_ids: Vec<DepositSolId>,
-    },
     /// Sweep queued SPL token accounts into the minter's associated token accounts.
-    #[n(2)]
+    /// The transaction uses a recent blockhash and is dropped once the blockhash expires.
+    #[n(5)]
     SweepSplDeposits {
         #[n(0)]
         deposit_ids: Vec<DepositSplId>,
+        /// The block height of the block whose blockhash the transaction uses.
+        #[n(1)]
+        block_height: BlockHeight,
     },
     /// Sweep one retried SPL deposit alone after the batch holding it failed.
-    #[n(3)]
+    #[n(6)]
     RetrySplDeposit {
         #[n(0)]
         deposit_id: DepositSplId,
+        /// The block height of the block whose blockhash the transaction uses.
+        #[n(1)]
+        block_height: BlockHeight,
     },
 }
 

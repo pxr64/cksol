@@ -66,8 +66,8 @@ mod balance_reading {
         },
         storage::total_event_count,
         test_fixtures::{
-            DEPOSIT_CONSOLIDATION_FEE, deposit::DEPOSITOR_ACCOUNT, init_schnorr_master_key,
-            init_state, runtime::TestCanisterRuntime, schnorr_master_key_response, spl_token,
+            DEPOSIT_SOL_FEE, deposit::DEPOSITOR_ACCOUNT, init_schnorr_master_key, init_state,
+            runtime::TestCanisterRuntime, spl_token,
         },
     };
     use assert_matches::assert_matches;
@@ -161,7 +161,7 @@ mod balance_reading {
     pub(super) fn runtime() -> TestCanisterRuntime {
         TestCanisterRuntime::new()
             .with_increasing_time()
-            .add_msg_cycles_available(2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_CONSOLIDATION_FEE)
+            .add_msg_cycles_available(2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_SOL_FEE)
             .add_msg_cycles_refunded(RPC_REFUND)
             .add_msg_cycles_refunded(RPC_REFUND)
             .expecting_charges()
@@ -187,7 +187,7 @@ mod balance_reading {
             runtime.msg_cycles_accepted(),
             [
                 GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
-                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND + DEPOSIT_CONSOLIDATION_FEE
+                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND + DEPOSIT_SOL_FEE
             ]
         );
         assert_eq!(runtime.sent_update_calls().len(), 2);
@@ -236,7 +236,7 @@ mod balance_reading {
     async fn should_fail_before_rpc_if_insufficient_cycles_are_attached() {
         let token = init_token(false);
         let runtime = TestCanisterRuntime::new()
-            .add_msg_cycles_available(2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_CONSOLIDATION_FEE - 1);
+            .add_msg_cycles_available(2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_SOL_FEE - 1);
 
         let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
@@ -244,8 +244,8 @@ mod balance_reading {
             result,
             Err(DepositSplError::InsufficientCycles(
                 InsufficientCyclesError {
-                    expected: 2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_CONSOLIDATION_FEE,
-                    received: 2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_CONSOLIDATION_FEE - 1,
+                    expected: 2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_SOL_FEE,
+                    received: 2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_SOL_FEE - 1,
                 }
             ))
         );
@@ -312,7 +312,7 @@ mod balance_reading {
                 sol_rpc_types::RpcSources,
                 Option<sol_rpc_types::RpcConfig>,
                 sol_rpc_types::GetAccountInfoParams,
-            ) = calls[1].args_tuple();
+            ) = calls[1].args();
             assert_eq!(args.2.pubkey.to_string(), expected_destination.to_string());
         }
     }
@@ -461,9 +461,9 @@ mod balance_reading {
     #[tokio::test]
     async fn should_hold_guard_across_await_and_release_it_after_error() {
         init_state();
+        init_schnorr_master_key();
         let token = register_token(false);
         let first_runtime = runtime()
-            .with_schnorr_public_key(schnorr_master_key_response())
             .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
         let mut first = Box::pin(deposit_spl(
             &first_runtime,
@@ -505,7 +505,7 @@ mod balance_reading {
             Ok(0)
         );
         let repeated_runtime = TestCanisterRuntime::new()
-            .add_msg_cycles_available(2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_CONSOLIDATION_FEE);
+            .add_msg_cycles_available(2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_SOL_FEE);
 
         let result = deposit_spl(&repeated_runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
@@ -600,12 +600,11 @@ mod lifecycle {
         storage::{reset_events, total_event_count, with_event_iter},
         test_fixtures::{
             BLOCK_INDEX, DEFAULT_BLOCK_HEIGHT, EventsAssert, GetTransactionResult, account,
-            confirmed_block,
+            confirmed_block, confirmed_block_with,
             deposit::DEPOSITOR_ACCOUNT,
-            init_balance_to, init_schnorr_master_key, minter_signature_nth,
+            devnet_sweep,
             runtime::{SentUpdateCall, TestCanisterRuntime},
-            schnorr_master_key,
-            signer::{sign_as_minter, sign_for},
+            signer::{sign_as_devnet_minter, sign_for},
             spl_fee_mint_arg,
             spl_sweep::balanced_outcome,
             spl_token, valid_init_args,
@@ -638,12 +637,10 @@ mod lifecycle {
     fn setup() {
         reset_state();
         reset_events();
-        lifecycle::init(
-            valid_init_args(),
-            TestCanisterRuntime::new().with_increasing_time(),
-        );
-        init_schnorr_master_key();
-        init_balance_to(INITIAL_BALANCE);
+        let runtime = TestCanisterRuntime::new().with_increasing_time();
+        lifecycle::init(valid_init_args(), runtime.clone());
+        devnet_sweep::record_master_key(&runtime);
+        devnet_sweep::init_balance_to(INITIAL_BALANCE);
     }
 
     fn source_account_info(
@@ -652,7 +649,7 @@ mod lifecycle {
         amount: u64,
     ) -> AccountInfo {
         let token_account = TokenAccount {
-            owner: account_address(&schnorr_master_key(), &account)
+            owner: account_address(&devnet_sweep::master_key(), &account)
                 .to_bytes()
                 .into(),
             mint: token.mint.to_bytes().into(),
@@ -686,33 +683,33 @@ mod lifecycle {
     struct SubmittedSweep {
         signature: Signature,
         plan: SplSweep,
+        blockhash: Hash,
         sent_transaction: String,
     }
 
     /// Runs one sweep round that submits one transaction signed by the minter and the owners.
-    async fn sweep(owners: &[Account], nth: usize) -> SubmittedSweep {
-        let signature = minter_signature_nth(nth);
+    /// The minter signs for real, so the finalizer accepts the transaction it sent. Every
+    /// sweep builds on a fresh blockhash, so a repeated sweep never repeats a signature.
+    async fn sweep(owners: &[Account]) -> SubmittedSweep {
+        static SWEEPS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        let blockhash = Hash::from([SWEEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); 32]);
         let mut runtime = TestCanisterRuntime::new()
             .with_increasing_time()
-            .add_recent_block(Ok(SLOT))
-            .add_signer(sign_as_minter().expect([Ok(signature)]));
+            .add_stub_response(MultiRpcResult::Consistent(Ok(SLOT)))
+            .add_stub_response(MultiRpcResult::Consistent(Ok(confirmed_block_with(
+                blockhash,
+                DEFAULT_BLOCK_HEIGHT,
+            ))))
+            .add_signer(sign_as_devnet_minter());
         for owner in owners {
             runtime = runtime.add_signer(sign_for(owner));
         }
         let runtime = runtime.add_stub_response(
-            MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Ok(signature.into())),
+            MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Ok(Signature::default().into())),
         );
 
         sweep_queued_spl_deposits(runtime.clone()).await;
 
-        let plan = read_state(|state| {
-            state
-                .spl_deposits()
-                .swept()
-                .get(&signature)
-                .expect("the round submitted one sweep")
-                .clone()
-        });
         let sends: Vec<SentUpdateCall> = runtime
             .sent_update_calls()
             .into_iter()
@@ -723,11 +720,24 @@ mod lifecycle {
             sol_rpc_types::RpcSources,
             Option<sol_rpc_types::RpcConfig>,
             sol_rpc_types::SendTransactionParams,
-        ) = sends[0].args_tuple();
+        ) = sends[0].args();
+        let sent_transaction = params.get_transaction().to_string();
+        let transaction: solana_transaction::Transaction =
+            bincode::deserialize(&STANDARD.decode(&sent_transaction).unwrap()).unwrap();
+        let signature = transaction.signatures[0];
+        let plan = read_state(|state| {
+            state
+                .spl_deposits()
+                .swept()
+                .get(&signature)
+                .expect("the round submitted one sweep")
+                .clone()
+        });
         SubmittedSweep {
             signature,
             plan,
-            sent_transaction: params.get_transaction().to_string(),
+            blockhash,
+            sent_transaction,
         }
     }
 
@@ -738,7 +748,7 @@ mod lifecycle {
     /// The outcome of the sweep's own signed transaction: every planned transfer landed, and
     /// the minter paid the fee plus the rent of one new account per mint.
     fn outcome_of(sweep: &SubmittedSweep) -> (EncodedConfirmedTransactionWithStatusMeta, u64) {
-        let message = sweep.plan.sweep_message(blockhash());
+        let message = sweep.plan.sweep_message(sweep.blockhash);
         let fee = u64::from(message.header.num_required_signatures) * FEE_PER_SIGNATURE;
         let destinations: BTreeSet<_> = sweep
             .plan
@@ -755,7 +765,7 @@ mod lifecycle {
             .collect();
         let spent = fee + destinations.len() as u64 * DESTINATION_LAMPORTS;
         let balance_before = read_state(|state| state.balance());
-        let mut outcome = balanced_outcome(&sweep.plan, blockhash(), true);
+        let mut outcome = balanced_outcome(&sweep.plan, sweep.blockhash, true);
         outcome.transaction.transaction = EncodedTransaction::Binary(
             sweep.sent_transaction.clone(),
             TransactionBinaryEncoding::Base64,
@@ -925,7 +935,7 @@ mod lifecycle {
         for token_2022 in [false, true] {
             setup();
             let token = register_token(token_2022);
-            let owner = account_address(&schnorr_master_key(), &DEPOSITOR_ACCOUNT);
+            let owner = account_address(&devnet_sweep::master_key(), &DEPOSITOR_ACCOUNT);
             // The production estimator currently quotes zero. Record a nonzero quote to
             // exercise the sweep, settlement and mint paths before enabling an oracle.
             mutate_state(|state| {
@@ -948,7 +958,7 @@ mod lifecycle {
             });
             assert_replay_matches();
 
-            let sweep = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+            let sweep = sweep(&[DEPOSITOR_ACCOUNT]).await;
             assert_eq!(sweep.plan.deposits()[&0].balance, BALANCE);
             let created_at = settle(&sweep).await;
             read_state(|state| {
@@ -1004,7 +1014,7 @@ mod lifecycle {
             }
         );
 
-        let sweep = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+        let sweep = sweep(&[DEPOSITOR_ACCOUNT]).await;
         assert_eq!(
             deposit_spl_status(deposit_id),
             DepositSplStatus::Swept {
@@ -1049,7 +1059,7 @@ mod lifecycle {
                 )
             });
 
-            let sweep = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+            let sweep = sweep(&[DEPOSITOR_ACCOUNT]).await;
 
             let signature = sweep.signature;
             read_state(|state| {
@@ -1099,7 +1109,7 @@ mod lifecycle {
                 assert_eq!(state.balance(), INITIAL_BALANCE - lamports_spent);
             });
             let deposit = sweep.plan.deposits()[&deposit_id].clone();
-            let message = sweep.plan.sweep_message(blockhash());
+            let message = sweep.plan.sweep_message(sweep.blockhash);
             let payloads: Vec<EventType> =
                 with_event_iter(|events| events.map(|event| event.payload).collect());
             assert_eq!(
@@ -1119,8 +1129,8 @@ mod lifecycle {
                         signers: sweep.plan.signers(&message),
                         purpose: TransactionPurpose::SweepSplDeposits {
                             deposit_ids: vec![deposit_id],
+                            block_height: DEFAULT_BLOCK_HEIGHT,
                         },
-                        block_height: DEFAULT_BLOCK_HEIGHT,
                     },
                     EventType::SucceededTransaction { signature },
                     EventType::CreditedSplSweep {
@@ -1170,9 +1180,9 @@ mod lifecycle {
         ];
         assert_eq!(expected.map(|(id, ..)| id), [0, 1, 2]);
 
-        let sweep = sweep(&[alice, bob], 0).await;
+        let sweep = sweep(&[alice, bob]).await;
 
-        let message = sweep.plan.sweep_message(blockhash());
+        let message = sweep.plan.sweep_message(sweep.blockhash);
         assert_eq!(
             sweep.plan.deposits().keys().copied().collect::<Vec<_>>(),
             vec![0, 1, 2]
@@ -1232,7 +1242,7 @@ mod lifecycle {
         setup();
         let token = register_token(false);
         let first = deposit(&token, DEPOSITOR_ACCOUNT, MINIMUM_DEPOSIT_AMOUNT).await;
-        let failed = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+        let failed = sweep(&[DEPOSITOR_ACCOUNT]).await;
         assert_eq!(
             deposit_spl(
                 &TestCanisterRuntime::new(),
@@ -1276,7 +1286,7 @@ mod lifecycle {
         let second = deposit(&token, DEPOSITOR_ACCOUNT, MINIMUM_DEPOSIT_AMOUNT).await;
 
         assert_eq!(second, first + 1);
-        let retry = sweep(&[DEPOSITOR_ACCOUNT], 1).await;
+        let retry = sweep(&[DEPOSITOR_ACCOUNT]).await;
         assert_ne!(retry.signature, failed.signature);
         let created_at = settle(&retry).await;
         let calls = mint(1).await;
@@ -1320,7 +1330,7 @@ mod lifecycle {
         setup();
         let token = register_token(false);
         let deposit_id = deposit(&token, DEPOSITOR_ACCOUNT, MINIMUM_DEPOSIT_AMOUNT).await;
-        let sweep = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+        let sweep = sweep(&[DEPOSITOR_ACCOUNT]).await;
         let (mut outcome, _) = outcome_of(&sweep);
         let OptionSerializer::Some(balances) = &mut outcome
             .transaction
@@ -1382,7 +1392,7 @@ mod lifecycle {
         setup();
         let token = register_token(false);
         let first = deposit(&token, DEPOSITOR_ACCOUNT, MINIMUM_DEPOSIT_AMOUNT).await;
-        let first_sweep = sweep(&[DEPOSITOR_ACCOUNT], 0).await;
+        let first_sweep = sweep(&[DEPOSITOR_ACCOUNT]).await;
         let (outcome, _) = outcome_of(&first_sweep);
         let leftover = source_balance_after(&first_sweep, &outcome, first);
         assert!(leftover >= MINIMUM_DEPOSIT_AMOUNT);
@@ -1417,7 +1427,7 @@ mod lifecycle {
 
         assert_eq!(second, first + 1);
         read_state(|state| assert_eq!(state.spl_deposits().queued()[&second].balance, leftover));
-        let second_sweep = sweep(&[DEPOSITOR_ACCOUNT], 1).await;
+        let second_sweep = sweep(&[DEPOSITOR_ACCOUNT]).await;
         let created_at = settle(&second_sweep).await;
         let calls = mint(1).await;
         assert_eq!(

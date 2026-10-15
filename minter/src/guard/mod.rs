@@ -1,5 +1,5 @@
 use crate::state::{State, TaskType, mutate_state};
-use cksol_types::{DepositSolError, DepositSplError, WithdrawalError};
+use cksol_types::{DepositSolError, DepositSplError, WithdrawSolError};
 use icrc_ledger_types::icrc1::account::Account;
 use solana_address::Address;
 use std::{collections::BTreeSet, marker::PhantomData};
@@ -37,7 +37,7 @@ impl From<GuardError> for DepositSplError {
     }
 }
 
-impl From<GuardError> for WithdrawalError {
+impl From<GuardError> for WithdrawSolError {
     fn from(e: GuardError) -> Self {
         match e {
             GuardError::AlreadyProcessing => Self::AlreadyProcessing,

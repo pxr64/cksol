@@ -6,6 +6,7 @@ use crate::{
     queue_cursor::QueueCursors,
     runtime::CanisterRuntime,
     state::{State, TaskType, audit::process_event, event::EventType, mutate_state, read_state},
+    storage::{FailedMintReason, record_failed_mint_attempt},
 };
 use canlog::log;
 use cksol_types_internal::log::Priority;
@@ -27,6 +28,14 @@ impl MintQueue {
         match self {
             Self::Sol => TaskType::Mint,
             Self::Spl | Self::SplFee => TaskType::MintSpl,
+        }
+    }
+
+    /// The metrics count the ckSOL mints only.
+    fn record_failed_mint(self, reason: FailedMintReason) {
+        match self {
+            Self::Sol => record_failed_mint_attempt(reason),
+            Self::Spl | Self::SplFee => {}
         }
     }
 }
@@ -53,10 +62,10 @@ pub async fn process_pending_mints_round<R: CanisterRuntime, Pending: Clone>(
         Ok(guard) => guard,
         Err(_) => return false,
     };
-    let (pending_mints_before_round, round) = read_state(|state| {
+    let (more_pending_mints_than_one_round, round) = read_state(|state| {
         let pending = pending_mints(state);
         (
-            pending.len(),
+            pending.len() > MAX_PENDING_MINTS_PER_ROUND,
             CURSORS
                 .with(|cursors| cursors.round(queue, pending, MAX_PENDING_MINTS_PER_ROUND))
                 .into_iter()
@@ -68,24 +77,28 @@ pub async fn process_pending_mints_round<R: CanisterRuntime, Pending: Clone>(
         CURSORS.with(|cursors| cursors.clear(queue));
         return false;
     }
+    let selected_deposit_ids: Vec<u64> = round.iter().map(|(deposit_id, _)| *deposit_id).collect();
     for (deposit_id, pending) in round {
         // Advance before awaiting the ledger, including when its reply fails or traps.
         CURSORS.with(|cursors| cursors.advance(queue, deposit_id));
         mint(runtime, deposit_id, pending).await;
     }
-    let pending_mints_after_round = read_state(|state| pending_mints(state).len());
-    if pending_mints_after_round == 0 {
-        CURSORS.with(|cursors| cursors.clear(queue));
-    }
-    let round_made_progress = pending_mints_after_round < pending_mints_before_round;
-    let more_pending_mints_than_one_round =
-        pending_mints_before_round > MAX_PENDING_MINTS_PER_ROUND;
+    let round_made_progress = read_state(|state| {
+        let pending = pending_mints(state);
+        if pending.is_empty() {
+            CURSORS.with(|cursors| cursors.clear(queue));
+        }
+        selected_deposit_ids
+            .iter()
+            .any(|deposit_id| !pending.contains_key(deposit_id))
+    });
     round_made_progress && more_pending_mints_than_one_round
 }
 
 /// Mints with fixed transfer arguments, retrying transient errors and quarantining unsafe retries.
 pub async fn mint_pending_deposit<R: CanisterRuntime, C: Runtime>(
     runtime: &R,
+    queue: MintQueue,
     client: LedgerClient<C>,
     args: TransferArg,
     minted_event: impl Fn(LedgerMintIndex) -> EventType,
@@ -101,10 +114,12 @@ pub async fn mint_pending_deposit<R: CanisterRuntime, C: Runtime>(
             Priority::Error,
             "Quarantining {label}: its pending mint is older than the deduplication window of the ledger"
         );
+        queue.record_failed_mint(FailedMintReason::Expired);
         mutate_state(|state| process_event(state, quarantine_event, runtime));
         return;
     }
     let quarantine_unless_defused = scopeguard::guard(quarantine_event, |event| {
+        queue.record_failed_mint(FailedMintReason::UnknownOutcome);
         mutate_state(|state| process_event(state, event, runtime));
     });
     let amount = args.amount.clone();
@@ -129,34 +144,49 @@ pub async fn mint_pending_deposit<R: CanisterRuntime, C: Runtime>(
             ScopeGuard::into_inner(quarantine_unless_defused);
         }
         Ok(Err(TransferError::TooOld)) => {
+            let quarantine_event = ScopeGuard::into_inner(quarantine_unless_defused);
+            queue.record_failed_mint(FailedMintReason::Expired);
             log!(
                 Priority::Error,
                 "Quarantining {label}: the ledger rejected its mint as outside the deduplication window"
             );
+            mutate_state(|state| process_event(state, quarantine_event, runtime));
         }
         Ok(Err(
             rejection @ (TransferError::BadFee { .. }
             | TransferError::BadBurn { .. }
             | TransferError::InsufficientFunds { .. }),
         )) => {
+            let quarantine_event = ScopeGuard::into_inner(quarantine_unless_defused);
+            queue.record_failed_mint(FailedMintReason::Rejected);
             log!(
                 Priority::Error,
                 "Quarantining {label}: the ledger definitively rejected its mint from the minting account: {rejection:?}"
             );
+            mutate_state(|state| process_event(state, quarantine_event, runtime));
         }
         Ok(Err(
-            transient @ (TransferError::TemporarilyUnavailable
-            | TransferError::GenericError { .. }
-            | TransferError::CreatedInFuture { .. }),
+            transient
+            @ (TransferError::TemporarilyUnavailable | TransferError::GenericError { .. }),
         )) => {
             ScopeGuard::into_inner(quarantine_unless_defused);
+            queue.record_failed_mint(FailedMintReason::LedgerError);
             log!(
                 Priority::Info,
                 "Failed to mint {label}, retrying on the next round: {transient:?}"
             );
         }
+        Ok(Err(clock_skew @ TransferError::CreatedInFuture { .. })) => {
+            ScopeGuard::into_inner(quarantine_unless_defused);
+            queue.record_failed_mint(FailedMintReason::CreatedInFuture);
+            log!(
+                Priority::Info,
+                "Failed to mint {label}, retrying on the next round: {clock_skew:?}"
+            );
+        }
         Err(ic_error) => {
             ScopeGuard::into_inner(quarantine_unless_defused);
+            queue.record_failed_mint(FailedMintReason::CallError);
             log!(
                 Priority::Info,
                 "Failed to mint {label}, retrying on the next round: {ic_error}"

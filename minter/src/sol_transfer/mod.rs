@@ -1,5 +1,5 @@
 use crate::{
-    address::{DerivationPath, lazy_get_schnorr_master_key, minter_address},
+    address::{DerivationPath, MINTER_DERIVATION_PATH},
     constants::FEE_PER_SIGNATURE,
     runtime::CanisterRuntime,
     signer::{SchnorrSigner, sign_bytes},
@@ -12,7 +12,7 @@ use sol_rpc_types::Lamport;
 use solana_address::Address;
 use solana_hash::Hash;
 use solana_system_interface::instruction;
-use solana_transaction::{Instruction, Message, Transaction};
+use solana_transaction::{Message, Transaction};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -23,9 +23,9 @@ pub const MAX_SIGNATURES: u64 = 10;
 pub const MAX_TX_SIZE: usize = 1_232;
 const BYTES_PER_SIGNATURE: usize = 64;
 
-/// Upper bound on the number of withdrawal transfers that fit in a single
-/// Solana transaction when the fee-payer is the only signer.
-pub const MAX_WITHDRAWALS_PER_TX: usize = 20;
+/// Maximum number of withdrawal transfers batched into a single
+/// durable-nonce transaction.
+pub const MAX_WITHDRAWALS_PER_NONCE_TX: usize = 10;
 
 /// Fee charged for a batch withdrawal transaction, which is signed by the fee payer only.
 pub const BATCH_WITHDRAWAL_TX_FEE: Lamport = FEE_PER_SIGNATURE;
@@ -74,38 +74,45 @@ pub async fn sign_sweep_transaction<R: CanisterRuntime>(
     Ok((transaction, signers))
 }
 
-/// Creates a signed Solana transaction that transfers lamports from a single
-/// minter-controlled address (the fee payer) to multiple target addresses.
-///
-/// Returns the signed transaction and its signers:
-/// only [`Signer::Minter`], the fee payer.
-///
-/// # Panics
-///
-/// Panics if the IC returns a signature that is not exactly 64 bytes.
-pub async fn create_signed_batch_withdrawal_transaction<R: CanisterRuntime>(
+/// Builds the unsigned message of a batch withdrawal transaction: an
+/// `AdvanceNonceAccount` instruction first, followed by one transfer from the
+/// minter's main address per withdrawal request, carrying the nonce value in
+/// place of a recent blockhash. The main address is the fee payer, the source
+/// of all transfers, and the nonce authority, so the transaction has a single
+/// signature.
+pub fn build_batch_withdrawal_message(
+    minter_address: &Address,
+    nonce_account: &Address,
+    nonce_value: Hash,
+    transfers: &[(Address, Lamport)],
+) -> Result<Message, CreateTransferError> {
+    let mut instructions = vec![instruction::advance_nonce_account(
+        nonce_account,
+        minter_address,
+    )];
+    instructions.extend(
+        transfers
+            .iter()
+            .map(|(target, amount)| instruction::transfer(minter_address, target, *amount)),
+    );
+    let message = Message::new_with_blockhash(&instructions, Some(minter_address), &nonce_value);
+    ensure_within_transaction_size(&message)?;
+    Ok(message)
+}
+
+/// Signs the given withdrawal message with the minter's master key.
+pub async fn sign_batch_withdrawal_message<R: CanisterRuntime>(
     runtime: &R,
-    targets: &[(Address, Lamport)],
-    recent_blockhash: Hash,
-) -> Result<(Transaction, Vec<Signer>), CreateTransferError> {
-    let master_public_key = lazy_get_schnorr_master_key(runtime).await;
-    let fee_payer_address = minter_address(&master_public_key);
-
-    let instructions: Vec<Instruction> = targets
-        .iter()
-        .map(|(target, amount)| instruction::transfer(&fee_payer_address, target, *amount))
-        .collect();
-
-    let message =
-        Message::new_with_blockhash(&instructions, Some(&fee_payer_address), &recent_blockhash);
+    message: Message,
+) -> Result<Transaction, CreateTransferError> {
     let mut transaction = Transaction::new_unsigned(message);
-
-    let signers = vec![Signer::Minter];
-    let derivation_paths: Vec<DerivationPath> =
-        signers.iter().map(Signer::derivation_path).collect();
-    sign_transaction(&mut transaction, derivation_paths, &runtime.signer()).await?;
-
-    Ok((transaction, signers))
+    sign_transaction(
+        &mut transaction,
+        [MINTER_DERIVATION_PATH],
+        &runtime.signer(),
+    )
+    .await?;
+    Ok(transaction)
 }
 
 /// The wire size of the transaction of the given message, with every required signature.
@@ -120,15 +127,19 @@ pub(crate) async fn sign_transaction(
     signer_derivation_paths: impl IntoIterator<Item = DerivationPath>,
     signer: &impl SchnorrSigner,
 ) -> Result<(), CreateTransferError> {
-    // The size is known before signing, and each signature is a paid call to the IC.
-    let tx_size = transaction_size(&transaction.message);
+    ensure_within_transaction_size(&transaction.message)?;
+    transaction.signatures =
+        sign_bytes(signer_derivation_paths, signer, transaction.message_data()).await?;
+    Ok(())
+}
+
+fn ensure_within_transaction_size(message: &Message) -> Result<(), CreateTransferError> {
+    let tx_size = transaction_size(message);
     if tx_size > MAX_TX_SIZE {
         return Err(CreateTransferError::TransactionTooLarge {
             max: MAX_TX_SIZE,
             got: tx_size,
         });
     }
-    let message_bytes = transaction.message_data();
-    transaction.signatures = sign_bytes(signer_derivation_paths, signer, message_bytes).await?;
     Ok(())
 }

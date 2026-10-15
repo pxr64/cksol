@@ -1,4 +1,4 @@
-use crate::{address::associated_token_address, state::SplSweep};
+use crate::{address::associated_token_address, state::SplSweep, test_fixtures::devnet_sweep};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use serde_json::json;
 use solana_hash::Hash;
@@ -9,11 +9,19 @@ use solana_transaction_status_client_types::{
 };
 use std::collections::BTreeMap;
 
+/// The outcome of the message signed by the fee payer with the key of
+/// [`devnet_sweep::master_key`], so that `get_transaction` accepts it when the sweep was
+/// planned with that key.
 pub fn transaction_outcome(
     message: solana_message::VersionedMessage,
 ) -> EncodedConfirmedTransactionWithStatusMeta {
+    let mut signatures =
+        vec![Signature::default(); message.header().num_required_signatures as usize];
+    if let solana_message::VersionedMessage::Legacy(legacy) = &message {
+        signatures[0] = devnet_sweep::minter_signature_of(legacy);
+    }
     let transaction = VersionedTransaction {
-        signatures: vec![Signature::default(); message.header().num_required_signatures as usize],
+        signatures,
         message,
     };
     serde_json::from_value(json!({

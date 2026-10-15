@@ -12,13 +12,17 @@ use crate::{
         events::{quarantine_sweep, queue_deposit, submit_sweep, succeed_transaction},
         init_schnorr_master_key, init_state,
         runtime::TestCanisterRuntime,
-        schnorr_master_key_response, signature,
+        signature,
         signer::sign_for,
     },
 };
 use assert_matches::assert_matches;
 use cksol_types::{DepositSolId, DepositSolStatus};
-use sol_rpc_types::{Lamport, MultiRpcResult, RpcError, Signature, Slot};
+use sol_rpc_types::{
+    CommitmentLevel, GetBlockCommitmentLevel, GetBlockParams, GetSlotParams, GetSlotRpcConfig,
+    Lamport, MultiRpcResult, RpcConfig, RpcError, RpcSources, SendTransactionParams, Signature,
+    Slot,
+};
 use solana_address::Address;
 use solana_system_interface::instruction::SystemInstruction;
 
@@ -120,8 +124,7 @@ async fn should_sweep_batch_with_largest_deposit_as_fee_payer() {
                 signature,
                 message,
                 signers,
-                purpose: TransactionPurpose::SweepDeposits { deposit_ids },
-                block_height,
+                purpose: TransactionPurpose::SweepDeposit { deposit_ids, block_height },
             } => {
                 assert_eq!(signature, fee_payer_signature);
                 assert_eq!(signers[0], Signer::Account(account(2)));
@@ -172,7 +175,7 @@ async fn should_record_event_even_if_transaction_submission_fails() {
         .expect_event(|e| {
             assert_matches!(e, EventType::SubmittedTransaction {
                 signature,
-                purpose: TransactionPurpose::SweepDeposits { deposit_ids },
+                purpose: TransactionPurpose::SweepDeposit { deposit_ids, .. },
                 ..
             } if signature == fee_payer_signature && deposit_ids == vec![0])
         })
@@ -182,6 +185,48 @@ async fn should_record_event_even_if_transaction_submission_fails() {
         DepositSolStatus::Swept {
             signature: fee_payer_signature.into()
         }
+    );
+}
+
+#[tokio::test]
+async fn should_build_and_simulate_the_sweep_at_confirmed_commitment() {
+    setup();
+    queue_deposit(0, account(1), MINIMUM_DEPOSIT_AMOUNT);
+    let runtime = TestCanisterRuntime::new()
+        .with_increasing_time()
+        .add_recent_block(Ok(SLOT))
+        .add_stub_response(SendTransactionResult::Consistent(Ok(account_signature(
+            &account(1),
+        )
+        .into())))
+        .add_signer(sign_for(&account(1)));
+
+    sweep_queued_deposits(runtime.clone()).await;
+
+    let [get_slot, get_block, send_transaction] = runtime.sent_update_calls().try_into().unwrap();
+    assert_eq!(get_slot.method, "getSlot");
+    let (_sources, _config, slot_params): (
+        RpcSources,
+        Option<GetSlotRpcConfig>,
+        Option<GetSlotParams>,
+    ) = get_slot.args();
+    assert_eq!(
+        slot_params.and_then(|params| params.commitment),
+        Some(CommitmentLevel::Confirmed)
+    );
+    assert_eq!(get_block.method, "getBlock");
+    let (_sources, _config, block_params): (RpcSources, Option<RpcConfig>, GetBlockParams) =
+        get_block.args();
+    assert_eq!(
+        block_params.commitment,
+        Some(GetBlockCommitmentLevel::Confirmed)
+    );
+    assert_eq!(send_transaction.method, "sendTransaction");
+    let (_sources, _config, send_params): (RpcSources, Option<RpcConfig>, SendTransactionParams) =
+        send_transaction.args();
+    assert_eq!(
+        send_params.preflight_commitment,
+        Some(CommitmentLevel::Confirmed)
     );
 }
 
@@ -218,14 +263,14 @@ async fn should_split_deposits_into_batches_of_max_size() {
         .expect_event(|e| {
             assert_matches!(e, EventType::SubmittedTransaction {
                 signature,
-                purpose: TransactionPurpose::SweepDeposits { deposit_ids },
+                purpose: TransactionPurpose::SweepDeposit { deposit_ids, .. },
                 ..
             } if signature == fee_payer_signature_1 && deposit_ids == batch_1_ids)
         })
         .expect_event(|e| {
             assert_matches!(e, EventType::SubmittedTransaction {
                 signature,
-                purpose: TransactionPurpose::SweepDeposits { deposit_ids },
+                purpose: TransactionPurpose::SweepDeposit { deposit_ids, .. },
                 ..
             } if signature == fee_payer_signature_2 && deposit_ids == batch_2_ids)
         })
@@ -283,10 +328,10 @@ async fn should_reschedule_until_all_deposits_swept() {
 }
 
 #[tokio::test]
-async fn should_fetch_the_master_key_once_for_all_batches_of_a_round() {
+async fn should_sweep_all_batches_of_a_round_without_fetching_the_master_key() {
     const NUM_DEPOSITS: usize = MAX_DEPOSITS_PER_SWEEP + 1;
     const NUM_BATCHES: usize = 2;
-    init_state();
+    setup();
     queue_deposits_with_increasing_amounts(NUM_DEPOSITS);
     let fee_payer_1 = account(MAX_DEPOSITS_PER_SWEEP - 1);
     let fee_payer_2 = account(NUM_DEPOSITS - 1);
@@ -297,12 +342,11 @@ async fn should_fetch_the_master_key_once_for_all_batches_of_a_round() {
         .add_signers((0..MAX_DEPOSITS_PER_SWEEP - 1).map(account))
         .build()
         .transaction_builder(fee_payer_2, account_signature(&fee_payer_2))
-        .build()
-        .with_schnorr_public_key(schnorr_master_key_response());
+        .build();
 
     sweep_queued_deposits(runtime.clone()).await;
 
-    assert_eq!(runtime.schnorr_public_key_call_count(), 1);
+    assert_eq!(runtime.schnorr_public_key_call_count(), 0);
     read_state(|s| {
         assert_eq!(s.submitted_transactions().len(), NUM_BATCHES);
         assert_eq!(s.deposits().swept().deposit_count(), NUM_DEPOSITS);

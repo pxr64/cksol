@@ -44,6 +44,7 @@ async fn process_pending_spl_mint<R: CanisterRuntime>(
 ) {
     mint_pending_deposit(
         runtime,
+        MintQueue::Spl,
         spl_ledger_client(runtime, &pending.deposit.deposit.mint),
         mint_arg(
             pending.account(),
@@ -68,6 +69,7 @@ async fn process_pending_spl_fee_mint<R: CanisterRuntime>(
 ) {
     mint_pending_deposit(
         runtime,
+        MintQueue::SplFee,
         spl_ledger_client(runtime, &pending.mint),
         mint_arg(
             Account {

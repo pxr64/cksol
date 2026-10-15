@@ -50,6 +50,13 @@ impl SplDeposits {
         &self.swept
     }
 
+    /// Whether the submitted sweep carries more than one deposit, so a failure splits it.
+    pub fn is_batch(&self, signature: &Signature) -> bool {
+        self.swept
+            .get(signature)
+            .is_some_and(|sweep| sweep.deposits().len() > 1)
+    }
+
     pub fn finalized(&self) -> &SplSweeps {
         &self.finalized
     }

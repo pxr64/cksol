@@ -300,6 +300,7 @@ mod settle {
         SweepSettlementError, TransactionError, UiTransactionError, UnreadableOutcome, account,
         devnet_sweep, planned_sweep, queued_deposit_of,
     };
+    use crate::test_fixtures::fetched;
 
     type Deviation = fn(&mut EncodedConfirmedTransactionWithStatusMeta);
 
@@ -334,8 +335,9 @@ mod settle {
             let mut outcome = devnet_sweep::outcome();
             deviate(&mut outcome);
 
+            let fetched = fetched(outcome);
             let settled = devnet_sweep::sweep()
-                .settle(&outcome)
+                .settle(&fetched.transaction, fetched.meta.as_ref())
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
 
             assert_eq!(
@@ -349,12 +351,7 @@ mod settle {
 
     #[test]
     fn should_reject_an_outcome_that_cannot_be_read() {
-        let cases: [(&str, Deviation, UnreadableOutcome); 3] = [
-            (
-                "the transaction cannot be decoded",
-                devnet_sweep::corrupt_transaction,
-                UnreadableOutcome::TransactionDecodingFailed,
-            ),
+        let cases: [(&str, Deviation, UnreadableOutcome); 2] = [
             (
                 "the meta field is missing",
                 |outcome| outcome.transaction.meta = None,
@@ -373,8 +370,9 @@ mod settle {
             let mut outcome = devnet_sweep::outcome();
             deviate(&mut outcome);
 
+            let fetched = fetched(outcome);
             assert_eq!(
-                devnet_sweep::sweep().settle(&outcome),
+                devnet_sweep::sweep().settle(&fetched.transaction, fetched.meta.as_ref()),
                 Err(SweepSettlementError::Unreadable(expected)),
                 "{name}"
             );
@@ -505,8 +503,9 @@ mod settle {
             let mut outcome = devnet_sweep::outcome();
             deviate(&mut outcome);
 
+            let fetched = fetched(outcome);
             assert_eq!(
-                devnet_sweep::sweep().settle(&outcome),
+                devnet_sweep::sweep().settle(&fetched.transaction, fetched.meta.as_ref()),
                 Err(SweepSettlementError::Mismatch(expected)),
                 "{name}"
             );
@@ -530,9 +529,12 @@ fn sweep_of<const N: usize>(sweepable_amounts: [Lamport; N]) -> Sweep {
 }
 
 mod recover {
-    use super::{Sweep, SweepRecoveryError, VersionedMessage, queued_deposit, sweep_message};
+    use super::{
+        MINTER_ADDRESS, Sweep, SweepRecoveryError, VersionedMessage, queued_deposit, sweep_message,
+    };
     use crate::test_fixtures::arb::{arb_address, arb_hash, arb_sweep_deposits};
     use proptest::{prop_assert_eq, proptest};
+    use solana_hash::Hash;
 
     proptest! {
         #[test]
@@ -544,7 +546,7 @@ mod recover {
             let planned = Sweep::plan(deposits.clone(), minter_address);
             let submitted = VersionedMessage::Legacy(planned.sweep_message(blockhash));
 
-            let recovered = Sweep::recover(deposits, &submitted);
+            let recovered = Sweep::recover(deposits, minter_address, &submitted);
 
             prop_assert_eq!(recovered, Ok(planned));
         }
@@ -572,7 +574,7 @@ mod recover {
             mutate(&mut message);
             let submitted = VersionedMessage::Legacy(message);
 
-            let sweep = Sweep::recover(deposits, &submitted);
+            let sweep = Sweep::recover(deposits, MINTER_ADDRESS, &submitted);
 
             assert_eq!(
                 sweep,
@@ -586,13 +588,42 @@ mod recover {
     }
 
     #[test]
-    fn should_fail_without_a_transfer_to_read_the_destination_from() {
+    fn should_fail_when_the_message_sweeps_to_another_destination() {
+        let deposits = [(0, queued_deposit(0)), (1, queued_deposit(1))];
+        let other_destination = solana_address::Address::from([7; 32]);
+        assert_ne!(other_destination, MINTER_ADDRESS);
+        let submitted = sweep_message(deposits);
+
+        let sweep = Sweep::recover(deposits, other_destination, &submitted);
+
+        assert_eq!(
+            sweep,
+            Err(SweepRecoveryError::UnexpectedMessage {
+                planned: Box::new(VersionedMessage::Legacy(
+                    Sweep::plan(deposits, other_destination).sweep_message(Hash::default())
+                )),
+                submitted: Box::new(submitted),
+            })
+        );
+    }
+
+    #[test]
+    fn should_fail_when_the_message_has_no_transfers() {
         let deposit = queued_deposit(0);
         let message = solana_message::Message::new(&[], Some(&deposit.address));
+        let submitted = VersionedMessage::Legacy(message);
 
-        let sweep = Sweep::recover([(0, deposit)], &VersionedMessage::Legacy(message));
+        let sweep = Sweep::recover([(0, deposit)], MINTER_ADDRESS, &submitted);
 
-        assert_eq!(sweep, Err(SweepRecoveryError::MissingDestination));
+        assert_eq!(
+            sweep,
+            Err(SweepRecoveryError::UnexpectedMessage {
+                planned: Box::new(VersionedMessage::Legacy(
+                    Sweep::plan([(0, deposit)], MINTER_ADDRESS).sweep_message(Hash::default())
+                )),
+                submitted: Box::new(submitted),
+            })
+        );
     }
 }
 

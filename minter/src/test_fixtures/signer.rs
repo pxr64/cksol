@@ -1,6 +1,7 @@
 use crate::{
     address::{DerivationPath, MINTER_DERIVATION_PATH, derivation_path},
     signer::SchnorrSigner,
+    test_fixtures::devnet_sweep,
 };
 use ic_cdk_management_canister::SignCallError;
 use icrc_ledger_types::icrc1::account::Account;
@@ -43,6 +44,7 @@ pub(super) fn derivation_path_signature(
 pub fn sign_for(account: &Account) -> SignerExpectation {
     SignerExpectation {
         derivation_path: derivation_path(account),
+        message: None,
         answers: Answers::Derived(1),
     }
 }
@@ -52,7 +54,18 @@ pub fn sign_for(account: &Account) -> SignerExpectation {
 pub fn sign_as_minter() -> SignerExpectation {
     SignerExpectation {
         derivation_path: MINTER_DERIVATION_PATH,
+        message: None,
         answers: Answers::Derived(1),
+    }
+}
+
+/// Expects the minter's main address to sign once with the key of
+/// [`devnet_sweep::master_key`], so that `get_transaction` accepts the signed transaction.
+pub fn sign_as_devnet_minter() -> SignerExpectation {
+    SignerExpectation {
+        derivation_path: MINTER_DERIVATION_PATH,
+        message: None,
+        answers: Answers::Signed(1),
     }
 }
 
@@ -60,6 +73,7 @@ pub fn sign_as_minter() -> SignerExpectation {
 #[derive(Clone)]
 pub struct SignerExpectation {
     derivation_path: DerivationPath,
+    message: Option<Vec<u8>>,
     answers: Answers,
 }
 
@@ -68,6 +82,12 @@ impl SignerExpectation {
     /// signature, so no two of them are alike.
     pub fn times(mut self, count: usize) -> Self {
         self.answers = Answers::Derived(count);
+        self
+    }
+
+    /// Expects every signing request to be for exactly `message`.
+    pub fn of_message(mut self, message: Vec<u8>) -> Self {
+        self.message = Some(message);
         self
     }
 
@@ -82,22 +102,23 @@ impl SignerExpectation {
 
     fn count(&self) -> usize {
         match &self.answers {
-            Answers::Derived(count) => *count,
+            Answers::Derived(count) | Answers::Signed(count) => *count,
             Answers::Given(answers) => answers.len(),
         }
     }
 
-    fn signatures(&self, first_occurrence: usize) -> Vec<Result<Signature, SignCallError>> {
+    fn answers(&self, first_occurrence: usize) -> Vec<Answer> {
         match &self.answers {
             Answers::Derived(count) => (0..*count)
                 .map(|index| {
-                    Ok(derivation_path_signature(
+                    Answer::Given(Ok(derivation_path_signature(
                         &self.derivation_path,
                         first_occurrence + index,
-                    ))
+                    )))
                 })
                 .collect(),
-            Answers::Given(answers) => answers.clone(),
+            Answers::Signed(count) => (0..*count).map(|_| Answer::Signed).collect(),
+            Answers::Given(answers) => answers.iter().cloned().map(Answer::Given).collect(),
         }
     }
 }
@@ -105,7 +126,15 @@ impl SignerExpectation {
 #[derive(Clone)]
 enum Answers {
     Derived(usize),
+    Signed(usize),
     Given(Vec<Result<Signature, SignCallError>>),
+}
+
+/// How the mock answers one signing request.
+enum Answer {
+    Given(Result<Signature, SignCallError>),
+    /// The real signature of the message by the devnet key on the requested path.
+    Signed,
 }
 
 mock! {
@@ -169,16 +198,26 @@ impl MockSchnorrSigner {
 
             for expectation in &self.expectations {
                 let occurrence = occurrences.entry(&expectation.derivation_path).or_default();
-                let signatures = expectation.signatures(*occurrence);
-                *occurrence += signatures.len();
+                let answers = expectation.answers(*occurrence);
+                *occurrence += answers.len();
 
-                for signature in signatures {
+                for answer in answers {
                     let expected_path = expectation.derivation_path.clone();
+                    let expected_message = expectation.message.clone();
                     mock.expect_sign()
-                        .withf(move |_message, path| path == &expected_path)
+                        .withf(move |message, path| {
+                            path == &expected_path
+                                && expected_message
+                                    .as_ref()
+                                    .is_none_or(|expected| expected == message)
+                        })
                         .times(1)
-                        .return_once(move |_message, _path| {
-                            signature.map(|signature| signature.as_ref().to_vec())
+                        .return_once(move |message, path| {
+                            let signature = match answer {
+                                Answer::Given(signature) => signature?,
+                                Answer::Signed => devnet_sweep::sign_on(path, &message),
+                            };
+                            Ok(signature.as_ref().to_vec())
                         });
                 }
             }

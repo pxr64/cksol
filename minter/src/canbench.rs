@@ -1,11 +1,13 @@
 use crate::{
+    address::minter_address,
     constants::RENT_EXEMPTION_THRESHOLD,
     lifecycle,
     numeric::{LedgerBurnIndex, LedgerMintIndex},
     rpc::BlockHeight,
     runtime::IcCanisterRuntime,
+    sol_transfer::build_batch_withdrawal_message,
     state::{
-        DepositBalance, QueuedDeposit, Sweep,
+        DepositBalance, QueuedDeposit, SchnorrPublicKey, Sweep,
         audit::{process_event, replay_events},
         event::{
             CreditedDeposit, EventType, Signer, TransactionPurpose, VersionedMessage,
@@ -18,6 +20,7 @@ use crate::{
 use canbench_rs::bench;
 use candid::Principal;
 use cksol_types_internal::{Ed25519KeyName, InitArgs, SolanaNetwork};
+use ic_ed25519::{PocketIcMasterPublicKeyId, PublicKey};
 use icrc_ledger_types::icrc1::account::Account;
 use solana_signature::Signature;
 
@@ -25,22 +28,31 @@ const INDEX_OFFSET_QUARANTINE: usize = 10_000;
 const INDEX_OFFSET_WITHDRAWAL: usize = 20_000;
 const INDEX_OFFSET_DROPPED: usize = 30_000;
 const INDEX_OFFSET_EXPIRED: usize = 40_000;
-const INDEX_OFFSET_RESUBMIT: usize = 50_000;
 
 fn init_args() -> InitArgs {
     InitArgs {
         ledger_suite_orchestrator_id: None,
         sol_rpc_canister_id: Principal::from_slice(&[1_u8; 20]),
         ledger_canister_id: Principal::from_slice(&[2_u8; 20]),
-        automated_deposit_fee: 10_000_000,
         master_key_name: Ed25519KeyName::default(),
         minimum_withdrawal_amount: 10_000_000,
         minimum_deposit_amount: 10_000_000,
         withdrawal_fee: 5_000_000,
         deposit_sol_required_cycles: 1_000_000_000_000,
         solana_network: SolanaNetwork::Mainnet,
-        deposit_consolidation_fee: 10_000_000_000,
+        deposit_sol_fee: 10_000_000_000,
+        nonce_accounts: vec![nonce_account().to_string()],
     }
+}
+
+fn nonce_account() -> solana_address::Address {
+    solana_address::Address::from([0x4E; 32])
+}
+
+fn nonce_value(i: usize) -> solana_hash::Hash {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+    solana_hash::Hash::from(bytes)
 }
 
 fn signature(i: usize) -> Signature {
@@ -62,11 +74,27 @@ fn account(i: usize) -> Account {
     }
 }
 
-const MINTER_ADDRESS: solana_address::Address = solana_address::Address::new_from_array([0x43; 32]);
+/// The master key the generator records, as the management canister returns it
+/// under PocketIC, so the sweep destination matches the one the state derives.
+fn master_key() -> SchnorrPublicKey {
+    SchnorrPublicKey {
+        public_key: PublicKey::pocketic_key(PocketIcMasterPublicKeyId::Key1),
+        chain_code: [1; 32],
+    }
+}
 
-fn message() -> solana_message::Message {
-    let payer = solana_address::Address::from([0x42; 32]);
-    solana_message::Message::new_with_blockhash(&[], Some(&payer), &solana_message::Hash::default())
+fn nonce_withdrawal_message(
+    nonce_value: solana_hash::Hash,
+    destination: solana_address::Address,
+    amount: u64,
+) -> solana_message::Message {
+    build_batch_withdrawal_message(
+        &minter_address(&master_key()),
+        &nonce_account(),
+        nonce_value,
+        &[(destination, amount)],
+    )
+    .expect("BUG: a single-transfer withdrawal message fits in a transaction")
 }
 
 fn record(event: EventType) {
@@ -88,15 +116,15 @@ fn queue_and_sweep(deposit_id: u64, account_index: usize, amount: u64, sig: Sign
         address: deposit.address,
         balance: deposit.balance,
     });
-    let sweep = Sweep::plan([(deposit_id, deposit)], MINTER_ADDRESS);
+    let sweep = Sweep::plan([(deposit_id, deposit)], minter_address(&master_key()));
     record(EventType::SubmittedTransaction {
         signature: sig,
         message: VersionedMessage::Legacy(sweep.sweep_message(solana_message::Hash::default())),
         signers: vec![Signer::Account(account)],
-        purpose: TransactionPurpose::SweepDeposits {
+        purpose: TransactionPurpose::SweepDeposit {
             deposit_ids: vec![deposit_id],
+            block_height: BlockHeight::new(0),
         },
-        block_height: BlockHeight::new(0),
     });
 }
 
@@ -109,22 +137,31 @@ fn deposit_address(account_index: usize) -> solana_address::Address {
 fn accept_and_submit_withdrawal(account_index: usize, burn_index: u64, sig: Signature) {
     const WITHDRAWAL_FEE: u64 = 5_000_000;
     const WITHDRAWAL_AMOUNT: u64 = 10_000_000;
+    const AMOUNT_TO_TRANSFER: u64 = WITHDRAWAL_AMOUNT - WITHDRAWAL_FEE;
 
+    let destination = [0u8; 32];
+    let burn_indices = vec![LedgerBurnIndex::from(burn_index)];
     record(EventType::AcceptedWithdrawalRequest(WithdrawalRequest {
         account: account(account_index),
-        solana_address: [0u8; 32],
+        solana_address: destination,
         burn_block_index: LedgerBurnIndex::from(burn_index),
         burned_amount: WITHDRAWAL_AMOUNT,
-        amount_to_transfer: WITHDRAWAL_AMOUNT - WITHDRAWAL_FEE,
+        amount_to_transfer: AMOUNT_TO_TRANSFER,
     }));
+    record(EventType::CreatedWithdrawalTransaction {
+        burn_indices: burn_indices.clone(),
+        nonce_account: nonce_account(),
+        nonce_value: nonce_value(account_index),
+    });
     record(EventType::SubmittedTransaction {
         signature: sig,
-        message: VersionedMessage::Legacy(message()),
+        message: VersionedMessage::Legacy(nonce_withdrawal_message(
+            nonce_value(account_index),
+            solana_address::Address::from(destination),
+            AMOUNT_TO_TRANSFER,
+        )),
         signers: vec![Signer::Minter],
-        purpose: TransactionPurpose::WithdrawSol {
-            burn_indices: vec![LedgerBurnIndex::from(burn_index)],
-        },
-        block_height: BlockHeight::new(0),
+        purpose: TransactionPurpose::Withdrawal { burn_indices },
     });
 }
 
@@ -137,6 +174,14 @@ fn setup_10k_events() {
 
     let runtime = IcCanisterRuntime::new();
     lifecycle::init(init_args(), runtime);
+
+    // A sweep takes its destination from the recorded minter public key, so the
+    // log starts with the event that records it.
+    let master_key = master_key();
+    record(EventType::MinterPublicKeyFetched {
+        public_key: master_key.public_key,
+        chain_code: master_key.chain_code,
+    });
 
     const SWEEP_FEE: u64 = 5_000;
     let amount: u64 = 1_000_000_000;
@@ -177,8 +222,8 @@ fn setup_10k_events() {
         record(EventType::QuarantinedSweep { signature: sig });
     }
 
-    // Withdrawal cycles: accept withdrawal → submit withdrawal → succeed
-    // 500 × 3 = 1500 events
+    // Withdrawal cycles: accept withdrawal → create transaction → submit → succeed
+    // 500 × 4 = 2000 events
     for i in 0..500 {
         let sig = signature(INDEX_OFFSET_WITHDRAWAL + i);
 
@@ -197,28 +242,19 @@ fn setup_10k_events() {
         record(EventType::FailedTransaction { signature: sig });
     }
 
-    // Expired + resubmitted withdrawal cycles: accept → submit → expire → resubmit → succeed
-    // 300 × 5 = 1500 events
+    // Expired sweeps: queue → sweep → expire
+    // 300 × 3 = 900 events
     for i in 0..300 {
-        let old_sig = signature(INDEX_OFFSET_EXPIRED + i);
-        let new_sig = signature(INDEX_OFFSET_RESUBMIT + i);
+        let deposit_id = next_deposit_id;
+        next_deposit_id += 1;
+        let sig = signature(INDEX_OFFSET_EXPIRED + i);
 
-        accept_and_submit_withdrawal(
-            INDEX_OFFSET_EXPIRED + i,
-            (INDEX_OFFSET_EXPIRED + i) as u64,
-            old_sig,
-        );
-        record(EventType::ExpiredTransaction { signature: old_sig });
-        record(EventType::ResubmittedTransaction {
-            old_signature: old_sig,
-            new_signature: new_sig,
-            new_block_height: BlockHeight::new(1),
-        });
-        record(EventType::SucceededTransaction { signature: new_sig });
+        queue_and_sweep(deposit_id, INDEX_OFFSET_EXPIRED + i, amount, sig);
+        record(EventType::ExpiredTransaction { signature: sig });
     }
 
-    // Total: 1 (init) + 5000 + 800 + 1500 + 1500 + 1500 = 10301 events
-    assert_eq!(total_event_count(), 10301);
+    // Total: 1 (init) + 1 (minter public key) + 5000 + 800 + 2000 + 1500 + 900 = 10202 events
+    assert_eq!(total_event_count(), 10202);
     reset_state();
 }
 

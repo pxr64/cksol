@@ -1,7 +1,7 @@
 use candid::Principal;
 use canlog::{Log, Sort};
 use cksol_minter::{
-    address::lazy_get_schnorr_master_key,
+    address::{fetch_and_record_minter_public_key, minter_address},
     deposit::{
         spl::{process_pending_spl_mints, sweep_queued_spl_deposits},
         sweep::{
@@ -9,10 +9,7 @@ use cksol_minter::{
             sweep_queued_deposits,
         },
     },
-    monitor::{
-        FINALIZE_TRANSACTIONS_DELAY, RESUBMIT_TRANSACTIONS_DELAY, finalize_transactions,
-        resubmit_transactions,
-    },
+    monitor::{FINALIZE_TRANSACTIONS_DELAY, finalize_transactions},
     runtime::IcCanisterRuntime,
     state::read_state,
     withdraw::{WITHDRAWAL_PROCESSING_DELAY, process_pending_withdrawals},
@@ -21,7 +18,7 @@ use cksol_types::{
     AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
     DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, DepositSplStatus,
     GetDepositAddressArgs, GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo,
-    WithdrawalArgs, WithdrawalError, WithdrawalOk, WithdrawalStatus, WithdrawalStatusArgs,
+    WithdrawSolArgs, WithdrawSolError, WithdrawSolOk, WithdrawSolStatus, WithdrawSolStatusArgs,
 };
 use cksol_types_internal::{MinterArg, log::Priority};
 use ic_http_types::{HttpRequest, HttpResponse, HttpResponseBuilder};
@@ -65,7 +62,7 @@ fn post_upgrade(args: Option<MinterArg>) {
     setup_timers();
 }
 
-#[ic_cdk::query]
+#[ic_cdk::update]
 fn get_deposit_address(args: GetDepositAddressArgs) -> Address {
     let account = assert_valid_deposit_account(args.owner, args.subaccount);
     cksol_minter::address::get_deposit_address(&account).into()
@@ -78,7 +75,7 @@ async fn deposit_sol(args: DepositSolArgs) -> Result<DepositSolId, DepositSolErr
 }
 
 #[ic_cdk::query]
-fn deposit_status(deposit_id: DepositSolId) -> DepositSolStatus {
+fn deposit_sol_status(deposit_id: DepositSolId) -> DepositSolStatus {
     cksol_minter::deposit::sweep::deposit_status(deposit_id)
 }
 
@@ -100,7 +97,7 @@ async fn deposit_spl(args: DepositSplArgs) -> Result<DepositSplId, DepositSplErr
     cksol_minter::deposit::spl::deposit_spl(&IcCanisterRuntime::new(), account, args.mint).await
 }
 
-#[ic_cdk::query]
+#[ic_cdk::update]
 fn get_spl_deposit_address(
     args: GetSplDepositAddressArgs,
 ) -> Result<Address, GetSplDepositAddressError> {
@@ -109,7 +106,7 @@ fn get_spl_deposit_address(
 }
 
 #[ic_cdk::update]
-async fn withdraw(args: WithdrawalArgs) -> Result<WithdrawalOk, WithdrawalError> {
+async fn withdraw_sol(args: WithdrawSolArgs) -> Result<WithdrawSolOk, WithdrawSolError> {
     let account = assert_non_anonymous_account(None, args.from_subaccount);
 
     cksol_minter::withdraw::withdraw(
@@ -122,7 +119,7 @@ async fn withdraw(args: WithdrawalArgs) -> Result<WithdrawalOk, WithdrawalError>
 }
 
 #[ic_cdk::update]
-fn withdrawal_status(args: WithdrawalStatusArgs) -> WithdrawalStatus {
+fn withdraw_sol_status(args: WithdrawSolStatusArgs) -> WithdrawSolStatus {
     cksol_minter::withdraw::withdrawal_status(args.block_index)
 }
 
@@ -130,207 +127,14 @@ fn withdrawal_status(args: WithdrawalStatusArgs) -> WithdrawalStatus {
 fn get_events(
     args: cksol_types_internal::event::GetEventsArgs,
 ) -> cksol_types_internal::event::GetEventsResult {
-    use cksol_minter::state::event::{
-        Event, EventType, Signer, TransactionPurpose, VersionedMessage,
-    };
     use cksol_types_internal::event;
 
     const MAX_EVENTS_PER_RESPONSE: u64 = 2_000;
 
-    fn map_event(event: Event) -> event::Event {
-        event::Event {
-            timestamp: event.timestamp,
-            payload: map_event_type(event.payload),
-        }
-    }
-
-    fn map_event_type(event_type: EventType) -> event::EventType {
-        match event_type {
-            EventType::Init(args) => event::EventType::Init(args),
-            EventType::Upgrade(args) => event::EventType::Upgrade(args),
-            EventType::AcceptedWithdrawalRequest(request) => {
-                event::EventType::AcceptedWithdrawalRequest {
-                    account: request.account,
-                    solana_address: solana_address::Address::from(request.solana_address).into(),
-                    burn_block_index: *request.burn_block_index.get(),
-                    burned_amount: request.burned_amount,
-                    amount_to_transfer: request.amount_to_transfer,
-                }
-            }
-            EventType::SubmittedTransaction {
-                signature,
-                message,
-                signers,
-                purpose,
-                block_height,
-            } => {
-                let purpose = match purpose {
-                    TransactionPurpose::WithdrawSol { burn_indices } => {
-                        event::TransactionPurpose::WithdrawSol {
-                            burn_indices: burn_indices.iter().map(|idx| *idx.get()).collect(),
-                        }
-                    }
-                    TransactionPurpose::SweepDeposits { deposit_ids } => {
-                        event::TransactionPurpose::SweepDeposits { deposit_ids }
-                    }
-                    TransactionPurpose::SweepSplDeposits { deposit_ids } => {
-                        event::TransactionPurpose::SweepSplDeposits { deposit_ids }
-                    }
-                    TransactionPurpose::RetrySplDeposit { deposit_id } => {
-                        event::TransactionPurpose::RetrySplDeposit { deposit_id }
-                    }
-                };
-                event::EventType::SubmittedTransaction {
-                    signature: signature.into(),
-                    transaction: match message {
-                        VersionedMessage::Legacy(message) => {
-                            event::VersionedTransactionMessage::Legacy(
-                                bincode::serialize(&message)
-                                    .expect("serializing transaction should succeed"),
-                            )
-                        }
-                    },
-                    signers: signers
-                        .into_iter()
-                        .map(|signer| match signer {
-                            Signer::Minter => event::Signer::Minter,
-                            Signer::Account(account) => event::Signer::Account(account),
-                        })
-                        .collect(),
-                    purpose,
-                    block_height: block_height.get(),
-                }
-            }
-            EventType::ResubmittedTransaction {
-                old_signature,
-                new_signature,
-                new_block_height,
-            } => event::EventType::ResubmittedTransaction {
-                old_signature: old_signature.into(),
-                new_signature: new_signature.into(),
-                new_block_height: new_block_height.get(),
-            },
-            EventType::SucceededTransaction { signature } => {
-                event::EventType::SucceededTransaction {
-                    signature: signature.into(),
-                }
-            }
-            EventType::FailedTransaction { signature } => event::EventType::FailedTransaction {
-                signature: signature.into(),
-            },
-            EventType::ExpiredTransaction { signature } => event::EventType::ExpiredTransaction {
-                signature: signature.into(),
-            },
-            EventType::QueuedDeposit {
-                deposit_id,
-                account,
-                address,
-                balance,
-            } => event::EventType::QueuedDeposit {
-                deposit_id,
-                account,
-                address: address.into(),
-                balance: balance.into(),
-            },
-            EventType::CreditedSweep {
-                signature,
-                amount_received,
-                mints,
-            } => event::EventType::CreditedSweep {
-                signature: signature.into(),
-                amount_received,
-                mints: mints
-                    .into_iter()
-                    .map(|mint| event::CreditedDeposit {
-                        deposit_id: mint.deposit_id,
-                        amount_to_mint: mint.amount_to_mint,
-                    })
-                    .collect(),
-            },
-            EventType::CreditedSplSweep {
-                signature,
-                lamports_spent,
-                mints,
-            } => event::EventType::CreditedSplSweep {
-                signature: signature.into(),
-                lamports_spent,
-                mints: mints
-                    .into_iter()
-                    .map(|mint| event::CreditedSplDeposit {
-                        deposit_id: mint.deposit_id,
-                        amount_to_mint: mint.amount_to_mint,
-                    })
-                    .collect(),
-            },
-            EventType::QuarantinedSweep { signature } => event::EventType::QuarantinedSweep {
-                signature: signature.into(),
-            },
-            EventType::QuarantinedSplSweep { signature } => event::EventType::QuarantinedSplSweep {
-                signature: signature.into(),
-            },
-            EventType::SplitFailedSplSweep { signature } => event::EventType::SplitFailedSplSweep {
-                signature: signature.into(),
-            },
-            EventType::MintedSweptSplDeposit {
-                deposit_id,
-                mint_block_index,
-            } => event::EventType::MintedSweptSplDeposit {
-                deposit_id,
-                mint_block_index: *mint_block_index.get(),
-            },
-            EventType::QuarantinedPendingSplMint { deposit_id } => {
-                event::EventType::QuarantinedPendingSplMint { deposit_id }
-            }
-            EventType::MintedSplDepositFee {
-                deposit_id,
-                mint_block_index,
-            } => event::EventType::MintedSplDepositFee {
-                deposit_id,
-                mint_block_index: *mint_block_index.get(),
-            },
-            EventType::QuarantinedPendingSplFeeMint { deposit_id } => {
-                event::EventType::QuarantinedPendingSplFeeMint { deposit_id }
-            }
-            EventType::MintedSweptDeposit {
-                deposit_id,
-                mint_block_index,
-            } => event::EventType::MintedSweptDeposit {
-                deposit_id,
-                mint_block_index: *mint_block_index.get(),
-            },
-            EventType::QuarantinedPendingMint { deposit_id } => {
-                event::EventType::QuarantinedPendingMint { deposit_id }
-            }
-            EventType::QueuedSplDeposit {
-                deposit_id,
-                account,
-                mint,
-                address,
-                balance,
-                fee,
-            } => event::EventType::QueuedSplDeposit {
-                deposit_id,
-                account,
-                mint: mint.into(),
-                address: address.into(),
-                balance,
-                fee,
-            },
-            EventType::AddedSplToken(token) => event::EventType::AddedSplToken {
-                mint: token.mint.into(),
-                token_program: token.token_program.id().into(),
-                decimals: token.decimals,
-                ledger_id: token.ledger_id,
-                minimum_deposit_amount: token.minimum_deposit_amount,
-                paused: token.paused,
-            },
-        }
-    }
-
     let events = cksol_minter::storage::with_event_iter(|it| {
         it.skip(args.start as usize)
             .take(args.length.min(MAX_EVENTS_PER_RESPONSE) as usize)
-            .map(map_event)
+            .map(event::Event::from)
             .collect()
     });
     event::GetEventsResult {
@@ -342,13 +146,20 @@ fn get_events(
 #[ic_cdk::query]
 fn get_minter_info() -> MinterInfo {
     read_state(|s| MinterInfo {
-        automated_deposit_fee: s.automated_deposit_fee(),
-        deposit_consolidation_fee: s.deposit_consolidation_fee(),
+        deposit_sol_fee: s.deposit_sol_fee(),
         minimum_withdrawal_amount: s.minimum_withdrawal_amount(),
         minimum_deposit_amount: s.minimum_deposit_amount(),
         withdrawal_fee: s.withdrawal_fee(),
         deposit_sol_required_cycles: s.deposit_sol_required_cycles(),
         balance: s.balance(),
+        minter_address: s
+            .minter_public_key()
+            .map(|key| minter_address(key).to_string()),
+        nonce_accounts: s
+            .nonce_pool_addresses()
+            .iter()
+            .map(|address| address.to_string())
+            .collect(),
     })
 }
 
@@ -471,9 +282,7 @@ fn assert_valid_deposit_account(
 
 fn setup_timers() {
     ic_cdk_timers::set_timer(Duration::from_secs(0), async {
-        // Initialize the minter's Ed25519 public key
-        let runtime = IcCanisterRuntime::new();
-        let _ = lazy_get_schnorr_master_key(&runtime).await;
+        fetch_and_record_minter_public_key(IcCanisterRuntime::new()).await;
     });
     ic_cdk_timers::set_timer_interval(WITHDRAWAL_PROCESSING_DELAY, async || {
         process_pending_withdrawals(IcCanisterRuntime::new()).await;
@@ -492,9 +301,6 @@ fn setup_timers() {
     });
     ic_cdk_timers::set_timer_interval(FINALIZE_TRANSACTIONS_DELAY, async || {
         finalize_transactions(IcCanisterRuntime::new()).await;
-    });
-    ic_cdk_timers::set_timer_interval(RESUBMIT_TRANSACTIONS_DELAY, async || {
-        resubmit_transactions(IcCanisterRuntime::new()).await;
     });
 }
 

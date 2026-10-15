@@ -11,10 +11,11 @@ use crate::{
     },
     storage::{reset_events, with_event_iter},
     test_fixtures::{
-        DEFAULT_BLOCK_HEIGHT, EventsAssert, account, confirmed_block, minter_signature,
-        minter_signature_nth, queued_spl_deposit,
+        DEFAULT_BLOCK_HEIGHT, EventsAssert, account, confirmed_block,
+        minter_public_key_fetched_event, minter_signature, minter_signature_nth,
+        queued_spl_deposit,
         runtime::TestCanisterRuntime,
-        schnorr_master_key, schnorr_master_key_response, signature,
+        schnorr_master_key, signature,
         signer::{sign_as_minter, sign_for},
         spl_token, valid_init_args,
     },
@@ -67,8 +68,8 @@ fn submit_batch(ids: &[u64]) -> (Signature, SplSweep) {
                 message: message.into(),
                 purpose: TransactionPurpose::SweepSplDeposits {
                     deposit_ids: ids.to_vec(),
+                    block_height: DEFAULT_BLOCK_HEIGHT,
                 },
-                block_height: DEFAULT_BLOCK_HEIGHT,
             },
             &TestCanisterRuntime::new().with_increasing_time(),
         )
@@ -166,11 +167,10 @@ async fn should_drop_frozen_single_sweep_and_allow_a_new_deposit_request() {
         );
         assert_eq!(state.spl_deposits().dropped().len(), 1);
     });
-    let fee = read_state(|state| state.deposit_consolidation_fee());
+    let fee = read_state(|state| state.deposit_sol_fee());
     let runtime = TestCanisterRuntime::new()
         .with_increasing_time()
         .expecting_charges()
-        .with_schnorr_public_key(schnorr_master_key_response())
         .add_msg_cycles_available(2 * crate::constants::GET_ACCOUNT_INFO_CYCLES + fee)
         .add_msg_cycles_refunded(crate::constants::GET_ACCOUNT_INFO_CYCLES / 2)
         .add_msg_cycles_refunded(crate::constants::GET_ACCOUNT_INFO_CYCLES / 2)
@@ -298,7 +298,6 @@ async fn should_submit_individual_retries_and_drop_only_the_failed_deposit() {
     split_batch(&[0, 1]);
     let runtime = TestCanisterRuntime::new()
         .with_increasing_time()
-        .with_schnorr_public_key(schnorr_master_key_response())
         .add_recent_block(Ok(block().slot))
         .add_signer(sign_as_minter().times(2))
         .add_signer(sign_for(&account(1)))
@@ -315,12 +314,23 @@ async fn should_submit_individual_retries_and_drop_only_the_failed_deposit() {
         assert_eq!(state.spl_deposits().swept().len(), 2);
         assert!(state.spl_deposits().retrying().is_empty());
         for transaction in state.submitted_transactions().values() {
-            assert_matches!(
-                transaction.purpose,
-                TransactionPurpose::RetrySplDeposit { .. }
-            );
+            assert_matches!(transaction, MinterTransaction::SweepSplDeposit { .. });
         }
     });
+    let retries = crate::storage::with_event_iter(|events| {
+        events
+            .filter(|event| {
+                matches!(
+                    event.payload,
+                    EventType::SubmittedTransaction {
+                        purpose: TransactionPurpose::RetrySplDeposit { .. },
+                        ..
+                    }
+                )
+            })
+            .count()
+    });
+    assert_eq!(retries, 2);
     let statuses = read_state(|state| {
         state
             .submitted_transactions()
@@ -377,6 +387,7 @@ async fn should_submit_individual_retries_and_drop_only_the_failed_deposit() {
     }
     read_state(|state| assert_eq!(state, &replayed));
 }
+use crate::state::MinterTransaction;
 use solana_hash::Hash;
 use solana_transaction::Transaction;
 
@@ -446,16 +457,13 @@ async fn should_return_early_when_spl_sweep_timer_is_active() {
 async fn should_leave_spl_queue_unchanged_when_fetching_block_fails() {
     queue_deposits(2, true, false, None);
     let before = EventsAssert::from_recorded();
-    let runtime = TestCanisterRuntime::new()
-        .with_schnorr_public_key(schnorr_master_key_response())
-        .add_recent_block(Err(RpcError::ValidationError(
-            "block unavailable".to_string(),
-        )));
+    let runtime = TestCanisterRuntime::new().add_recent_block(Err(RpcError::ValidationError(
+        "block unavailable".to_string(),
+    )));
 
     sweep_queued_spl_deposits(runtime.clone()).await;
 
     assert_eq!(EventsAssert::from_recorded(), before);
-    assert_eq!(runtime.schnorr_public_key_call_count(), 1);
     assert_eq!(runtime.set_timer_call_count(), 0);
     assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
     read_state(|state| assert_eq!(state.spl_deposits().queued().len(), 2));
@@ -468,14 +476,12 @@ async fn should_sweep_spl_deposits_while_sol_sweep_timer_is_active() {
     let sweep = queued_sweep();
     let runtime = signing_runtime()
         .add_recent_block(Ok(block().slot))
-        .with_schnorr_public_key(schnorr_master_key_response())
         .add_stub_response(MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Ok(
             minter_signature().into(),
         )));
 
     sweep_queued_spl_deposits(runtime.clone()).await;
 
-    assert_eq!(runtime.schnorr_public_key_call_count(), 1);
     assert_eq!(runtime.set_timer_call_count(), 0);
     assert!(TimerGuard::new(TaskType::SweepDeposits).is_err());
     assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
@@ -489,7 +495,6 @@ async fn should_keep_spl_sweep_tracked_when_timer_submission_fails() {
     let sweep = queued_sweep();
     let runtime = signing_runtime()
         .add_recent_block(Ok(block().slot))
-        .with_schnorr_public_key(schnorr_master_key_response())
         .add_stub_error(IcError::CallPerformFailed);
 
     sweep_queued_spl_deposits(runtime.clone()).await;
@@ -505,7 +510,6 @@ async fn should_leave_spl_deposits_queued_when_timer_signing_fails() {
     let before = EventsAssert::from_recorded();
     let runtime = TestCanisterRuntime::new()
         .add_recent_block(Ok(block().slot))
-        .with_schnorr_public_key(schnorr_master_key_response())
         .add_signer(sign_as_minter().expect([Err(SignCallError::CallFailed(
             CallRejected::with_rejection(4, "signing unavailable".to_string()).into(),
         ))]));
@@ -565,7 +569,6 @@ async fn should_reschedule_spl_sweep_round_until_all_deposits_are_submitted() {
     let total_batches = round.batches.len() + second_round_batches.len();
     let mut runtime = TestCanisterRuntime::new()
         .with_increasing_time()
-        .with_schnorr_public_key(schnorr_master_key_response())
         .add_signer(sign_as_minter().times(total_batches));
     for id in 1..=100 {
         runtime = runtime.add_signer(sign_for(&account(id)));
@@ -599,7 +602,6 @@ async fn should_reschedule_spl_sweep_round_until_all_deposits_are_submitted() {
     sweep_queued_spl_deposits(runtime.clone()).await;
 
     assert_eq!(runtime.set_timer_call_count(), 1);
-    assert_eq!(runtime.schnorr_public_key_call_count(), 1);
     assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
     read_state(|state| {
         assert!(state.spl_deposits().queued().is_empty());
@@ -616,8 +618,8 @@ fn assert_submission_is_tracked(sweep: &SplSweep, block: Block) {
         signers: sweep.signers(&message),
         purpose: TransactionPurpose::SweepSplDeposits {
             deposit_ids: sweep.deposits().keys().copied().collect(),
+            block_height: block.block_height,
         },
-        block_height: block.block_height,
     };
     assert!(EventsAssert::from_recorded().contains_event(&expected));
     read_state(|state| {
@@ -630,8 +632,12 @@ fn assert_submission_is_tracked(sweep: &SplSweep, block: Block) {
             .submitted_transactions()
             .get(&minter_signature())
             .unwrap();
-        assert_eq!(submitted.message, message.into());
-        assert_eq!(submitted.block_height, block.block_height);
+        assert_eq!(
+            submitted,
+            &MinterTransaction::SweepSplDeposit {
+                block_height: block.block_height
+            }
+        );
         assert!(state.failed_transactions().is_empty());
         assert!(state.succeeded_transactions().is_empty());
         for (deposit_id, deposit) in sweep.deposits() {
@@ -664,10 +670,14 @@ async fn should_sign_record_and_submit_spl_sweep() {
         MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Ok(minter_signature().into())),
     );
 
-    let signature =
-        submit_spl_sweep_transaction(&runtime, batch_purpose(&sweep), sweep.clone(), block())
-            .await
-            .unwrap();
+    let signature = submit_spl_sweep_transaction(
+        &runtime,
+        batch_purpose(&sweep, block()),
+        sweep.clone(),
+        block(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(signature, minter_signature());
     assert_eq!(EventsAssert::from_recorded().len(), before + 1);
@@ -687,8 +697,13 @@ async fn should_keep_spl_sweep_tracked_when_rpc_submission_fails() {
         MultiRpcResult::<sol_rpc_types::Signature>::Consistent(Err(error.clone())),
     );
 
-    let result =
-        submit_spl_sweep_transaction(&runtime, batch_purpose(&sweep), sweep.clone(), block()).await;
+    let result = submit_spl_sweep_transaction(
+        &runtime,
+        batch_purpose(&sweep, block()),
+        sweep.clone(),
+        block(),
+    )
+    .await;
 
     assert_matches!(result, Err(SweepError::SubmitTransactionFailed(SubmitTransactionError::RpcError(actual))) if actual == error);
     assert_submission_is_tracked(&sweep, block());
@@ -701,8 +716,13 @@ async fn should_keep_spl_sweep_tracked_when_inter_canister_submission_fails() {
     let sweep = queued_sweep();
     let runtime = signing_runtime().add_stub_error(IcError::CallPerformFailed);
 
-    let result =
-        submit_spl_sweep_transaction(&runtime, batch_purpose(&sweep), sweep.clone(), block()).await;
+    let result = submit_spl_sweep_transaction(
+        &runtime,
+        batch_purpose(&sweep, block()),
+        sweep.clone(),
+        block(),
+    )
+    .await;
 
     assert_matches!(
         result,
@@ -724,8 +744,13 @@ async fn should_leave_spl_deposits_queued_when_signing_fails() {
         ),
     )]));
 
-    let result =
-        submit_spl_sweep_transaction(&runtime, batch_purpose(&sweep), sweep.clone(), block()).await;
+    let result = submit_spl_sweep_transaction(
+        &runtime,
+        batch_purpose(&sweep, block()),
+        sweep.clone(),
+        block(),
+    )
+    .await;
 
     assert_matches!(
         result,
@@ -750,6 +775,7 @@ fn queue_deposits(
 ) {
     let runtime = TestCanisterRuntime::new().with_increasing_time();
     lifecycle::init(valid_init_args(), runtime.clone());
+    mutate_state(|state| process_event(state, minter_public_key_fetched_event(), &runtime));
     for id in 0..count {
         let mint: solana_address::Address = if same_mint {
             [1; 32]

@@ -15,7 +15,7 @@ pub async fn credit_finalized_spl_sweeps<R: CanisterRuntime>(runtime: &R) -> boo
         FinalizedQueue::Spl,
         |state| state.spl_deposits().finalized().by_signature(),
         |signature, sweep: SplSweep, outcome| {
-            let settled = sweep.settle(outcome)?;
+            let settled = sweep.settle(&outcome.transaction, outcome.meta.as_ref())?;
             Ok(EventType::CreditedSplSweep {
                 signature,
                 lamports_spent: settled.lamports_spent(),

@@ -103,8 +103,8 @@ fn setup_pending_with_programs(
                     message: message.into(),
                     purpose: TransactionPurpose::SweepSplDeposits {
                         deposit_ids: vec![id as u64],
+                        block_height: DEFAULT_BLOCK_HEIGHT,
                     },
-                    block_height: DEFAULT_BLOCK_HEIGHT,
                 },
                 &runtime,
             );

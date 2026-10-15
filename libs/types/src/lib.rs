@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 #![forbid(missing_docs)]
 
-use candid::{CandidType, Nat, Principal};
+use candid::{CandidType, Principal};
 use icrc_ledger_types::icrc1::account::{Account, Subaccount};
 pub use memo::{BurnMemo, MAX_SERIALIZED_MEMO_BYTES, Memo, MintMemo};
 use serde::{Deserialize, Serialize};
@@ -102,12 +102,15 @@ pub enum DepositSolStatus {
         /// The signature of the sweep transaction.
         signature: Signature,
     },
-    /// The sweep transaction was finalized, but its outcome did not match the plan the
-    /// minter submitted it with, so the amount to credit cannot be determined safely and
-    /// no ckSOL was minted. This is not expected to happen and the minter does not
-    /// process the deposit any further: releasing or crediting it requires a minter
-    /// upgrade. Meanwhile the account stays in flight, so `deposit_sol` keeps rejecting
-    /// it and a new deposit has to use a different subaccount.
+    /// The minter stopped processing the deposit: either the finalized sweep's outcome
+    /// did not match the plan the minter submitted it with, so the amount to credit
+    /// cannot be determined safely and no ckSOL was minted, or the ckSOL mint of the
+    /// credited deposit could not be completed, in which case the mint may nevertheless
+    /// have landed on the ledger. This is not expected to happen and resolving it
+    /// requires a minter upgrade: before minting by hand, search the ledger for a mint
+    /// whose memo carries the sweep signature and the deposit id, otherwise a double
+    /// mint results. Meanwhile the account stays in flight, so `deposit_sol` keeps
+    /// rejecting it and a new deposit has to use a different subaccount.
     Quarantined {
         /// The signature of the sweep transaction.
         signature: Signature,
@@ -348,7 +351,7 @@ pub struct InsufficientCyclesError {
 
 /// Arguments for a withdrawal request to the ckSOL minter endpoint.
 #[derive(Clone, Eq, PartialEq, Debug, Default, CandidType, Deserialize, Serialize)]
-pub struct WithdrawalArgs {
+pub struct WithdrawSolArgs {
     /// The subaccount to burn ckSOL from.
     pub from_subaccount: Option<Subaccount>,
     /// Amount to withdraw in Lamports.
@@ -359,21 +362,21 @@ pub struct WithdrawalArgs {
 
 /// The successful result of a withdrawal request.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
-pub struct WithdrawalOk {
+pub struct WithdrawSolOk {
     /// The index of the burn block on the ckSOL ledger.
     pub block_index: LedgerBurnIndex,
 }
 
-/// Arguments for a request to the `withdrawal_status` ckSOL minter endpoint.
+/// Arguments for a request to the `withdraw_sol_status` ckSOL minter endpoint.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
-pub struct WithdrawalStatusArgs {
-    /// The burn block index returned by the `withdraw` endpoint.
+pub struct WithdrawSolStatusArgs {
+    /// The burn block index returned by the `withdraw_sol` endpoint.
     pub block_index: LedgerBurnIndex,
 }
 
 /// The error result of a withdrawal request.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
-pub enum WithdrawalError {
+pub enum WithdrawSolError {
     /// There is another request for this principal.
     AlreadyProcessing,
     /// The withdrawal amount is too low.
@@ -385,6 +388,9 @@ pub enum WithdrawalError {
     },
     /// The Solana address is not valid.
     MalformedAddress(String),
+    /// The destination address is not a valid withdrawal destination.
+    /// The payload contains a human-readable message explaining why the destination was rejected.
+    InvalidDestination(String),
     /// The withdrawal account does not hold the requested ckSOL amount.
     InsufficientFunds {
         /// The current balance of the withdrawal account.
@@ -406,8 +412,6 @@ pub enum TxFinalizedStatus {
     Success {
         /// The unique identifier (signature) of the Solana transaction.
         transaction_id: Signature,
-        /// The fee that was paid by the user.
-        effective_transaction_fee: Option<Nat>,
     },
     /// The transaction failed.
     Failure {
@@ -418,7 +422,7 @@ pub enum TxFinalizedStatus {
 
 /// Status of a withdrawal request.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
-pub enum WithdrawalStatus {
+pub enum WithdrawSolStatus {
     /// Withdrawal request is not found.
     NotFound,
     /// Withdrawal request is waiting to be processed.
@@ -435,10 +439,8 @@ pub enum WithdrawalStatus {
 /// Information about the ckSOL minter canister.
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Deserialize, Serialize)]
 pub struct MinterInfo {
-    /// Fee deducted from each deposit in the automated flow (SOL -> ckSOL).
-    pub automated_deposit_fee: Lamport,
     /// Extra cycles charged per `deposit_sol` call to offset the cost of the sweep.
-    pub deposit_consolidation_fee: u128,
+    pub deposit_sol_fee: u128,
     /// Minimum withdrawal amount in lamports.
     pub minimum_withdrawal_amount: Lamport,
     /// Minimum deposit amount in lamports.
@@ -449,4 +451,9 @@ pub struct MinterInfo {
     pub deposit_sol_required_cycles: u128,
     /// The minter's tracked SOL balance in lamports.
     pub balance: Lamport,
+    /// The minter's main Solana address, available once its Schnorr public key
+    /// has been fetched for the first time, shortly after installation.
+    pub minter_address: Option<String>,
+    /// The base58 addresses of the durable nonce accounts reserved for withdrawal transactions.
+    pub nonce_accounts: Vec<String>,
 }

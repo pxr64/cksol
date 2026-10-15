@@ -1,5 +1,5 @@
 use crate::{
-    address::lazy_get_schnorr_master_key,
+    address::minter_public_key,
     constants::MAX_CONCURRENT_RPC_CALLS,
     guard::TimerGuard,
     rpc::{Block, SubmitTransactionError, get_recent_block, submit_transaction},
@@ -15,6 +15,7 @@ use crate::{
 };
 use canlog::log;
 use cksol_types_internal::log::Priority;
+use sol_rpc_types::CommitmentLevel;
 use solana_hash::Hash;
 use solana_signature::Signature;
 use std::collections::BTreeMap;
@@ -23,6 +24,8 @@ use thiserror::Error;
 
 #[cfg(test)]
 mod tests;
+
+const SWEEP_BLOCKHASH_COMMITMENT: CommitmentLevel = CommitmentLevel::Confirmed;
 
 pub async fn sweep_queued_spl_deposits<R: CanisterRuntime>(runtime: R) {
     let _guard = match TimerGuard::new(TaskType::SweepSplDeposits) {
@@ -34,8 +37,14 @@ pub async fn sweep_queued_spl_deposits<R: CanisterRuntime>(runtime: R) {
     }) {
         return;
     }
-    let master_key = lazy_get_schnorr_master_key(&runtime).await;
-    let block = match get_recent_block(&runtime).await {
+    let master_key = match minter_public_key() {
+        Ok(key) => key,
+        Err(e) => {
+            log!(Priority::Info, "Skipping sweep of queued SPL deposits: {e}");
+            return;
+        }
+    };
+    let block = match get_recent_block(&runtime, SWEEP_BLOCKHASH_COMMITMENT).await {
         Ok(block) => block,
         Err(error) => {
             log!(
@@ -59,10 +68,10 @@ pub async fn sweep_queued_spl_deposits<R: CanisterRuntime>(runtime: R) {
     });
     let retries = retries
         .into_iter()
-        .map(|sweep| (retry_purpose(&sweep), sweep));
+        .map(|sweep| (retry_purpose(&sweep, block), sweep));
     let batches = batches
         .into_iter()
-        .map(|sweep| (batch_purpose(&sweep), sweep));
+        .map(|sweep| (batch_purpose(&sweep, block), sweep));
     futures::future::join_all(retries.chain(batches).map(async |(purpose, sweep)| {
         match submit_spl_sweep_transaction(&runtime, purpose, sweep, block).await {
             Ok(signature) => log!(
@@ -87,16 +96,20 @@ pub async fn sweep_queued_spl_deposits<R: CanisterRuntime>(runtime: R) {
     }
 }
 
-fn retry_purpose(sweep: &SplSweep) -> TransactionPurpose {
+fn retry_purpose(sweep: &SplSweep, block: Block) -> TransactionPurpose {
     let [deposit_id] = sweep.deposits().keys().copied().collect::<Vec<_>>()[..] else {
         panic!("BUG: a retry sweeps exactly one deposit");
     };
-    TransactionPurpose::RetrySplDeposit { deposit_id }
+    TransactionPurpose::RetrySplDeposit {
+        deposit_id,
+        block_height: block.block_height,
+    }
 }
 
-fn batch_purpose(sweep: &SplSweep) -> TransactionPurpose {
+fn batch_purpose(sweep: &SplSweep, block: Block) -> TransactionPurpose {
     TransactionPurpose::SweepSplDeposits {
         deposit_ids: sweep.deposits().keys().copied().collect(),
+        block_height: block.block_height,
     }
 }
 
@@ -223,11 +236,10 @@ async fn submit_spl_sweep_transaction<R: CanisterRuntime>(
                 message: transaction.message.clone().into(),
                 signers,
                 purpose,
-                block_height: block.block_height,
             },
             runtime,
         )
     });
-    submit_transaction(runtime, transaction).await?;
+    submit_transaction(runtime, transaction, SWEEP_BLOCKHASH_COMMITMENT).await?;
     Ok(signature)
 }

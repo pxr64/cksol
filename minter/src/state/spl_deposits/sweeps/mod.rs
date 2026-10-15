@@ -1,5 +1,6 @@
 use crate::{
     address::{account_address, associated_token_address, minter_address},
+    constants::FEE_PER_SIGNATURE,
     state::{
         QueuedSplDeposit, SchnorrPublicKey, SupportedSplToken, SweepMismatch, SweepSettlementError,
         TokenProgram, UnreadableOutcome,
@@ -13,10 +14,9 @@ use sol_rpc_types::Lamport;
 use solana_address::Address;
 use solana_hash::Hash;
 use solana_signature::Signature;
-use solana_transaction::Message;
+use solana_transaction::{Message, versioned::VersionedTransaction};
 use solana_transaction_status_client_types::{
-    EncodedConfirmedTransactionWithStatusMeta, UiTransactionStatusMeta, UiTransactionTokenBalance,
-    option_serializer::OptionSerializer,
+    UiTransactionStatusMeta, UiTransactionTokenBalance, option_serializer::OptionSerializer,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -222,9 +222,11 @@ impl SplSweep {
     /// Returns the lamport spend to debit and the token deposits to mint.
     pub fn settle(
         self,
-        outcome: &EncodedConfirmedTransactionWithStatusMeta,
+        transaction: &VersionedTransaction,
+        meta: Option<&UiTransactionStatusMeta>,
     ) -> Result<SettledSplSweep, SweepSettlementError> {
-        let (message, meta) = validate_sweep_transaction(outcome, |hash| self.sweep_message(hash))?;
+        let (message, meta) =
+            validate_sweep_transaction(transaction, meta, |hash| self.sweep_message(hash))?;
         let pre_lamports = meta.pre_balances[0];
         let post_lamports = meta.post_balances[0];
         let lamports_spent = pre_lamports
@@ -235,7 +237,7 @@ impl SplSweep {
                 post: post_lamports,
                 fee: meta.fee,
             })?;
-        self.validate_token_balances(&message, meta)?;
+        self.validate_token_balances(message, meta)?;
         let mints = self
             .deposits
             .into_iter()
@@ -334,6 +336,15 @@ impl SplSweep {
     }
 
     /// One destination account creation per token, followed by each planned transfer.
+    /// The fee of the sweep: one signature per account that signs it.
+    pub fn transaction_fee(&self) -> Lamport {
+        let signatures = self
+            .sweep_message(Hash::default())
+            .header
+            .num_required_signatures;
+        FEE_PER_SIGNATURE * u64::from(signatures)
+    }
+
     pub fn sweep_message(&self, recent_blockhash: Hash) -> Message {
         let mut destinations = BTreeSet::new();
         let mut instructions = Vec::new();

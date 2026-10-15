@@ -4,10 +4,9 @@ use crate::{
     state::{event::EventType, read_state},
     storage::with_event_iter,
     test_fixtures::{
-        DEPOSIT_CONSOLIDATION_FEE, DEPOSIT_SOL_REQUIRED_CYCLES, EventsAssert,
-        MINIMUM_DEPOSIT_AMOUNT, MINTER_ACCOUNT, account, deposit::DEPOSITOR_ACCOUNT, events,
-        init_schnorr_master_key, init_state, queued_deposit_of, runtime::TestCanisterRuntime,
-        signature,
+        DEPOSIT_SOL_FEE, DEPOSIT_SOL_REQUIRED_CYCLES, EventsAssert, MINIMUM_DEPOSIT_AMOUNT,
+        MINTER_ACCOUNT, account, deposit::DEPOSITOR_ACCOUNT, events, init_schnorr_master_key,
+        init_state, queued_deposit_of, runtime::TestCanisterRuntime, signature,
     },
 };
 use assert_matches::assert_matches;
@@ -47,6 +46,21 @@ async fn should_fail_if_insufficient_cycles_attached() {
                 received: DEPOSIT_SOL_REQUIRED_CYCLES - 1,
             }
         ))
+    );
+    assert!(runtime.msg_cycles_accepted().is_empty());
+    EventsAssert::assert_no_events_recorded();
+}
+
+#[tokio::test]
+async fn should_fail_while_the_minter_public_key_is_unavailable() {
+    init_state();
+    let runtime = TestCanisterRuntime::new().add_msg_cycles_available(DEPOSIT_SOL_REQUIRED_CYCLES);
+
+    let result = deposit_sol(&runtime, DEPOSITOR_ACCOUNT).await;
+
+    assert_matches!(
+        result,
+        Err(DepositSolError::TemporarilyUnavailable(e)) => assert!(e.contains("minter public key"))
     );
     assert!(runtime.msg_cycles_accepted().is_empty());
     EventsAssert::assert_no_events_recorded();
@@ -119,7 +133,7 @@ async fn should_queue_deposits_from_minimum_with_sequential_ids() {
         );
         assert_eq!(
             runtime.msg_cycles_accepted(),
-            [GET_BALANCE_CYCLES - GET_BALANCE_REFUND + DEPOSIT_CONSOLIDATION_FEE]
+            [GET_BALANCE_CYCLES - GET_BALANCE_REFUND + DEPOSIT_SOL_FEE]
         );
     }
     assert_eq!(deposit_status(2), DepositSolStatus::NotFound);

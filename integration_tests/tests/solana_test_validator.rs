@@ -1,3 +1,4 @@
+use assert_matches::assert_matches;
 use candid::Principal;
 use cksol_int_tests::{
     Setup,
@@ -5,7 +6,11 @@ use cksol_int_tests::{
     ledger_init_args::LEDGER_TRANSFER_FEE,
     validator::{FEE_PER_SIGNATURE, SolanaTestValidator, wait_for_withdrawal_finalized},
 };
-use cksol_types::{DepositSolId, DepositSolStatus, Signature, WithdrawalArgs};
+use cksol_types::{
+    DepositSolId, DepositSolStatus, Signature, TxFinalizedStatus, WithdrawSolArgs,
+    WithdrawSolError, WithdrawSolStatus,
+};
+use cksol_types_internal::{UpgradeArgs, event::EventType};
 use icrc_ledger_types::icrc1::account::Account;
 use sol_rpc_types::Lamport;
 use solana_address::Address;
@@ -90,7 +95,7 @@ async fn should_deposit_and_withdraw() {
         {
             let expected_minted_amount =
                 deposit_amount - RENT_EXEMPTION_THRESHOLD - FEE_PER_SIGNATURE;
-            let minted_amount = wait_for_deposit_minted(&setup, deposit_id).await;
+            let minted_amount = setup.wait_for_deposit_minted(deposit_id).await;
             assert_eq!(minted_amount, expected_minted_amount);
             assert_eq!(
                 setup.ledger().balance_of(*account).await,
@@ -129,7 +134,7 @@ async fn should_deposit_and_withdraw() {
 
                     setup
                         .minter()
-                        .withdraw(WithdrawalArgs {
+                        .withdraw_sol(WithdrawSolArgs {
                             from_subaccount: account.subaccount,
                             amount: withdrawal_amount,
                             address: withdrawal_address.to_string(),
@@ -141,12 +146,23 @@ async fn should_deposit_and_withdraw() {
             ))
             .await;
 
+        let nonce_account: Address = setup.minter().get_minter_info().await.nonce_accounts[0]
+            .parse()
+            .expect("the minter reports well-formed nonce accounts");
+        let nonce_value_before = validator.get_nonce_value(&nonce_account).await;
+
         // Advance time to trigger withdrawal processing and monitor timers
         setup.advance_time(Duration::from_mins(10)).await;
 
         for &burn_index in &burn_indices {
             wait_for_withdrawal_finalized(&setup, burn_index).await;
         }
+
+        // The landed withdrawal transaction advanced the durable nonce it carried.
+        assert_ne!(
+            validator.get_nonce_value(&nonce_account).await,
+            nonce_value_before
+        );
 
         // Verify all ICRC accounts are drained
         for account in &accounts {
@@ -173,6 +189,223 @@ async fn should_deposit_and_withdraw() {
             "Minter SOL balance should not decrease"
         );
     }
+
+    setup.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_add_an_operator_created_nonce_account_through_an_upgrade() {
+    let validator = SolanaTestValidator::start().await;
+    let setup = validator
+        .setup_builder()
+        .with_nonce_accounts(Vec::new())
+        .build()
+        .await;
+
+    assert_eq!(
+        setup.minter().get_minter_info().await.nonce_accounts,
+        Vec::<String>::new()
+    );
+    let authority = setup.wait_for_minter_address().await;
+
+    let nonce_accounts: Vec<String> = validator
+        .create_nonce_accounts(1, &authority)
+        .await
+        .iter()
+        .map(Address::to_string)
+        .collect();
+
+    setup
+        .minter()
+        .upgrade(UpgradeArgs {
+            nonce_accounts_to_add: Some(nonce_accounts.clone()),
+            ..UpgradeArgs::default()
+        })
+        .await
+        .expect("upgrade should succeed");
+
+    assert_eq!(
+        setup.minter().get_minter_info().await.nonce_accounts,
+        nonce_accounts
+    );
+
+    setup.drop().await;
+}
+
+/// The largest number of withdrawals the minter serves in a single durable-nonce transaction,
+/// mirroring `MAX_WITHDRAWALS_PER_NONCE_TX` in `minter/src/sol_transfer/mod.rs`.
+const MAX_WITHDRAWALS_PER_NONCE_TX: usize = 10;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_batch_withdrawals_over_two_nonce_accounts_and_reuse_a_freed_one() {
+    const NUM_BATCHED_WITHDRAWALS: usize = MAX_WITHDRAWALS_PER_NONCE_TX + 1;
+    const WITHDRAWAL_AMOUNT: Lamport = LAMPORTS_PER_SOL / 100;
+    const AMOUNT_RECEIVED_PER_WITHDRAWAL: Lamport =
+        WITHDRAWAL_AMOUNT - Setup::DEFAULT_WITHDRAWAL_FEE;
+
+    let validator = SolanaTestValidator::start().await;
+    let setup = validator.setup_with_nonce_accounts(2).await;
+    let pool: Vec<Address> = setup
+        .minter()
+        .get_minter_info()
+        .await
+        .nonce_accounts
+        .iter()
+        .map(|nonce_account| {
+            nonce_account
+                .parse()
+                .expect("the minter reports well-formed nonce accounts")
+        })
+        .collect();
+    assert_eq!(pool.len(), 2);
+
+    let account = Account {
+        owner: DEPOSITOR,
+        subaccount: None,
+    };
+    validator
+        .fund_deposit_address(&setup, account, LAMPORTS_PER_SOL / 5)
+        .await;
+    let deposit_id = setup
+        .minter()
+        .deposit_sol(account)
+        .await
+        .expect("deposit_sol should queue a sweep");
+    setup.advance_time(Duration::from_mins(1)).await;
+    setup.wait_for_deposit_minted(deposit_id).await;
+    setup
+        .ledger()
+        .approve(
+            account.subaccount,
+            (NUM_BATCHED_WITHDRAWALS as Lamport + 1) * WITHDRAWAL_AMOUNT,
+            setup.minter_account(),
+        )
+        .await;
+
+    let withdraw_to = async |destination: &Address| {
+        setup
+            .minter()
+            .withdraw_sol(WithdrawSolArgs {
+                from_subaccount: account.subaccount,
+                amount: WITHDRAWAL_AMOUNT,
+                address: destination.to_string(),
+            })
+            .await
+    };
+    let created_withdrawal_transactions = async || {
+        setup
+            .minter()
+            .get_all_events()
+            .await
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                EventType::CreatedWithdrawalTransaction {
+                    burn_indices,
+                    nonce_account,
+                    ..
+                } => Some((burn_indices, Address::from(nonce_account))),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let balance_before_rejection = setup.ledger().balance_of(account).await;
+    assert_matches!(
+        withdraw_to(&pool[0]).await,
+        Err(WithdrawSolError::InvalidDestination(_))
+    );
+    assert_eq!(
+        setup.ledger().balance_of(account).await,
+        balance_before_rejection
+    );
+
+    let nonce_values_before = [
+        validator.get_nonce_value(&pool[0]).await,
+        validator.get_nonce_value(&pool[1]).await,
+    ];
+    let destinations: Vec<Address> = (0..NUM_BATCHED_WITHDRAWALS)
+        .map(|_| Keypair::new().pubkey())
+        .collect();
+    let mut burn_indices = Vec::with_capacity(NUM_BATCHED_WITHDRAWALS);
+    setup.stop_progress().await;
+    for destination in &destinations {
+        let withdrawal = withdraw_to(destination)
+            .await
+            .expect("withdraw should succeed");
+        burn_indices.push(withdrawal.block_index);
+    }
+    setup.resume_progress().await;
+
+    setup.advance_time(Duration::from_mins(1)).await;
+    for &burn_index in &burn_indices {
+        wait_for_withdrawal_finalized(&setup, burn_index).await;
+        assert_matches!(
+            setup.minter().withdraw_sol_status(burn_index).await,
+            WithdrawSolStatus::TxFinalized(TxFinalizedStatus::Success { .. })
+        );
+    }
+    assert_eq!(
+        validator.get_balances(&destinations).await,
+        vec![AMOUNT_RECEIVED_PER_WITHDRAWAL; NUM_BATCHED_WITHDRAWALS]
+    );
+
+    let batches = created_withdrawal_transactions().await;
+    let [
+        (first_burn_indices, first_nonce_account),
+        (second_burn_indices, second_nonce_account),
+    ] = batches.as_slice()
+    else {
+        panic!("Expected two withdrawal transactions, got {batches:?}");
+    };
+    assert_ne!(first_nonce_account, second_nonce_account);
+    let mut batched_burn_indices = [
+        first_burn_indices.as_slice(),
+        second_burn_indices.as_slice(),
+    ];
+    batched_burn_indices.sort_unstable();
+    assert_eq!(
+        batched_burn_indices,
+        [
+            &burn_indices[..MAX_WITHDRAWALS_PER_NONCE_TX],
+            &burn_indices[MAX_WITHDRAWALS_PER_NONCE_TX..]
+        ]
+    );
+    let nonce_values_after_batches = [
+        validator.get_nonce_value(&pool[0]).await,
+        validator.get_nonce_value(&pool[1]).await,
+    ];
+    assert_ne!(nonce_values_after_batches[0], nonce_values_before[0]);
+    assert_ne!(nonce_values_after_batches[1], nonce_values_before[1]);
+
+    let reuse_destination = Keypair::new().pubkey();
+    let reuse_burn_index = withdraw_to(&reuse_destination)
+        .await
+        .expect("withdraw should succeed")
+        .block_index;
+    setup.advance_time(Duration::from_mins(1)).await;
+    wait_for_withdrawal_finalized(&setup, reuse_burn_index).await;
+    assert_matches!(
+        setup.minter().withdraw_sol_status(reuse_burn_index).await,
+        WithdrawSolStatus::TxFinalized(TxFinalizedStatus::Success { .. })
+    );
+    assert_eq!(
+        validator.get_balance(&reuse_destination).await,
+        AMOUNT_RECEIVED_PER_WITHDRAWAL
+    );
+
+    let batches = created_withdrawal_transactions().await;
+    let [_, _, (reused_burn_indices, reused_nonce_account)] = batches.as_slice() else {
+        panic!("Expected three withdrawal transactions, got {batches:?}");
+    };
+    assert_eq!(reused_burn_indices, &[reuse_burn_index]);
+    let reused = pool
+        .iter()
+        .position(|nonce_account| nonce_account == reused_nonce_account)
+        .expect("the reused nonce account belongs to the pool");
+    assert_ne!(
+        validator.get_nonce_value(reused_nonce_account).await,
+        nonce_values_after_batches[reused]
+    );
 
     setup.drop().await;
 }
@@ -228,7 +461,7 @@ async fn should_sweep_a_full_batch_of_deposits_in_one_transaction() {
 
     for (&deposit_id, &deposit_amount) in deposit_ids.iter().zip(&deposit_amounts) {
         assert_eq!(
-            setup.minter().deposit_status(deposit_id).await,
+            setup.minter().deposit_sol_status(deposit_id).await,
             DepositSolStatus::Queued {
                 sweepable_amount: deposit_amount - RENT_EXEMPTION_THRESHOLD
             }
@@ -264,7 +497,7 @@ async fn should_sweep_a_full_batch_of_deposits_in_one_transaction() {
     }
     for &deposit_id in &deposit_ids {
         assert_eq!(
-            setup.minter().deposit_status(deposit_id).await,
+            setup.minter().deposit_sol_status(deposit_id).await,
             DepositSolStatus::Swept {
                 signature: sweep_signature.clone()
             }
@@ -275,7 +508,7 @@ async fn should_sweep_a_full_batch_of_deposits_in_one_transaction() {
 
     for &deposit_id in &deposit_ids {
         assert_eq!(
-            setup.minter().deposit_status(deposit_id).await,
+            setup.minter().deposit_sol_status(deposit_id).await,
             DepositSolStatus::Finalized {
                 signature: sweep_signature.clone()
             }
@@ -286,7 +519,7 @@ async fn should_sweep_a_full_batch_of_deposits_in_one_transaction() {
         deposit_ids.iter().zip(&accounts).zip(&deposit_amounts)
     {
         let expected_minted_amount = deposit_amount - RENT_EXEMPTION_THRESHOLD - FEE_PER_SIGNATURE;
-        let minted_amount = wait_for_deposit_minted(&setup, deposit_id).await;
+        let minted_amount = setup.wait_for_deposit_minted(deposit_id).await;
         assert_eq!(minted_amount, expected_minted_amount);
         assert_eq!(
             setup.ledger().balance_of(account).await,
@@ -328,12 +561,12 @@ async fn should_sweep_sub_rent_remainder_together_with_the_deposit() {
 
     let sweepable_amount = deposit_address_balance - RENT_EXEMPTION_THRESHOLD;
     assert_eq!(
-        setup.minter().deposit_status(deposit_id).await,
+        setup.minter().deposit_sol_status(deposit_id).await,
         DepositSolStatus::Queued { sweepable_amount }
     );
 
     setup.advance_time(Duration::from_mins(1)).await;
-    let minted_amount = wait_for_deposit_minted(&setup, deposit_id).await;
+    let minted_amount = setup.wait_for_deposit_minted(deposit_id).await;
 
     assert_eq!(minted_amount, sweepable_amount - FEE_PER_SIGNATURE);
     assert_eq!(setup.ledger().balance_of(account).await, minted_amount);
@@ -343,16 +576,4 @@ async fn should_sweep_sub_rent_remainder_together_with_the_deposit() {
     );
 
     setup.drop().await;
-}
-
-async fn wait_for_deposit_minted(setup: &Setup, deposit_id: DepositSolId) -> Lamport {
-    for _ in 0..30 {
-        if let DepositSolStatus::Minted { minted_amount, .. } =
-            setup.minter().deposit_status(deposit_id).await
-        {
-            return minted_amount;
-        }
-        setup.advance_time_and_settle(Duration::from_mins(1)).await;
-    }
-    panic!("Deposit {deposit_id} was not minted within timeout");
 }

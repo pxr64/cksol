@@ -1,7 +1,7 @@
 use crate::{
     runtime::CanisterRuntime,
     state::{
-        State,
+        SchnorrPublicKey, State,
         event::{Event, EventType},
     },
     storage,
@@ -32,22 +32,8 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
             message,
             signers,
             purpose,
-            block_height,
         } => {
-            state.process_transaction_submitted(
-                signature,
-                message,
-                signers,
-                purpose,
-                *block_height,
-            );
-        }
-        EventType::ResubmittedTransaction {
-            old_signature,
-            new_signature,
-            new_block_height,
-        } => {
-            state.process_transaction_resubmitted(old_signature, new_signature, *new_block_height);
+            state.process_transaction_submitted(signature, message, signers, purpose, timestamp);
         }
         EventType::SucceededTransaction { signature } => {
             state.process_transaction_succeeded(signature);
@@ -67,7 +53,7 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
             address,
             balance,
         } => {
-            state.process_queued_deposit(*deposit_id, account, address, *balance);
+            state.process_queued_deposit(*deposit_id, account, address, *balance, timestamp);
         }
         EventType::CreditedSweep {
             signature,
@@ -78,6 +64,15 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
         }
         EventType::QuarantinedSweep { signature } => {
             state.process_quarantined_sweep(signature);
+        }
+        EventType::MinterPublicKeyFetched {
+            public_key,
+            chain_code,
+        } => {
+            state.cache_minter_public_key(SchnorrPublicKey {
+                public_key: *public_key,
+                chain_code: *chain_code,
+            });
         }
         EventType::MintedSweptDeposit {
             deposit_id,
@@ -122,6 +117,13 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
             fee,
         } => {
             state.process_queued_spl_deposit(*deposit_id, account, mint, address, *balance, *fee);
+        }
+        EventType::CreatedWithdrawalTransaction {
+            burn_indices,
+            nonce_account,
+            nonce_value,
+        } => {
+            state.process_transaction_created(burn_indices, nonce_account, *nonce_value);
         }
     }
 }

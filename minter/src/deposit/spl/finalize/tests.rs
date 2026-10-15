@@ -11,8 +11,8 @@ use crate::{
     },
     storage::{reset_events, with_event_iter},
     test_fixtures::{
-        DEFAULT_BLOCK_HEIGHT, EventsAssert, GetTransactionResult, account, queued_spl_deposit,
-        runtime::TestCanisterRuntime, schnorr_master_key, signature, spl_sweep::balanced_outcome,
+        DEFAULT_BLOCK_HEIGHT, EventsAssert, GetTransactionResult, account, devnet_sweep,
+        queued_spl_deposit_under, runtime::TestCanisterRuntime, spl_sweep::balanced_outcome,
         spl_token, valid_init_args,
     },
 };
@@ -61,7 +61,12 @@ fn finalize_sweep(index: usize) -> (Signature, SplSweep) {
             [2; 32]
         };
         let token = spl_token(mint.into(), program);
-        let deposit = queued_spl_deposit(account(index + 1), token.mint, program);
+        let deposit = queued_spl_deposit_under(
+            &devnet_sweep::master_key(),
+            account(index + 1),
+            token.mint,
+            program,
+        );
         let deposit_id = (index * 2 + offset) as u64;
         mutate_state(|state| {
             process_event(
@@ -80,9 +85,9 @@ fn finalize_sweep(index: usize) -> (Signature, SplSweep) {
         tokens.insert(token.mint, token);
         deposits.push((deposit_id, deposit));
     }
-    let sweep = SplSweep::plan(deposits, &tokens, &schnorr_master_key());
+    let sweep = SplSweep::plan(deposits, &tokens, &devnet_sweep::master_key());
     let message = sweep.sweep_message(Hash::default());
-    let signature = signature(index);
+    let signature = devnet_sweep::minter_signature_of(&message);
     mutate_state(|state| {
         process_event(
             state,
@@ -92,8 +97,8 @@ fn finalize_sweep(index: usize) -> (Signature, SplSweep) {
                 message: message.into(),
                 purpose: TransactionPurpose::SweepSplDeposits {
                     deposit_ids: sweep.deposits().keys().copied().collect(),
+                    block_height: DEFAULT_BLOCK_HEIGHT,
                 },
-                block_height: DEFAULT_BLOCK_HEIGHT,
             },
             &runtime,
         );
@@ -111,7 +116,7 @@ fn response(outcome: EncodedConfirmedTransactionWithStatusMeta) -> GetTransactio
 }
 
 fn runtime() -> TestCanisterRuntime {
-    TestCanisterRuntime::new().add_times([CREDIT_TIMESTAMP; 2])
+    TestCanisterRuntime::new().with_time(CREDIT_TIMESTAMP)
 }
 
 fn assert_replay_matches() {
@@ -211,7 +216,9 @@ async fn should_retry_unavailable_or_unreadable_spl_outcomes_later() {
 async fn should_credit_a_later_sweep_after_a_round_of_unavailable_outcomes() {
     for deviation in 0..3 {
         setup();
-        let sweeps: Vec<_> = (0..=MAX_CONCURRENT_RPC_CALLS).map(finalize_sweep).collect();
+        let mut sweeps: Vec<_> = (0..=MAX_CONCURRENT_RPC_CALLS).map(finalize_sweep).collect();
+        // The rounds walk the finalized sweeps in signature order.
+        sweeps.sort_by_key(|(signature, _)| *signature);
         let (healthy_signature, healthy_sweep) = sweeps.last().unwrap();
         let unavailable = || match deviation {
             0 => GetTransactionResult::Consistent(Ok(None)),

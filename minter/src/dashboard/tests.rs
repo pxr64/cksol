@@ -1,8 +1,7 @@
 use crate::dashboard::{DashboardPaginationParameters, DashboardTemplate, lamports_to_sol};
 use crate::state::read_state;
 use crate::test_fixtures::{
-    AUTOMATED_DEPOSIT_FEE, MINIMUM_DEPOSIT_AMOUNT, MINIMUM_WITHDRAWAL_AMOUNT, WITHDRAWAL_FEE,
-    account,
+    MINIMUM_DEPOSIT_AMOUNT, MINIMUM_WITHDRAWAL_AMOUNT, WITHDRAWAL_FEE, account,
     events::{
         accept_withdrawal, fail_transaction, quarantine_sweep, queue_deposit, submit_sweep,
         submit_withdrawal, succeed_transaction,
@@ -42,11 +41,6 @@ fn should_display_metadata() {
             "#sol-rpc-canister-id > td",
             &sol_rpc_canister_id().to_string(),
             "wrong sol rpc canister ID",
-        )
-        .has_string_value(
-            "#automated-deposit-fee > td",
-            &lamports_to_sol(AUTOMATED_DEPOSIT_FEE),
-            "wrong automated deposit fee",
         )
         .has_string_value(
             "#withdrawal-fee > td",
@@ -118,6 +112,7 @@ fn should_display_minter_address_with_devnet_solscan_link() {
 #[test]
 fn should_display_quarantined_swept_deposits_with_the_sweep_signature() {
     init_state();
+    init_schnorr_master_key();
     let sweep_signature = signature(0xAA);
     let sweepable_amount = 400_000_000;
     queue_deposit(0, account(1), sweepable_amount);
@@ -132,7 +127,9 @@ fn should_display_quarantined_swept_deposits_with_the_sweep_signature() {
                 "0",
                 &account(1).to_string(),
                 &sweep_signature.to_string(),
+                "Sweep unreadable",
                 &lamports_to_sol(sweepable_amount),
+                "-",
             ],
             "quarantined swept deposits",
         )
@@ -143,8 +140,36 @@ fn should_display_quarantined_swept_deposits_with_the_sweep_signature() {
 }
 
 #[test]
+fn should_display_a_quarantined_pending_mint_with_the_amount_it_is_owed() {
+    init_state();
+    init_schnorr_master_key();
+    let sweepable_amount = 400_000_000;
+    let pending = DepositFlow::queue(account(1), sweepable_amount)
+        .sweep(signature(0xAA))
+        .succeed()
+        .credit()
+        .single_pending_mint();
+    let amount_to_mint = pending.amount_to_mint;
+    let quarantined = pending.quarantine();
+
+    DashboardAssert::assert_that(dashboard()).has_table_row_value(
+        "#quarantined-swept-deposits + table > tbody > tr:nth-child(1)",
+        &[
+            &quarantined.deposit_id.to_string(),
+            &quarantined.account.to_string(),
+            &quarantined.sweep_signature.to_string(),
+            "Mint unresolved",
+            &lamports_to_sol(sweepable_amount),
+            &lamports_to_sol(amount_to_mint),
+        ],
+        "quarantined swept deposits",
+    );
+}
+
+#[test]
 fn should_display_minted_swept_deposits_with_amount_and_block_index() {
     init_state();
+    init_schnorr_master_key();
     let minted = DepositFlow::queue(account(1), 400_000_000)
         .sweep(signature(0xAA))
         .succeed()
@@ -169,6 +194,7 @@ fn should_paginate_minted_swept_deposits_across_multiple_pages() {
     use crate::dashboard::DEFAULT_PAGE_SIZE;
 
     init_state();
+    init_schnorr_master_key();
 
     let total_minted_sweeps = DEFAULT_PAGE_SIZE + 1;
     for i in 0..total_minted_sweeps {
@@ -213,6 +239,7 @@ fn should_paginate_quarantined_swept_deposits_across_multiple_pages() {
     use crate::dashboard::DEFAULT_PAGE_SIZE;
 
     init_state();
+    init_schnorr_master_key();
 
     let total_deposits = DEFAULT_PAGE_SIZE + 1;
     for deposit_id in 0..total_deposits {

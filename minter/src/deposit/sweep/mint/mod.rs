@@ -31,6 +31,7 @@ async fn process_pending_mint<R: CanisterRuntime>(
     let client = read_state(|state| state.ledger_client(runtime.inter_canister_call_runtime()));
     mint_pending_deposit(
         runtime,
+        MintQueue::Sol,
         client,
         mint_transfer_arg(deposit_id, &pending),
         |mint_block_index| EventType::MintedSweptDeposit {

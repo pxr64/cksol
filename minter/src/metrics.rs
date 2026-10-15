@@ -1,8 +1,9 @@
-use crate::state::State;
-use crate::storage;
+use crate::state::{QuarantineCause, State};
+use crate::storage::{self, FailedCreditReason, FailedMintReason, UndecidedWithdrawalReason};
 use ic_metrics_encoder::MetricsEncoder;
 
 const WASM_PAGE_SIZE_IN_BYTES: usize = 65536;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 pub fn encode_metrics(w: &mut MetricsEncoder<Vec<u8>>, s: &State) -> std::io::Result<()> {
     w.encode_gauge(
@@ -41,7 +42,7 @@ pub fn encode_metrics(w: &mut MetricsEncoder<Vec<u8>>, s: &State) -> std::io::Re
         "Number of swept deposits whose ckSOL mint is pending.",
     )?;
     w.encode_gauge(
-        "minted_sweeps",
+        "minted_swept_deposits",
         s.deposits().minted().len().metric_value(),
         "Number of swept deposits whose ckSOL mint landed on the ledger.",
     )?;
@@ -50,14 +51,30 @@ pub fn encode_metrics(w: &mut MetricsEncoder<Vec<u8>>, s: &State) -> std::io::Re
         s.deposits().dropped().len().metric_value(),
         "Number of deposits whose sweep transaction failed or expired.",
     )?;
-    w.encode_gauge(
+    let mut sweep_unreadable: usize = 0;
+    let mut mint_unresolved: usize = 0;
+    for quarantined in s.deposits().quarantined().values() {
+        match quarantined.cause {
+            QuarantineCause::SweepUnreadable => sweep_unreadable += 1,
+            QuarantineCause::MintUnresolved { .. } => mint_unresolved += 1,
+        }
+    }
+    w.gauge_vec(
         "quarantined_swept_deposits",
-        s.deposits().quarantined().len().metric_value(),
-        "Number of quarantined deposits whose finalized sweep did not match its plan and could not be credited.",
+        "Number of quarantined deposits by cause: a sweep whose finalized outcome did not match its plan credited nothing, while an unresolved mint was credited but could no longer be retried and may have landed on the ledger.",
+    )?
+    .value(
+        &[("cause", "sweep_unreadable")],
+        sweep_unreadable.metric_value(),
+    )?
+    .value(
+        &[("cause", "mint_unresolved")],
+        mint_unresolved.metric_value(),
     )?;
     w.encode_gauge(
         "pending_withdrawal_requests",
-        s.pending_withdrawal_requests().len().metric_value(),
+        (s.pending_withdrawal_requests().len() + s.created_withdrawal_requests().len())
+            .metric_value(),
         "Number of pending withdrawal requests.",
     )?;
     w.encode_gauge(
@@ -80,18 +97,41 @@ pub fn encode_metrics(w: &mut MetricsEncoder<Vec<u8>>, s: &State) -> std::io::Re
         s.failed_transactions().len().metric_value(),
         "Number of failed Solana transactions.",
     )?;
-    let oldest_incomplete_withdrawal_age_seconds = s
-        .oldest_incomplete_withdrawal_created_at()
-        .map(|created_at| {
-            let now = ic_cdk::api::time();
-            now.saturating_sub(created_at) / 1_000_000_000
-        })
-        .unwrap_or(0);
     w.encode_gauge(
         "oldest_incomplete_withdrawal_age_seconds",
-        oldest_incomplete_withdrawal_age_seconds.metric_value(),
+        age_seconds(s.oldest_incomplete_withdrawal_created_at()).metric_value(),
         "Age of the oldest incomplete withdrawal request in seconds. Returns 0 if there are no incomplete withdrawals.",
     )?;
+    w.encode_gauge(
+        "oldest_in_flight_deposit_age_seconds",
+        age_seconds(s.deposits().oldest_in_flight_queued_at()).metric_value(),
+        "Age of the oldest in-flight deposit in seconds, from queued until minted, dropped or quarantined. Returns 0 if there are no in-flight deposits.",
+    )?;
+    w.encode_gauge(
+        "oldest_pending_mint_age_seconds",
+        age_seconds(s.deposits().oldest_pending_mint_created_at()).metric_value(),
+        "Age of the oldest pending ckSOL mint in seconds, from the created_at_time the ledger deduplicates it by. Returns 0 if there are no pending mints.",
+    )?;
+    let mut failed_credit_attempts = w.counter_vec(
+        "failed_credit_attempts",
+        "Number of failed attempts to credit the deposits of a finalized sweep, by reason.",
+    )?;
+    for reason in FailedCreditReason::ALL {
+        failed_credit_attempts = failed_credit_attempts.value(
+            &[("reason", reason.label())],
+            storage::failed_credit_attempt_count(reason).metric_value(),
+        )?;
+    }
+    let mut failed_mint_attempts = w.counter_vec(
+        "failed_mint_attempts",
+        "Number of failed attempts to mint a pending deposit on the ckSOL ledger, by reason.",
+    )?;
+    for reason in FailedMintReason::ALL {
+        failed_mint_attempts = failed_mint_attempts.value(
+            &[("reason", reason.label())],
+            storage::failed_mint_attempt_count(reason).metric_value(),
+        )?;
+    }
     w.encode_gauge(
         "minter_balance",
         s.balance().metric_value(),
@@ -102,7 +142,28 @@ pub fn encode_metrics(w: &mut MetricsEncoder<Vec<u8>>, s: &State) -> std::io::Re
         storage::with_unstable_metrics(|m| m.post_upgrade_instructions_consumed).metric_value(),
         "Number of instructions consumed during the last post-upgrade.",
     )?;
+    w.encode_counter(
+        "withdrawal_transaction_rebroadcasts",
+        storage::with_unstable_metrics(|m| m.withdrawal_transaction_rebroadcasts).metric_value(),
+        "Number of re-broadcast attempts of withdrawal transactions since the last upgrade.",
+    )?;
+    let mut undecided_withdrawal_transactions = w.gauge_vec(
+        "undecided_withdrawal_transactions",
+        "Number of in-flight withdrawal transactions left undecided by the last finalization round, by reason: a stale nonce read, a failed nonce read, or a nonce advance whose outcome could not be fetched.",
+    )?;
+    for reason in UndecidedWithdrawalReason::ALL {
+        undecided_withdrawal_transactions = undecided_withdrawal_transactions.value(
+            &[("reason", reason.label())],
+            storage::undecided_withdrawal_transaction_count(reason).metric_value(),
+        )?;
+    }
     Ok(())
+}
+
+fn age_seconds(start: Option<u64>) -> u64 {
+    start
+        .map(|start| ic_cdk::api::time().saturating_sub(start) / NANOS_PER_SECOND)
+        .unwrap_or(0)
 }
 
 pub trait MetricValue {

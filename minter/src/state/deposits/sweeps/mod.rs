@@ -13,8 +13,8 @@ use solana_address::Address;
 use solana_hash::Hash;
 use solana_signature::Signature;
 use solana_system_interface::instruction;
-use solana_transaction::{Instruction, Message};
-use solana_transaction_status_client_types::EncodedConfirmedTransactionWithStatusMeta;
+use solana_transaction::{Instruction, Message, versioned::VersionedTransaction};
+use solana_transaction_status_client_types::UiTransactionStatusMeta;
 use std::{cmp::Reverse, collections::BTreeMap};
 use thiserror::Error;
 
@@ -88,9 +88,10 @@ impl Sweeps {
 /// The plan of one sweep transaction: the deposits it moves to the minter's main account,
 /// the deposit paying the transaction fee, the fee assumed for it, and the destination.
 ///
-/// The plan is a function of the queued deposits alone. The state keeps the plan it recovers
-/// from the submitted transaction, after checking that the plan builds that very message, so
-/// that the outcome of the transaction can be checked against exactly what the minter signed.
+/// The plan is a function of the queued deposits and the destination. The state keeps the
+/// plan it recovers from the submitted transaction, after checking that the plan toward the
+/// minter address derived from the recorded public key builds that very message, so that
+/// the outcome of the transaction can be checked against exactly what the minter signed.
 ///
 /// Each deposit is kept as it was recorded when it was queued, whatever stage the sweep
 /// holding it has reached.
@@ -161,21 +162,15 @@ impl Sweep {
         }
     }
 
-    /// Plans again the sweep of the given deposits that the submitted message sweeps,
-    /// to the destination of its first transfer, and checks that the plan builds the
-    /// submitted message.
+    /// Plans again the sweep of the given deposits to the given minter address and
+    /// checks that the plan builds the submitted message, so that a message sweeping
+    /// to any other destination is rejected.
     pub fn recover(
         deposits: impl IntoIterator<Item = (DepositSolId, QueuedDeposit)>,
+        minter_address: Address,
         submitted: &VersionedMessage,
     ) -> Result<Self, SweepRecoveryError> {
         let VersionedMessage::Legacy(message) = submitted;
-        let minter_address = message
-            .instructions
-            .first()
-            .and_then(|transfer| transfer.accounts.get(1))
-            .and_then(|index| message.account_keys.get(*index as usize))
-            .copied()
-            .ok_or(SweepRecoveryError::MissingDestination)?;
         let sweep = Self::plan(deposits, minter_address);
         let planned = VersionedMessage::Legacy(sweep.sweep_message(message.recent_blockhash));
         if planned != *submitted {
@@ -241,9 +236,11 @@ impl Sweep {
     /// on the fee payer's address.
     pub fn settle(
         self,
-        outcome: &EncodedConfirmedTransactionWithStatusMeta,
+        transaction: &VersionedTransaction,
+        meta: Option<&UiTransactionStatusMeta>,
     ) -> Result<SettledSweep, SweepSettlementError> {
-        let (message, meta) = validate_sweep_transaction(outcome, |hash| self.sweep_message(hash))?;
+        let (message, meta) =
+            validate_sweep_transaction(transaction, meta, |hash| self.sweep_message(hash))?;
         if meta.fee > self.fee() {
             return Err(SweepMismatch::UnexpectedFee {
                 expected: self.fee(),
@@ -359,8 +356,6 @@ pub enum SweepSettlementError {
 
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum UnreadableOutcome {
-    #[error("the sweep transaction could not be decoded")]
-    TransactionDecodingFailed,
     #[error("the 'getTransaction' response has no 'meta' field")]
     NoMetaField,
     #[error("the balances in the metadata do not cover all account keys")]
@@ -419,8 +414,6 @@ pub enum SweepMismatch {
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum SweepRecoveryError {
-    #[error("the message has no transfer to read the destination from")]
-    MissingDestination,
     #[error("the plan builds {planned:?} but the submitted message is {submitted:?}")]
     UnexpectedMessage {
         planned: Box<VersionedMessage>,

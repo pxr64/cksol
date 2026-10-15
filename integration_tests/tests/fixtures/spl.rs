@@ -305,7 +305,7 @@ pub async fn queue_deposit_for_caller(token_program: Address, extensions: &[Exte
     assert_eq!(deposit_id, 0);
     setup.minter().assert_that_events().await.satisfy(|events| {
         check!(
-            events[1..]
+            events[2..]
                 == [
                     EventType::AddedSplToken {
                         mint: MINT.into(),
@@ -393,7 +393,7 @@ pub async fn sweep_queued_deposit(
             EventType::SubmittedTransaction {
                 signature,
                 transaction,
-                purpose: TransactionPurpose::SweepSplDeposits { deposit_ids },
+                purpose: TransactionPurpose::SweepSplDeposits { deposit_ids, .. },
                 ..
             } if deposit_ids == [deposit_id] => Some((signature, transaction)),
             _ => None,
@@ -437,7 +437,7 @@ pub async fn finalize_sweep_with_amount(
     setup
         .execute_http_mocks(
             MockBuilder::with_start_id(start_id)
-                .finalize_transaction(SUBMISSION_BLOCK_HEIGHT)
+                .finalize_transaction(signature, SUBMISSION_BLOCK_HEIGHT)
                 .get_transaction(
                     signature,
                     sweep_transaction_response(

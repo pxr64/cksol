@@ -12,6 +12,10 @@ pub const SPL_FEE_SUBACCOUNT: [u8; 32] = {
 /// Maximum number of concurrent calls to the SOL RPC canister.
 pub const MAX_CONCURRENT_RPC_CALLS: usize = 10;
 
+/// Maximum number of concurrent threshold signing requests to the management canister
+/// in a single round of a timer.
+pub const MAX_CONCURRENT_SIGNATURES: usize = 10;
+
 /// Maximum number of attempts to fetch a recent block, each attempt consisting of
 /// at most one `getSlot` and one `getBlock` call.
 pub const GET_RECENT_BLOCK_MAX_TRIES: NonZeroUsize =
@@ -19,6 +23,10 @@ pub const GET_RECENT_BLOCK_MAX_TRIES: NonZeroUsize =
 
 /// Interval of the timer sweeping queued deposits, the same as withdrawal processing.
 pub const SWEEP_DEPOSITS_DELAY: Duration = Duration::from_mins(1);
+
+/// Delay before retrying the minter public key fetch after it trapped. Deposits and
+/// transfer creation stay unavailable until the key is recorded, so the retry is quick.
+pub const MINTER_PUBLIC_KEY_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Interval of the timer minting the pending mints of credited sweeps.
 pub const PROCESS_PENDING_MINTS_DELAY: Duration = Duration::from_mins(1);
@@ -29,18 +37,20 @@ pub const MAX_PENDING_MINTS_PER_ROUND: usize = 10;
 
 /// The window within which the ckSOL ledger deduplicates transfers by their
 /// `created_at_time`, matching `TRANSACTION_WINDOW` of the ICRC-1 ledger:
-/// <https://github.com/dfinity/ic/blob/master/rs/ledger_suite/icrc1/ledger/src/lib.rs>
+/// <https://github.com/dfinity/ic/blob/d3b3351fa343a893aea2cfa8d39ac6b0d507b477/rs/ledger_suite/icrc1/ledger/src/lib.rs#L65>
 ///
 /// Retrying a pending mint beyond this window is no longer deduplicated, so a
 /// pending mint older than that is quarantined instead of retried.
 pub const LEDGER_DEDUPLICATION_WINDOW: Duration = Duration::from_hours(24);
 
-/// Matches the ICP HTTPS outcall response limit for variable-length RPC calls
-/// such as `getTransaction` and `getSignatureStatuses`:
-/// https://docs.internetcomputer.org/references/ic-interface-spec#ic-http_request
-pub const MAX_HTTP_OUTCALL_RESPONSE_BYTES: u64 = 2_000_000;
-
 /// Cycles to attach for `getTransaction` RPC calls.
+///
+/// The SOL RPC canister charges about 3.2B cycles for a `getTransaction`
+/// request with the default 3-out-of-4 provider consensus and its default
+/// response size estimate of 10 KiB, which fits a full sweep or withdrawal
+/// transaction. The attached amount leaves a wide margin for provider or price
+/// changes and for the SOL RPC canister doubling the response size estimate
+/// after an oversized response; the unused part is refunded.
 pub const GET_TRANSACTION_CYCLES: u128 = 50_000_000_000;
 
 /// Cycles to attach for `getBalance` RPC calls.
@@ -52,11 +62,28 @@ pub const GET_TRANSACTION_CYCLES: u128 = 50_000_000_000;
 /// unused part is refunded and never charged to the caller of `deposit_sol`.
 pub const GET_BALANCE_CYCLES: u128 = 10_000_000_000;
 
-/// Cycles to attach for a `getAccountInfo` call, which reads a token account or a mint account.
-pub const GET_ACCOUNT_INFO_CYCLES: u128 = 10_000_000_000;
-
 /// Cycles to attach for `getSignatureStatuses` RPC calls.
-pub const GET_SIGNATURE_STATUSES_CYCLES: u128 = 1_000_000_000_000;
+///
+/// The SOL RPC canister charges about 2.3B cycles for a `getSignatureStatuses`
+/// request for one signature and about 10.7B cycles for 256 signatures, the
+/// largest batch, with the default 3-out-of-4 provider consensus and its
+/// default response size estimate of 256 bytes per signature. The attached
+/// amount leaves a wide margin for provider or price changes and for the SOL
+/// RPC canister doubling the response size estimate after an oversized
+/// response; the unused part is refunded. Up to `MAX_CONCURRENT_RPC_CALLS`
+/// requests run at once, so the minter needs that many times this amount
+/// available.
+pub const GET_SIGNATURE_STATUSES_CYCLES: u128 = 50_000_000_000;
+
+/// Cycles to attach for `getAccountInfo` RPC calls.
+///
+/// The SOL RPC canister charges about 2.1B cycles for a `getAccountInfo`
+/// request with the default 3-out-of-4 provider consensus, comparable to
+/// `getBalance` since a nonce account holds only 80 bytes of state and a
+/// token account 165 bytes plus its extensions. The
+/// attached amount leaves a wide margin for provider or price changes; the
+/// unused part is refunded.
+pub const GET_ACCOUNT_INFO_CYCLES: u128 = 10_000_000_000;
 
 /// Cost in lamports per signature included in a Solana transaction.
 ///

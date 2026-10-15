@@ -3,14 +3,13 @@ use crate::test_fixtures::{
     account, planned_spl_sweep, queued_spl_deposit, schnorr_master_key, signature, spl_token,
 };
 use assert_matches::assert_matches;
+use solana_transaction_status_client_types::EncodedConfirmedTransactionWithStatusMeta;
 
 mod settle {
     use super::*;
     use crate::test_fixtures::spl_sweep::{balanced_outcome, transaction_outcome as outcome};
     use solana_transaction::TransactionError;
-    use solana_transaction_status_client_types::{
-        EncodedTransaction, TransactionBinaryEncoding, UiTransactionError,
-    };
+    use solana_transaction_status_client_types::UiTransactionError;
 
     fn sweep() -> SplSweep {
         let tokens = BTreeMap::from([
@@ -64,7 +63,7 @@ mod settle {
         for blockhash in [Hash::default(), Hash::from([1; 32])] {
             for new_destinations in [false, true] {
                 let outcome = balanced_outcome(&sweep, blockhash, new_destinations);
-                let settled = sweep.clone().settle(&outcome).unwrap();
+                let settled = settle(sweep.clone(), &outcome).unwrap();
                 assert_eq!(settled.lamports_spent(), 5_000);
                 assert_eq!(
                     settled.into_mints(),
@@ -91,7 +90,7 @@ mod settle {
             },
         )]);
         let outcome = balanced_outcome(&sweep, Hash::default(), true);
-        let settled = sweep.settle(&outcome).unwrap();
+        let settled = settle(sweep, &outcome).unwrap();
         assert_eq!(settled.lamports_spent(), 5_000);
         assert_eq!(
             settled.into_mints(),
@@ -115,7 +114,7 @@ mod settle {
                 meta.pre_balances[balance.account_index as usize] = 1;
             }
         }
-        assert_eq!(sweep.settle(&outcome).unwrap().lamports_spent(), 5_000);
+        assert_eq!(settle(sweep, &outcome).unwrap().lamports_spent(), 5_000);
     }
 
     #[test]
@@ -130,7 +129,7 @@ mod settle {
             .pre_balances
             .pop();
         assert_eq!(
-            sweep.clone().settle(&outcome),
+            settle(sweep.clone(), &outcome),
             Err(SweepSettlementError::Unreadable(
                 UnreadableOutcome::IncompleteBalances
             ))
@@ -157,7 +156,7 @@ mod settle {
                 let amount: u64 = balance.ui_token_amount.amount.parse().unwrap();
                 balance.ui_token_amount.amount = (i128::from(amount) + change).to_string();
                 assert_matches!(
-                    sweep.clone().settle(&outcome),
+                    settle(sweep.clone(), &outcome),
                     Err(SweepSettlementError::Mismatch(
                         SweepMismatch::UnexpectedTokenBalanceChange { .. }
                     ))
@@ -192,7 +191,7 @@ mod settle {
                     _ => unreachable!(),
                 }
                 assert_matches!(
-                    sweep.clone().settle(&outcome),
+                    settle(sweep.clone(), &outcome),
                     Err(SweepSettlementError::Mismatch(
                         SweepMismatch::UnexpectedTokenAccount { .. }
                     ))
@@ -210,7 +209,7 @@ mod settle {
             meta.pre_balances[0] = 10_000_000;
             meta.post_balances[0] = meta.pre_balances[0] - meta.fee - rent;
             assert_eq!(
-                sweep.clone().settle(&outcome).unwrap().lamports_spent(),
+                settle(sweep.clone(), &outcome).unwrap().lamports_spent(),
                 5_000 + rent
             );
         }
@@ -229,7 +228,7 @@ mod settle {
                 fee: meta.fee,
             };
             assert_eq!(
-                sweep.clone().settle(&outcome),
+                settle(sweep.clone(), &outcome),
                 Err(SweepSettlementError::Mismatch(expected))
             );
         }
@@ -291,7 +290,7 @@ mod settle {
                 _ => unreachable!(),
             }
             assert_eq!(
-                sweep.clone().settle(&outcome),
+                settle(sweep.clone(), &outcome),
                 Err(SweepSettlementError::Unreadable(
                     UnreadableOutcome::IncompleteTokenBalances
                 )),
@@ -314,7 +313,7 @@ mod settle {
                 _ => unreachable!(),
             }
             assert_matches!(
-                sweep.clone().settle(&outcome),
+                settle(sweep.clone(), &outcome),
                 Err(SweepSettlementError::Unreadable(
                     UnreadableOutcome::InvalidTokenBalances { .. }
                 ))
@@ -323,27 +322,14 @@ mod settle {
     }
 
     #[test]
-    fn should_reject_unreadable_transaction_outcome() {
+    fn should_reject_outcome_without_meta() {
         let sweep = sweep();
-        let mut unreadable = outcome(solana_message::VersionedMessage::Legacy(
-            sweep.sweep_message(Hash::default()),
-        ));
-        unreadable.transaction.transaction = EncodedTransaction::Binary(
-            "invalid base64!".to_string(),
-            TransactionBinaryEncoding::Base64,
-        );
-        assert_eq!(
-            sweep.clone().settle(&unreadable),
-            Err(SweepSettlementError::Unreadable(
-                UnreadableOutcome::TransactionDecodingFailed
-            )),
-        );
         let mut missing_meta = outcome(solana_message::VersionedMessage::Legacy(
             sweep.sweep_message(Hash::default()),
         ));
         missing_meta.transaction.meta = None;
         assert_eq!(
-            sweep.clone().settle(&missing_meta),
+            settle(sweep.clone(), &missing_meta),
             Err(SweepSettlementError::Unreadable(
                 UnreadableOutcome::NoMetaField
             )),
@@ -361,7 +347,7 @@ mod settle {
         meta.err = Some(error.clone());
         meta.status = Err(error.clone());
         assert_eq!(
-            sweep.clone().settle(&outcome),
+            settle(sweep.clone(), &outcome),
             Err(SweepSettlementError::Mismatch(
                 SweepMismatch::TransactionFailed {
                     error: error.to_string(),
@@ -391,7 +377,7 @@ mod settle {
             }
             let outcome = outcome(solana_message::VersionedMessage::Legacy(message));
             assert_eq!(
-                sweep.clone().settle(&outcome),
+                settle(sweep.clone(), &outcome),
                 Err(SweepSettlementError::Mismatch(
                     SweepMismatch::UnexpectedMessage
                 )),
@@ -414,7 +400,7 @@ mod settle {
             },
         ));
         assert_eq!(
-            sweep.clone().settle(&outcome),
+            settle(sweep.clone(), &outcome),
             Err(SweepSettlementError::Mismatch(
                 SweepMismatch::UnexpectedMessage
             )),
@@ -660,4 +646,17 @@ fn should_reject_mint_configuration_for_another_mint() {
         spl_token([2; 32].into(), TokenProgram::Classic),
     )]);
     SplSweep::plan([(0, deposit)], &tokens, &schnorr_master_key());
+}
+
+/// Settles the sweep against an encoded outcome, decoded as `get_transaction` does.
+fn settle(
+    sweep: SplSweep,
+    outcome: &EncodedConfirmedTransactionWithStatusMeta,
+) -> Result<SettledSplSweep, SweepSettlementError> {
+    let transaction = outcome
+        .transaction
+        .transaction
+        .decode()
+        .expect("the test outcome decodes");
+    sweep.settle(&transaction, outcome.transaction.meta.as_ref())
 }

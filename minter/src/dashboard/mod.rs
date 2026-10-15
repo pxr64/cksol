@@ -1,9 +1,12 @@
-use crate::{address::minter_address, state::State};
+use crate::{
+    address::minter_address,
+    state::{QuarantineCause, State},
+};
 use askama::Template;
 use candid::Principal;
 use cksol_types_internal::SolanaNetwork;
 use ic_http_types::HttpRequest;
-use std::str::FromStr;
+use std::{collections::BTreeMap, str::FromStr};
 
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
@@ -91,7 +94,36 @@ impl<T: Clone> DashboardPaginatedTable<T> {
         page_offset_query_param: &str,
         other_query_params: String,
     ) -> Self {
-        let total_items = items.len();
+        Self::from_rows(
+            items.iter(),
+            Clone::clone,
+            current_page_offset,
+            page_size,
+            num_cols,
+            table_reference,
+            page_offset_query_param,
+            other_query_params,
+        )
+    }
+
+    /// Paginates without materializing the whole table: only the rows of the current page
+    /// go through `to_row`, so rendering one page stays constant in the number of rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_rows<I, F>(
+        rows: I,
+        to_row: F,
+        current_page_offset: usize,
+        page_size: usize,
+        num_cols: usize,
+        table_reference: &str,
+        page_offset_query_param: &str,
+        other_query_params: String,
+    ) -> Self
+    where
+        I: ExactSizeIterator,
+        F: Fn(I::Item) -> T,
+    {
+        let total_items = rows.len();
 
         // Align offset to page boundary and clamp to the last valid page.
         let offset = if page_size == 0 || total_items == 0 {
@@ -103,7 +135,7 @@ impl<T: Clone> DashboardPaginatedTable<T> {
         };
 
         Self {
-            current_page: items.iter().skip(offset).take(page_size).cloned().collect(),
+            current_page: rows.skip(offset).take(page_size).map(to_row).collect(),
             pagination: DashboardTablePagination::new(
                 total_items,
                 offset,
@@ -191,7 +223,10 @@ pub struct DashboardQuarantinedDeposit {
     pub deposit_id: String,
     pub account: String,
     pub signature: String,
+    pub cause: &'static str,
     pub planned_amount: String,
+    /// The mint the deposit is still owed, or `-` when the sweep was never credited.
+    pub amount_to_mint: String,
 }
 
 /// A swept deposit whose ckSOL mint landed on the ledger.
@@ -212,7 +247,6 @@ pub struct DashboardTemplate {
     pub ledger_canister_id: Principal,
     pub sol_rpc_canister_id: Principal,
     pub master_key_name: String,
-    pub automated_deposit_fee: String,
     pub withdrawal_fee: String,
     pub minimum_deposit_amount: String,
     pub minimum_withdrawal_amount: String,
@@ -236,35 +270,39 @@ impl DashboardTemplate {
             .rev()
             .map(|(deposit_id, quarantined)| DashboardQuarantinedDeposit {
                 deposit_id: deposit_id.to_string(),
-                account: quarantined.deposit.account.to_string(),
-                signature: quarantined.signature.to_string(),
-                planned_amount: lamports_to_sol(quarantined.deposit.sweepable_amount()),
+                account: quarantined.account().to_string(),
+                signature: quarantined.sweep_signature().to_string(),
+                cause: match quarantined.cause {
+                    QuarantineCause::SweepUnreadable => "Sweep unreadable",
+                    QuarantineCause::MintUnresolved { .. } => "Mint unresolved",
+                },
+                planned_amount: lamports_to_sol(quarantined.planned_amount()),
+                amount_to_mint: match quarantined.cause {
+                    QuarantineCause::SweepUnreadable => "-".to_string(),
+                    QuarantineCause::MintUnresolved { amount_to_mint, .. } => {
+                        lamports_to_sol(amount_to_mint)
+                    }
+                },
             })
             .collect();
         let quarantined_swept_deposits_table = DashboardPaginatedTable::from_items(
             &quarantined_swept_deposits,
             pagination.quarantined_swept_deposits_start,
             DEFAULT_PAGE_SIZE,
-            4,
+            6,
             "quarantined-swept-deposits",
             "quarantined_swept_deposits_start",
             pagination.other_params("quarantined_swept_deposits_start"),
         );
 
-        let minted_sweeps: Vec<DashboardMintedSweep> = state
-            .deposits()
-            .minted()
-            .iter()
-            .rev()
-            .map(|(deposit_id, minted)| DashboardMintedSweep {
+        let minted_sweeps_table = DashboardPaginatedTable::from_rows(
+            state.deposits().minted().iter().rev(),
+            |(deposit_id, minted)| DashboardMintedSweep {
                 deposit_id: deposit_id.to_string(),
                 account: minted.deposit.deposit.account.to_string(),
                 minted_amount: lamports_to_sol(minted.minted_amount),
                 mint_block_index: minted.mint_block_index.to_string(),
-            })
-            .collect();
-        let minted_sweeps_table = DashboardPaginatedTable::from_items(
-            &minted_sweeps,
+            },
             pagination.minted_sweeps_start,
             DEFAULT_PAGE_SIZE,
             4,
@@ -293,7 +331,12 @@ impl DashboardTemplate {
         }
 
         // Pending and sent (active) newest-first, then finalized (succeeded/failed) newest-first.
-        for (burn_index, pending) in state.pending_withdrawal_requests().iter().rev() {
+        let pending_and_created_requests: BTreeMap<_, _> = state
+            .pending_withdrawal_requests()
+            .iter()
+            .chain(state.created_withdrawal_requests())
+            .collect();
+        for (burn_index, pending) in pending_and_created_requests.into_iter().rev() {
             push_withdrawal(
                 &mut withdrawals,
                 burn_index,
@@ -348,7 +391,6 @@ impl DashboardTemplate {
             ledger_canister_id: state.ledger_canister_id(),
             sol_rpc_canister_id: state.sol_rpc_canister_id(),
             master_key_name: state.master_key_name().to_string(),
-            automated_deposit_fee: lamports_to_sol(state.automated_deposit_fee()),
             withdrawal_fee: lamports_to_sol(state.withdrawal_fee()),
             minimum_deposit_amount: lamports_to_sol(state.minimum_deposit_amount()),
             minimum_withdrawal_amount: lamports_to_sol(state.minimum_withdrawal_amount()),

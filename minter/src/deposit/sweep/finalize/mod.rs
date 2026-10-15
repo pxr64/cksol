@@ -23,7 +23,7 @@ pub async fn credit_finalized_sweeps<R: CanisterRuntime>(runtime: &R) -> bool {
         FinalizedQueue::Sol,
         |state| state.deposits().finalized().by_signature(),
         |signature, sweep: Sweep, outcome| {
-            let settled = sweep.settle(outcome)?;
+            let settled = sweep.settle(&outcome.transaction, outcome.meta.as_ref())?;
             Ok(EventType::CreditedSweep {
                 signature,
                 amount_received: settled.amount_received(),

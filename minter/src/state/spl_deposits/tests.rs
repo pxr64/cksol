@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::MinterTransaction;
 use crate::{
     constants::FEE_PER_SIGNATURE,
     lifecycle,
@@ -10,9 +11,9 @@ use crate::{
     },
     storage::{reset_events, with_event_iter},
     test_fixtures::{
-        DEFAULT_BLOCK_HEIGHT, account, classic_spl_tokens, planned_spl_sweep, planned_sweep,
-        queued_deposit_of, queued_spl_deposit, runtime::TestCanisterRuntime, schnorr_master_key,
-        signature, spl_token, valid_init_args,
+        DEFAULT_BLOCK_HEIGHT, account, classic_spl_tokens, minter_public_key_fetched_event,
+        planned_spl_sweep, planned_sweep, queued_deposit_of, queued_spl_deposit,
+        runtime::TestCanisterRuntime, schnorr_master_key, signature, spl_token, valid_init_args,
     },
 };
 use ic_stable_structures::Storable;
@@ -97,8 +98,8 @@ fn submitted_spl_sweep() -> (TestCanisterRuntime, Signature, SplSweep) {
                 signers,
                 purpose: TransactionPurpose::SweepSplDeposits {
                     deposit_ids: sweep.deposits().keys().copied().collect(),
+                    block_height: DEFAULT_BLOCK_HEIGHT,
                 },
-                block_height: DEFAULT_BLOCK_HEIGHT,
             },
             &runtime,
         );
@@ -118,13 +119,14 @@ fn assert_replay_matches_state() -> State {
 }
 
 fn fund_minter() -> u64 {
-    let runtime = TestCanisterRuntime::new().add_times([0; 8]);
+    let runtime = TestCanisterRuntime::new().with_time(0);
     let deposit = queued_deposit_of(account(3), 10_000_000);
     let sweep = planned_sweep([(0, deposit)]);
     let signature = signature(101);
     let amount_received = sweep.expected_received();
     mutate_state(|state| {
         for event in [
+            minter_public_key_fetched_event(),
             EventType::QueuedDeposit {
                 deposit_id: 0,
                 account: deposit.account,
@@ -135,10 +137,10 @@ fn fund_minter() -> u64 {
                 signature,
                 message: sweep.sweep_message(Hash::default()).into(),
                 signers: vec![Signer::Account(deposit.account)],
-                purpose: TransactionPurpose::SweepDeposits {
+                purpose: TransactionPurpose::SweepDeposit {
                     deposit_ids: vec![0],
+                    block_height: DEFAULT_BLOCK_HEIGHT,
                 },
-                block_height: DEFAULT_BLOCK_HEIGHT,
             },
             EventType::SucceededTransaction { signature },
             EventType::CreditedSweep {
@@ -327,19 +329,12 @@ fn should_submit_and_replay_spl_sweep() {
             Some(*id)
         );
     }
-    let transaction = replayed.submitted_transactions().get(&signature).unwrap();
     assert_eq!(
-        transaction.purpose,
-        TransactionPurpose::SweepSplDeposits {
-            deposit_ids: vec![0, 1]
-        }
+        replayed.submitted_transactions().get(&signature),
+        Some(&MinterTransaction::SweepSplDeposit {
+            block_height: DEFAULT_BLOCK_HEIGHT
+        })
     );
-    assert_eq!(
-        transaction.signers,
-        vec![Signer::Minter, Signer::Account(account(1))]
-    );
-    assert_eq!(transaction.block_height, DEFAULT_BLOCK_HEIGHT);
-    assert_eq!(transaction.amount, 0);
     assert_eq!(replayed.balance(), 0);
     assert!(replayed.deposits().queued().is_empty());
     assert!(replayed.deposits().swept().is_empty());
@@ -404,7 +399,6 @@ fn should_drop_and_replay_failed_spl_sweep() {
 
     assert!(replayed.submitted_transactions().is_empty());
     assert!(replayed.failed_transactions().contains_key(&signature));
-    assert!(replayed.transactions_to_resubmit().is_empty());
     assert!(replayed.spl_deposits().swept().is_empty());
     assert_eq!(
         replayed.spl_deposits().dropped().len(),
@@ -436,7 +430,6 @@ fn should_drop_and_replay_expired_spl_sweep_without_resubmission() {
     let replayed = assert_replay_matches_state();
 
     assert!(replayed.submitted_transactions().is_empty());
-    assert!(replayed.transactions_to_resubmit().is_empty());
     assert!(replayed.spl_deposits().swept().is_empty());
     assert_eq!(
         replayed.spl_deposits().dropped().len(),
@@ -472,7 +465,6 @@ fn should_split_and_replay_failed_spl_batch_without_releasing_accounts() {
     let replayed = assert_replay_matches_state();
     assert!(replayed.submitted_transactions().is_empty());
     assert!(replayed.failed_transactions().contains_key(&signature));
-    assert!(replayed.transactions_to_resubmit().is_empty());
     assert_eq!(replayed.spl_deposits().retrying(), sweep.deposits());
     assert!(replayed.spl_deposits().queued().is_empty());
     assert!(replayed.spl_deposits().swept().is_empty());
@@ -540,8 +532,11 @@ fn should_reject_spl_split_event_for_single_deposit() {
                 signature,
                 signers: plan.signers(&message),
                 message: message.into(),
-                purpose: TransactionPurpose::RetrySplDeposit { deposit_id: 0 },
-                block_height: DEFAULT_BLOCK_HEIGHT,
+                purpose: TransactionPurpose::RetrySplDeposit {
+                    deposit_id: 0,
+
+                    block_height: DEFAULT_BLOCK_HEIGHT,
+                },
             },
             &runtime,
         );

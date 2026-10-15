@@ -461,7 +461,7 @@ async fn should_drop_deposit_and_release_account_after_sweep_expires() {
         .execute_http_mocks(
             // getSlot, getBlock and getSignatureStatuses use RPC IDs 24 to 35.
             MockBuilder::with_start_id(24)
-                .mark_transaction_expired(EXPIRY_BLOCK_HEIGHT)
+                .mark_transaction_expired(&signature, EXPIRY_BLOCK_HEIGHT)
                 .build(),
         )
         .await;
@@ -470,10 +470,11 @@ async fn should_drop_deposit_and_release_account_after_sweep_expires() {
         check!(events.contains(&EventType::ExpiredTransaction {
             signature: signature.clone()
         }));
-        check!(!events.iter().any(|event| matches!(
-            event,
-            EventType::ResubmittedTransaction { .. } | EventType::FailedTransaction { .. }
-        )));
+        check!(
+            !events
+                .iter()
+                .any(|event| matches!(event, EventType::FailedTransaction { .. }))
+        );
     });
     assert_eq!(
         setup.minter().deposit_spl_status(deposit_id).await,
@@ -504,7 +505,7 @@ async fn should_drop_deposit_and_release_account_when_sweep_fails_on_chain() {
         .execute_http_mocks(
             // getSlot, getBlock and getSignatureStatuses use RPC IDs 24 to 35.
             MockBuilder::with_start_id(24)
-                .fail_transaction(SUBMISSION_BLOCK_HEIGHT)
+                .fail_transaction(&signature, SUBMISSION_BLOCK_HEIGHT)
                 .build(),
         )
         .await;
@@ -681,12 +682,9 @@ mod cycles {
         let (caller_after, minter_after) = cycle_balances(&setup).await;
         assert_eq!(
             caller_before - caller_after,
-            reads_cost + Setup::DEFAULT_DEPOSIT_CONSOLIDATION_FEE
+            reads_cost + Setup::DEFAULT_DEPOSIT_SOL_FEE
         );
-        assert_eq!(
-            minter_after - minter_before,
-            Setup::DEFAULT_DEPOSIT_CONSOLIDATION_FEE
-        );
+        assert_eq!(minter_after - minter_before, Setup::DEFAULT_DEPOSIT_SOL_FEE);
         setup.drop().await;
     }
 
@@ -774,7 +772,7 @@ mod cycles {
 
         let result = setup
             .minter()
-            .deposit_spl_with_cycles(deposit_args(), Setup::DEFAULT_DEPOSIT_CONSOLIDATION_FEE)
+            .deposit_spl_with_cycles(deposit_args(), Setup::DEFAULT_DEPOSIT_SOL_FEE)
             .await;
 
         assert_matches!(result, Err(DepositSplError::InsufficientCycles(_)));

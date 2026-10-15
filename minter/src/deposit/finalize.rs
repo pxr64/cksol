@@ -1,17 +1,17 @@
 use crate::{
     constants::MAX_CONCURRENT_RPC_CALLS,
     queue_cursor::QueueCursors,
-    rpc::get_transaction,
+    rpc::{FetchedTransaction, get_transaction},
     runtime::CanisterRuntime,
     state::{
         State, SweepSettlementError, audit::process_event, event::EventType, mutate_state,
         read_state,
     },
+    storage::{FailedCreditReason, record_failed_credit_attempt},
 };
 use canlog::log;
 use cksol_types_internal::log::Priority;
 use solana_signature::Signature;
-use solana_transaction_status_client_types::EncodedConfirmedTransactionWithStatusMeta;
 use std::collections::BTreeMap;
 
 /// The queues of finalized sweeps that settle on a timer, each with its own rotation cursor.
@@ -19,6 +19,16 @@ use std::collections::BTreeMap;
 pub enum FinalizedQueue {
     Sol,
     Spl,
+}
+
+impl FinalizedQueue {
+    /// The metrics count the ckSOL sweeps only.
+    fn record_failed_credit(self, reason: FailedCreditReason) {
+        match self {
+            Self::Sol => record_failed_credit_attempt(reason),
+            Self::Spl => {}
+        }
+    }
 }
 
 thread_local! {
@@ -37,11 +47,7 @@ pub async fn credit_finalized_sweep_round<R: CanisterRuntime, S: Clone>(
     runtime: &R,
     queue: FinalizedQueue,
     finalized_sweeps: impl Fn(&State) -> &BTreeMap<Signature, S>,
-    settle: impl Fn(
-        Signature,
-        S,
-        &EncodedConfirmedTransactionWithStatusMeta,
-    ) -> Result<EventType, SweepSettlementError>,
+    settle: impl Fn(Signature, S, &FetchedTransaction) -> Result<EventType, SweepSettlementError>,
     quarantine: impl Fn(Signature) -> EventType,
     label: &str,
 ) -> bool {
@@ -76,9 +82,18 @@ pub async fn credit_finalized_sweep_round<R: CanisterRuntime, S: Clone>(
             Ok(Some(outcome)) => outcome,
             Ok(None) => {
                 log!(
-                    Priority::Info,
+                    Priority::Error,
                     "Finalized {label} {signature} was not returned by getTransaction, retrying later"
                 );
+                queue.record_failed_credit(FailedCreditReason::NotFound);
+                continue;
+            }
+            Err(e) if e.is_response_untrustworthy() => {
+                log!(
+                    Priority::Error,
+                    "Failed to fetch finalized {label} {signature}: {e}, retrying later"
+                );
+                queue.record_failed_credit(FailedCreditReason::InvalidResponse);
                 continue;
             }
             Err(e) => {
@@ -86,6 +101,7 @@ pub async fn credit_finalized_sweep_round<R: CanisterRuntime, S: Clone>(
                     Priority::Info,
                     "Failed to fetch finalized {label} {signature}: {e}, retrying later"
                 );
+                queue.record_failed_credit(FailedCreditReason::RpcError);
                 continue;
             }
         };
@@ -93,9 +109,10 @@ pub async fn credit_finalized_sweep_round<R: CanisterRuntime, S: Clone>(
             Ok(event) => event,
             Err(SweepSettlementError::Unreadable(e)) => {
                 log!(
-                    Priority::Info,
+                    Priority::Error,
                     "Could not read the outcome of {label} {signature}: {e}, retrying later"
                 );
+                queue.record_failed_credit(FailedCreditReason::Unreadable);
                 continue;
             }
             Err(SweepSettlementError::Mismatch(e)) => {
@@ -103,6 +120,7 @@ pub async fn credit_finalized_sweep_round<R: CanisterRuntime, S: Clone>(
                     Priority::Error,
                     "Quarantining the deposits of {label} {signature}: {e}"
                 );
+                queue.record_failed_credit(FailedCreditReason::Mismatch);
                 quarantine(signature)
             }
         };

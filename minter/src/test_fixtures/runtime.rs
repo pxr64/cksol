@@ -9,13 +9,16 @@ use crate::{
 use async_trait::async_trait;
 use candid::{
     CandidType, Principal,
-    utils::{ArgumentEncoder, decode_args, encode_args},
+    utils::{ArgumentDecoder, ArgumentEncoder, decode_args, encode_args},
 };
 use ic_canister_runtime::{IcError, Runtime, StubRuntime};
+use ic_cdk::call::{CallPerformFailed, Error as CallError};
 use ic_cdk_management_canister::{SchnorrPublicKeyArgs, SchnorrPublicKeyResult};
 use icrc_ledger_types::icrc1::account::Account;
 use serde::de::DeserializeOwned;
-use sol_rpc_types::{MultiRpcResult, RpcResult, Signature, Slot};
+use sol_rpc_types::{
+    MultiRpcResult, RpcConfig, RpcResult, RpcSources, SendTransactionParams, Signature, Slot,
+};
 use std::{
     future::Future,
     sync::{Arc, Mutex},
@@ -34,8 +37,8 @@ pub struct TestCanisterRuntime {
     msg_cycles_accepted: Arc<Mutex<Vec<u128>>>,
     msg_cycles_available: Stubs<u128>,
     msg_cycles_refunded: Stubs<u128>,
-    set_timer_call_count: Arc<Mutex<usize>>,
-    schnorr_public_key_results: Stubs<SchnorrPublicKeyResult>,
+    set_timer_delays: Arc<Mutex<Vec<Duration>>>,
+    schnorr_public_key_results: Stubs<Result<SchnorrPublicKeyResult, CallError>>,
     schnorr_public_key_call_count: Arc<Mutex<usize>>,
 }
 
@@ -77,6 +80,22 @@ impl TestCanisterRuntime {
             .clone()
     }
 
+    /// The parameters of the `sendTransaction` calls made through this runtime, in call order.
+    pub fn sent_transactions(&self) -> Vec<SendTransactionParams> {
+        self.sent_update_calls()
+            .iter()
+            .filter(|call| call.method == "sendTransaction")
+            .map(|call| {
+                let (_sources, _config, params): (
+                    RpcSources,
+                    Option<RpcConfig>,
+                    SendTransactionParams,
+                ) = call.args();
+                params
+            })
+            .collect()
+    }
+
     pub fn add_recent_block(mut self, result: RpcResult<Slot>) -> Self {
         match result {
             Ok(slot) => self
@@ -102,8 +121,12 @@ impl TestCanisterRuntime {
         self
     }
 
-    pub fn with_increasing_time(mut self) -> Self {
-        self.times = (0..).into();
+    pub fn with_increasing_time(self) -> Self {
+        self.with_increasing_time_from(0)
+    }
+
+    pub fn with_increasing_time_from(mut self, start: u64) -> Self {
+        self.times = (start..).into();
         self
     }
 
@@ -137,12 +160,23 @@ impl TestCanisterRuntime {
     }
 
     pub fn with_schnorr_public_key(mut self, result: SchnorrPublicKeyResult) -> Self {
-        self.schnorr_public_key_results = self.schnorr_public_key_results.add(result);
+        self.schnorr_public_key_results = self.schnorr_public_key_results.add(Ok(result));
+        self
+    }
+
+    pub fn with_schnorr_public_key_call_failure(mut self) -> Self {
+        self.schnorr_public_key_results = self
+            .schnorr_public_key_results
+            .add(Err(CallPerformFailed.into()));
         self
     }
 
     pub(crate) fn set_timer_call_count(&self) -> usize {
-        *self.set_timer_call_count.lock().unwrap()
+        self.set_timer_delays().len()
+    }
+
+    pub(crate) fn set_timer_delays(&self) -> Vec<Duration> {
+        self.set_timer_delays.lock().unwrap().clone()
     }
 
     pub(crate) fn schnorr_public_key_call_count(&self) -> usize {
@@ -191,17 +225,20 @@ impl CanisterRuntime for TestCanisterRuntime {
         self.msg_cycles_refunded.next()
     }
 
-    fn set_timer<F, Fut>(&self, _delay: Duration, _f: F) -> ic_cdk_timers::TimerId
+    fn set_timer<F, Fut>(&self, delay: Duration, _f: F) -> ic_cdk_timers::TimerId
     where
         Self: Sized,
         F: FnOnce(Self) -> Fut + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        *self.set_timer_call_count.lock().unwrap() += 1;
+        self.set_timer_delays.lock().unwrap().push(delay);
         Default::default()
     }
 
-    async fn schnorr_public_key(&self, _args: SchnorrPublicKeyArgs) -> SchnorrPublicKeyResult {
+    async fn schnorr_public_key(
+        &self,
+        _args: SchnorrPublicKeyArgs,
+    ) -> Result<SchnorrPublicKeyResult, CallError> {
         *self.schnorr_public_key_call_count.lock().unwrap() += 1;
         suspend_like_an_inter_canister_call().await;
         self.schnorr_public_key_results.next()
@@ -235,8 +272,13 @@ impl SentUpdateCall {
 
     /// Decodes the single Candid argument of the recorded call.
     pub fn single_arg<Arg: CandidType + DeserializeOwned>(&self) -> Arg {
-        let (arg,) = self.args_tuple();
+        let (arg,) = self.args();
         arg
+    }
+
+    /// Decodes the Candid arguments of the recorded call.
+    pub fn args<Args: for<'a> ArgumentDecoder<'a>>(&self) -> Args {
+        decode_args(&self.args).expect("Failed to decode the call arguments")
     }
 }
 

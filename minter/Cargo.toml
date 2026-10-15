@@ -22,8 +22,8 @@ bincode = { workspace = true }
 canbench-rs = { workspace = true, optional = true }
 candid = { workspace = true }
 canlog = { workspace = true, features = ["derive"] }
-cksol-types = { path = "../libs/types" }
-cksol-types-internal = { path = "../libs/types-internal", features = ["event", "log"] }
+cksol-types = { version = "0.1.0", path = "../libs/types" }
+cksol-types-internal = { version = "0.1.0", path = "../libs/types-internal", features = ["event", "log"] }
 derive_more = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
@@ -49,20 +49,26 @@ sol_rpc_types = { workspace = true }
 solana-account-decoder-client-types = { workspace = true }
 solana-address = { workspace = true }
 solana-hash = { workspace = true }
-solana-program-pack = { workspace = true }
 solana-message = { workspace = true }
+solana-nonce = { workspace = true }
+solana-program-pack = { workspace = true }
+solana-sdk-ids = { workspace = true }
 solana-signature = { workspace = true }
 solana-system-interface = { workspace = true, features = ["bincode"] }
-solana-transaction = { workspace = true, features = ["bincode"] }
+solana-transaction = { workspace = true, features = ["bincode", "verify"] }
 solana-transaction-status-client-types = { workspace = true }
 spl-associated-token-account-interface = { workspace = true }
 spl-token-interface = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+agave-reserved-account-keys = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 candid_parser = { workspace = true }
+cksol-test-utils = { version = "0.1.0", path = "../libs/test-utils" }
+flate2 = { workspace = true }
+ic-agent = { workspace = true }
 mockall = { workspace = true }
 proptest = { workspace = true }
 scraper = { workspace = true }
