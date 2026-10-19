@@ -85,6 +85,9 @@ pub const GET_SIGNATURE_STATUSES_CYCLES: u128 = 50_000_000_000;
 /// unused part is refunded.
 pub const GET_ACCOUNT_INFO_CYCLES: u128 = 10_000_000_000;
 
+/// Cycles to attach to an XRC exchange-rate request; unused cycles are refunded.
+pub const XRC_REQUEST_CYCLES: u128 = 1_000_000_000;
+
 /// Cost in lamports per signature included in a Solana transaction.
 ///
 /// See <https://solana.com/docs/core/fees#base-fee>.
@@ -96,6 +99,8 @@ pub const FEE_PER_SIGNATURE: u64 = 5_000;
 /// See <https://solana.com/docs/core/rent#rent-exempt-minimum>.
 pub const RENT_EXEMPTION_THRESHOLD: u64 = 890_880;
 
-/// Rent exemption of an associated token account at the larger Token-2022 size, with the
-/// immutable owner extension. Classic accounts need less; settlement returns the difference.
+/// Rent exemption of a Token-2022 associated token account with the immutable owner extension.
 pub const TOKEN_ACCOUNT_RENT_EXEMPTION: u64 = 2_074_080;
+
+/// Rent exemption of a classic SPL associated token account (165 bytes).
+pub const CLASSIC_TOKEN_ACCOUNT_RENT_EXEMPTION: u64 = 2_039_280;

@@ -1050,6 +1050,7 @@ dependencies = [
  "ic-http-types",
  "ic-metrics-encoder",
  "ic-stable-structures",
+ "ic-xrc-types",
  "icrc-cbor",
  "icrc-ledger-types",
  "itertools 0.14.0",
@@ -2836,6 +2837,16 @@ dependencies = [
  "pairing",
  "rand 0.8.6",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "ic-xrc-types"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1a2b2eaa332201f4abbd1192a307f7a5b6ea55d077a7f489ac62bf8e358b5a2"
+dependencies = [
+ "candid",
+ "serde",
 ]
 
 [[package]]

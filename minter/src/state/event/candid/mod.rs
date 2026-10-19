@@ -127,6 +127,7 @@ impl From<EventType> for CandidEventType {
                 ledger_id: token.ledger_id,
                 minimum_deposit_amount: token.minimum_deposit_amount,
                 paused: token.paused,
+                xrc_symbol: token.xrc_symbol,
             },
             EventType::QueuedSplDeposit {
                 deposit_id,
@@ -368,6 +369,7 @@ impl TryFrom<CandidEventType> for EventType {
                 ledger_id,
                 minimum_deposit_amount,
                 paused,
+                xrc_symbol,
             } => EventType::AddedSplToken(SupportedSplToken {
                 mint: Address::from(mint),
                 token_program: TokenProgram::try_from(Address::from(token_program))
@@ -376,6 +378,7 @@ impl TryFrom<CandidEventType> for EventType {
                 ledger_id,
                 minimum_deposit_amount,
                 paused,
+                xrc_symbol,
             }),
             CandidEventType::QueuedSplDeposit {
                 deposit_id,

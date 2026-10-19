@@ -1,6 +1,7 @@
 use crate::{
     rpc::{decode_program_account, get_account_info},
     runtime::CanisterRuntime,
+    spl_fee::{XrcAssetError, check_xrc_asset},
     state::{
         SupportedSplToken, TokenProgram, audit::process_event, event::EventType, mutate_state,
         read_state,
@@ -30,8 +31,16 @@ pub async fn add_spl_token<R: CanisterRuntime>(
 
     let data = get_finalized_mint_data(runtime, &token).await?;
     validate_mint_data(&data, &token)?;
+    check_xrc_asset(runtime, &token.xrc_symbol)
+        .await
+        .map_err(|error| match error {
+            XrcAssetError::UnknownAsset(_) => AddSplTokenError::InvalidToken(error.to_string()),
+            XrcAssetError::Unavailable(message) => {
+                AddSplTokenError::TemporarilyUnavailable(message)
+            }
+        })?;
 
-    // Recheck after the RPC await: another registration may have claimed the mint
+    // Recheck after the external calls: another registration may have claimed the mint
     // or ledger while this request was suspended. No await separates check and write.
     mutate_state(|state| {
         state.validate_spl_token_registration(&token)?;
@@ -59,6 +68,11 @@ fn validate_config(
     if token.minimum_deposit_amount == 0 {
         return Err(AddSplTokenError::InvalidToken(
             "Minimum deposit amount must be greater than zero".to_string(),
+        ));
+    }
+    if token.xrc_symbol.trim().is_empty() {
+        return Err(AddSplTokenError::InvalidToken(
+            "The XRC symbol must not be empty".to_string(),
         ));
     }
     if [

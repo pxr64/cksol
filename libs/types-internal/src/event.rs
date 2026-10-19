@@ -200,6 +200,8 @@ pub enum EventType {
         minimum_deposit_amount: u64,
         /// Whether deposits are initially paused.
         paused: bool,
+        /// The underlying asset symbol used for XRC requests.
+        xrc_symbol: String,
     },
     /// The minter bound a durable nonce account and its nonce value to the
     /// withdrawal requests of the given burn indices, before requesting the

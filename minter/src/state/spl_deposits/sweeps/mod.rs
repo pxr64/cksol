@@ -1,6 +1,6 @@
 use crate::{
     address::{account_address, associated_token_address, minter_address},
-    constants::{FEE_PER_SIGNATURE, TOKEN_ACCOUNT_RENT_EXEMPTION},
+    constants::FEE_PER_SIGNATURE,
     state::{
         QueuedSplDeposit, SchnorrPublicKey, SupportedSplToken, SweepMismatch, SweepSettlementError,
         TokenProgram, UnreadableOutcome,
@@ -347,13 +347,20 @@ impl SplSweep {
     /// The most the minter pays for the sweep: the fee of its signatures and the rent of every
     /// treasury account it may create.
     pub fn max_lamports_spent(&self) -> Lamport {
-        let treasury_accounts = self
-            .deposits
+        let treasury_rent: Lamport = self
+            .transfers
+            .iter()
+            .map(|transfer| {
+                (
+                    self.deposits[&transfer.deposit_id].mint,
+                    transfer.token_program,
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
             .values()
-            .map(|deposit| deposit.mint)
-            .collect::<BTreeSet<_>>()
-            .len();
-        self.transaction_fee() + TOKEN_ACCOUNT_RENT_EXEMPTION * treasury_accounts as u64
+            .map(|program| program.account_rent_exemption())
+            .sum();
+        self.transaction_fee() + treasury_rent
     }
 
     /// One destination account creation per token, followed by each planned transfer.

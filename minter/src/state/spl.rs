@@ -1,3 +1,4 @@
+use crate::constants::{CLASSIC_TOKEN_ACCOUNT_RENT_EXEMPTION, TOKEN_ACCOUNT_RENT_EXEMPTION};
 use candid::Principal;
 use cksol_types::{AddSplTokenArgs, AddSplTokenError};
 use minicbor::{Decode, Encode};
@@ -19,6 +20,14 @@ impl TokenProgram {
         match self {
             Self::Classic => spl_token_interface::id().to_bytes().into(),
             Self::Token2022 => TOKEN_2022_PROGRAM_ID,
+        }
+    }
+
+    /// The rent exemption of an associated token account of this program.
+    pub fn account_rent_exemption(self) -> u64 {
+        match self {
+            Self::Classic => CLASSIC_TOKEN_ACCOUNT_RENT_EXEMPTION,
+            Self::Token2022 => TOKEN_ACCOUNT_RENT_EXEMPTION,
         }
     }
 }
@@ -55,6 +64,9 @@ pub struct SupportedSplToken {
     pub minimum_deposit_amount: u64,
     #[n(5)]
     pub paused: bool,
+    /// The underlying asset symbol used for XRC requests.
+    #[n(6)]
+    pub xrc_symbol: String,
 }
 
 impl TryFrom<AddSplTokenArgs> for SupportedSplToken {
@@ -68,6 +80,7 @@ impl TryFrom<AddSplTokenArgs> for SupportedSplToken {
             ledger_id: args.ledger_id,
             minimum_deposit_amount: args.minimum_deposit_amount,
             paused: args.paused,
+            xrc_symbol: args.xrc_symbol,
         })
     }
 }

@@ -36,6 +36,7 @@ ic-ed25519 = { workspace = true }
 ic-http-types = { workspace = true }
 ic-metrics-encoder = { workspace = true }
 ic-stable-structures = { workspace = true }
+ic-xrc-types = { workspace = true }
 icrc-cbor = { workspace = true }
 icrc-ledger-types = { workspace = true }
 itertools = { workspace = true }

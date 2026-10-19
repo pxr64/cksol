@@ -281,6 +281,8 @@ type AddSplTokenArgs = record {
     ledger_id: principal;
     minimum_deposit_amount: nat64;
     paused: bool;
+    // The symbol of the underlying asset on the exchange rate canister, such as `USDC`.
+    xrc_symbol: text;
 };
 type AddSplTokenError = variant {
     AlreadySupported: record { mint: Address };
@@ -528,7 +530,22 @@ type TransactionPurpose = variant {
 // Backwards-compatibility is not guaranteed.
 type EventType = variant {
     // A validated SPL token was registered with its IC ledger.
-    AddedSplToken: AddSplTokenArgs;
+    AddedSplToken : record {
+      // The number of token decimals.
+      decimals : nat8;
+      // The Solana mint address.
+      mint : text;
+      // The IC ledger assigned to the mint.
+      ledger_id : principal;
+      // The underlying asset symbol used for XRC requests.
+      xrc_symbol : text;
+      // The minimum deposit in the token's smallest units.
+      minimum_deposit_amount : nat64;
+      // The program owning the mint.
+      token_program : text;
+      // Whether deposits are initially paused.
+      paused : bool;
+    };
     // The minter initialization event.
     // Must be the first event in the log.
     Init : InitArgs;
@@ -743,8 +760,8 @@ service : (MinterArg) -> {
     // Queues a finalized SPL balance for sweeping to the minter and minting on its token ledger.
     // The token fee quoted at acceptance is deducted from the ledger mint.
     // Once the user mint succeeds, that fee is minted into the minter's fee subaccount.
-    // New deposits cover two account reads and a consolidation fee in cycles; the fee is
-    // charged only when both source and destination checks succeed. Repeated requests for
+    // New deposits cover two account reads, an XRC quote and a consolidation fee in cycles;
+    // the fee is charged only when the account checks and quoted net minimum succeed. Repeated requests for
     // an in-flight account and mint return the existing ID without a charge, also when paused.
     deposit_spl: (DepositSplArgs) -> (DepositSplResult);
 
@@ -757,7 +774,8 @@ service : (MinterArg) -> {
     get_spl_deposit_address: (GetSplDepositAddressArgs) -> (GetSplDepositAddressResult);
 
     // Registers an SPL token and its IC ledger. Only the configured orchestrator can
-    // call it, and Token-2022 mints with extensions are rejected.
+    // call it, and Token-2022 mints with extensions are rejected. The exchange rate
+    // canister must quote SOL in the token's symbol.
     add_spl_token: (AddSplTokenArgs) -> (AddSplTokenResult);
 
     // Returns the status of the deposit with the given identifier,

@@ -274,6 +274,9 @@ pub struct AddSplTokenArgs {
     pub minimum_deposit_amount: u64,
     /// Whether deposits should initially be paused.
     pub paused: bool,
+    /// The symbol of the underlying asset on the exchange rate canister, such as `USDC`.
+    /// Registration fails when the canister has no SOL rate in that symbol.
+    pub xrc_symbol: String,
 }
 
 /// An error while registering a supported SPL token.
