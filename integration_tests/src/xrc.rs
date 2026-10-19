@@ -30,7 +30,11 @@ pub async fn install(env: &PocketIc) {
 }
 
 /// Mocks exchange HTTP responses, leaving parsing, rate calculation and refunds to XRC.
-pub fn http_response(request: &CanisterHttpRequest) -> Option<CanisterHttpResponse> {
+pub fn http_response(
+    request: &CanisterHttpRequest,
+    sol_price: f64,
+    spl_price: f64,
+) -> Option<CanisterHttpResponse> {
     let url = reqwest::Url::parse(&request.url).unwrap();
     let host = url.host_str()?;
     let is_exchange = matches!(
@@ -65,14 +69,13 @@ pub fn http_response(request: &CanisterHttpRequest) -> Option<CanisterHttpRespon
         .then(|| reply(503, vec![]));
     }
 
-    // A low positive SOL/SPL rate keeps the fee at one token unit in the
-    // deposit lifecycle fixtures. These are synthetic prices, not live quotes.
-    let (rate, float_rate) = if request.url.contains("SOL") {
-        ("0.000000001", 0.000_000_001)
+    let float_rate = if request.url.contains("SOL") {
+        sol_price
     } else {
         assert!(request.url.contains("SPL"), "Unexpected XRC pair: {url}");
-        ("1.0", 1.0)
+        spl_price
     };
+    let rate = float_rate.to_string();
     // Candle timestamps do not affect XRC's extraction; XRC supplies the
     // requested minute in its exchange-rate response.
     let body = match host {

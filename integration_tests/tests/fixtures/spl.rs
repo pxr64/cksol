@@ -188,13 +188,14 @@ pub async fn try_register_token(
 }
 
 /// Uses the recorded message, with an outcome where the given amount moved from the
-/// source to a newly created treasury ATA and the minter paid its fee and rent.
+/// source to the treasury ATA. `destination_balance` is `None` when the sweep creates it.
 pub fn sweep_transaction_response(
     signature: &Signature,
     transaction: VersionedTransactionMessage,
     owner: &Address,
     token_program: &Address,
     amount: u64,
+    destination_balance: Option<u64>,
 ) -> JsonRpcResponse {
     let bytes = assert_matches!(transaction, VersionedTransactionMessage::Legacy(bytes) => bytes);
     let message: solana_message::Message = bincode::deserialize(&bytes).unwrap();
@@ -213,9 +214,13 @@ pub fn sweep_transaction_response(
     let mut pre_balances = vec![1; message.account_keys.len()];
     pre_balances[0] = 5_000_000_000;
     pre_balances[source_index] = RENT_EXEMPT_LAMPORTS;
-    pre_balances[destination_index] = 0;
+    pre_balances[destination_index] = if destination_balance.is_some() {
+        RENT_EXEMPT_LAMPORTS
+    } else {
+        0
+    };
     let mut post_balances = pre_balances.clone();
-    post_balances[0] -= fee + RENT_EXEMPT_LAMPORTS;
+    post_balances[0] -= fee + RENT_EXEMPT_LAMPORTS - pre_balances[destination_index];
     post_balances[destination_index] = RENT_EXEMPT_LAMPORTS;
     let token_balance = |account_index: usize, owner: &Address, amount: u64| {
         json!({
@@ -234,6 +239,10 @@ pub fn sweep_transaction_response(
     let mut transaction = solana_transaction::Transaction::new_unsigned(message);
     transaction.signatures[0] = signature.clone().into();
     let encoded = STANDARD.encode(bincode::serialize(&transaction).unwrap());
+    let mut pre_token_balances = vec![token_balance(source_index, owner, amount)];
+    if let Some(balance) = destination_balance {
+        pre_token_balances.push(token_balance(destination_index, &MINTER_ADDRESS, balance));
+    }
     JsonRpcResponse::from(json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -247,10 +256,10 @@ pub fn sweep_transaction_response(
                 "fee": fee,
                 "preBalances": pre_balances,
                 "postBalances": post_balances,
-                "preTokenBalances": [token_balance(source_index, owner, amount)],
+                "preTokenBalances": pre_token_balances,
                 "postTokenBalances": [
                     token_balance(source_index, owner, 0),
-                    token_balance(destination_index, &MINTER_ADDRESS, amount)
+                    token_balance(destination_index, &MINTER_ADDRESS, destination_balance.unwrap_or(0) + amount)
                 ],
                 "innerInstructions": [],
                 "logMessages": [],
@@ -461,6 +470,7 @@ pub async fn finalize_sweep_with_amount(
                         owner,
                         token_program,
                         amount,
+                        None,
                     ),
                 )
                 .build(),

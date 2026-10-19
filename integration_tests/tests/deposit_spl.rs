@@ -24,6 +24,7 @@ use sol_rpc_types::{
 };
 use solana_address::Address;
 use spl_token_2022_interface::extension::ExtensionType;
+use std::time::Duration;
 use tokio::join;
 
 mod fixtures;
@@ -33,7 +34,8 @@ use fixtures::spl::{
     RENT_EXEMPT_LAMPORTS, account_info, add_spl_token_args, associated_token_address,
     finalize_sweep, finalize_sweep_with_amount, frozen_token_account_data, queue_deposit,
     queue_deposit_for_caller, register_token, run_mint_timer, setup_with_registered_mint,
-    sweep_queued_deposit, token_account_data, token_account_data_with_amount, try_register_token,
+    sweep_queued_deposit, sweep_transaction_response, token_account_data,
+    token_account_data_with_amount, try_register_token,
 };
 
 #[tokio::test]
@@ -48,6 +50,115 @@ async fn should_sweep_finalize_and_mint_token_2022_deposit_after_timers() {
         &[ExtensionType::ImmutableOwner],
     )
     .await;
+}
+
+#[tokio::test]
+async fn should_quote_and_mint_the_spl_deposit_fee_using_xrc() {
+    const DEPOSIT_BALANCE: u64 = 10_000_000;
+    // Two signatures cost 10,000 lamports. With a 20% margin, SOL at $150
+    // and SPL at $1, the fee is 0.0018 SPL, or 1,800 units at six decimals.
+    const EXPECTED_FEE: u64 = 1_800;
+
+    let token_program: Address = spl_token_interface::id().to_bytes().into();
+    let setup = SetupBuilder::new()
+        .with_proxy_canister()
+        .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
+        .build()
+        .await;
+    setup.fund_minter().await;
+    let ledger = setup.install_spl_ledger(DECIMALS).await;
+    register_token(&setup, ledger.canister_id(), token_program, 32).await;
+    // Move past the cached registration quote so XRC fetches the new prices.
+    setup.advance_time(Duration::from_secs(120)).await;
+    let account = Account {
+        owner: setup.proxy_canister_id(),
+        subaccount: Some([1; 32]),
+    };
+    let owner: Address = setup.minter().get_deposit_address(account).await.into();
+    let source = associated_token_address(&owner, &token_program);
+    let destination = associated_token_address(&MINTER_ADDRESS, &token_program);
+    let deposit_id = setup
+        .minter()
+        .with_http_mocks(
+            MockBuilder::with_start_id(36)
+                .with_xrc_prices(150.0, 1.0)
+                .get_account_info(
+                    &source,
+                    Some(account_info(
+                        token_account_data_with_amount(&owner, DEPOSIT_BALANCE),
+                        token_program,
+                    )),
+                )
+                // The treasury ATA already exists, so its rent is not part of the quote.
+                .get_account_info(
+                    &destination,
+                    Some(account_info(
+                        token_account_data_with_amount(&MINTER_ADDRESS, 0),
+                        token_program,
+                    )),
+                )
+                .build(),
+        )
+        .deposit_spl(DepositSplArgs {
+            owner: None,
+            subaccount: account.subaccount,
+            mint: MINT.into(),
+        })
+        .await
+        .expect("deposit_spl should quote the fee and queue the deposit");
+    assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Queued {
+            balance: DEPOSIT_BALANCE,
+            fee: EXPECTED_FEE,
+        }
+    );
+
+    let (signature, transaction) = sweep_queued_deposit(&setup, deposit_id, 44).await;
+    setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
+    setup
+        .execute_http_mocks(
+            MockBuilder::with_start_id(56)
+                .finalize_transaction(&signature, SUBMISSION_BLOCK_HEIGHT)
+                .get_transaction(
+                    &signature,
+                    sweep_transaction_response(
+                        &signature,
+                        transaction,
+                        &owner,
+                        &token_program,
+                        DEPOSIT_BALANCE,
+                        Some(0),
+                    ),
+                )
+                .build(),
+        )
+        .await;
+    assert_eq!(
+        setup.minter().get_minter_info().await.balance,
+        Setup::FUNDED_BALANCE - 2 * FEE_PER_SIGNATURE
+    );
+
+    run_mint_timer(&setup).await;
+    let user_balance = ledger.balance_of(account).await;
+    let fee_balance = ledger
+        .balance_of(Account {
+            owner: setup.minter_canister_id(),
+            subaccount: Some(cksol_int_tests::ledger_init_args::FEE_COLLECTOR_SUBACCOUNT),
+        })
+        .await;
+    assert_eq!(user_balance, DEPOSIT_BALANCE - EXPECTED_FEE);
+    assert_eq!(fee_balance, EXPECTED_FEE);
+    assert_eq!(user_balance + fee_balance, DEPOSIT_BALANCE);
+    assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Minted {
+            block_index: 0,
+            minted_amount: DEPOSIT_BALANCE - EXPECTED_FEE,
+            fee: SplFeeMintStatus::Minted { block_index: 1 },
+        }
+    );
+    setup.drop().await;
 }
 
 /// Queues a deposit, sweeps it on the timers, settles it and mints it on the ledger.
@@ -638,7 +749,6 @@ async fn should_queue_token_2022_deposit_with_immutable_owner() {
 
 mod cycles {
     use super::*;
-    use std::time::Duration;
 
     fn deposit_args() -> DepositSplArgs {
         DepositSplArgs {

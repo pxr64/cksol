@@ -95,13 +95,17 @@ impl SharedMockHttpOutcalls {
 }
 
 /// Answers SOL RPC requests from the builder and exchange requests from the real XRC.
-pub struct HttpMocks(MockHttpOutcalls);
+pub struct HttpMocks {
+    inner: MockHttpOutcalls,
+    sol_price: f64,
+    spl_price: f64,
+}
 
 #[async_trait]
 impl ExecuteHttpOutcallMocks for HttpMocks {
     async fn execute_http_outcall_mocks(&mut self, env: &PocketIc) {
         if !env.canister_exists(xrc::CANISTER_ID).await {
-            self.0.execute_http_outcall_mocks(env).await;
+            self.inner.execute_http_outcall_mocks(env).await;
             return;
         }
         loop {
@@ -119,10 +123,10 @@ impl ExecuteHttpOutcallMocks for HttpMocks {
             }
             for request in requests {
                 let mut response = self
-                    .0
+                    .inner
                     .pop_matching(&request)
                     .map(|mock| mock.response)
-                    .or_else(|| xrc::http_response(&request))
+                    .or_else(|| xrc::http_response(&request, self.sol_price, self.spl_price))
                     .unwrap_or_else(|| panic!("No mocks matching the request: {request:?}"));
                 if let crate::CanisterHttpResponse::CanisterHttpReply(reply) = &response {
                     let limit = request.max_response_bytes.unwrap_or(2_000_000);
@@ -163,6 +167,8 @@ impl ExecuteHttpOutcallMocks for SharedMockHttpOutcalls {
 pub struct MockBuilder {
     inner: MockHttpOutcallsBuilder,
     next_id: u64,
+    sol_price: f64,
+    spl_price: f64,
 }
 
 /// Number of Solana RPC providers used for redundancy.
@@ -177,17 +183,24 @@ impl Default for MockBuilder {
 
 impl MockBuilder {
     pub fn new() -> Self {
-        Self {
-            inner: MockHttpOutcallsBuilder::new(),
-            next_id: 0,
-        }
+        Self::with_start_id(0)
     }
 
     pub fn with_start_id(id: u64) -> Self {
         Self {
             inner: MockHttpOutcallsBuilder::new(),
             next_id: id,
+            // These synthetic prices quote a one-unit deposit fee by default.
+            sol_price: 0.000_000_001,
+            spl_price: 1.0,
         }
+    }
+
+    /// Sets the SOL and SPL prices in USD/USDT returned by the mocked exchanges.
+    pub fn with_xrc_prices(mut self, sol_price: f64, spl_price: f64) -> Self {
+        self.sol_price = sol_price;
+        self.spl_price = spl_price;
+        self
     }
 
     /// Add a mock for one RPC call ([`NUM_RPC_PROVIDERS`] IDs for redundancy).
@@ -203,7 +216,11 @@ impl MockBuilder {
     }
 
     pub fn build(self) -> HttpMocks {
-        HttpMocks(self.inner.build())
+        HttpMocks {
+            inner: self.inner.build(),
+            sol_price: self.sol_price,
+            spl_price: self.spl_price,
+        }
     }
 
     /// Mock for `getBalance` returning the given balance for any address.
