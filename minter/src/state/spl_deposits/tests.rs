@@ -1,7 +1,9 @@
 use super::*;
 use crate::state::MinterTransaction;
 use crate::{
-    constants::{FEE_PER_SIGNATURE, TOKEN_ACCOUNT_RENT_EXEMPTION},
+    constants::{
+        CLASSIC_TOKEN_ACCOUNT_RENT_EXEMPTION, FEE_PER_SIGNATURE, TOKEN_ACCOUNT_RENT_EXEMPTION,
+    },
     lifecycle,
     state::{
         State, TokenProgram,
@@ -540,13 +542,9 @@ fn should_split_and_replay_failed_spl_batch_without_releasing_accounts() {
 #[test]
 fn should_reserve_the_maximum_cost_of_a_submitted_spl_sweep() {
     let (_, signature, sweep, balance) = funded_spl_sweep();
-    let treasury_accounts = sweep
-        .deposits()
-        .values()
-        .map(|deposit| deposit.mint)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len() as u64;
-    let expected = 2 * FEE_PER_SIGNATURE + treasury_accounts * TOKEN_ACCOUNT_RENT_EXEMPTION;
+    // One classic and one Token-2022 deposit, each creating its treasury account.
+    let expected =
+        2 * FEE_PER_SIGNATURE + CLASSIC_TOKEN_ACCOUNT_RENT_EXEMPTION + TOKEN_ACCOUNT_RENT_EXEMPTION;
 
     assert_eq!(sweep.max_lamports_spent(), expected);
     let replayed = assert_replay_matches_state();

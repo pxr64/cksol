@@ -1,5 +1,7 @@
 use super::*;
-use crate::constants::{FEE_PER_SIGNATURE, RENT_EXEMPTION_THRESHOLD, TOKEN_ACCOUNT_RENT_EXEMPTION};
+use crate::constants::{
+    CLASSIC_TOKEN_ACCOUNT_RENT_EXEMPTION, FEE_PER_SIGNATURE, RENT_EXEMPTION_THRESHOLD,
+};
 use crate::sol_transfer::{MAX_SIGNATURES, MAX_TX_SIZE};
 use crate::{
     address::account_address,
@@ -173,19 +175,31 @@ async fn should_drop_frozen_single_sweep_and_allow_a_new_deposit_request() {
     let runtime = TestCanisterRuntime::new()
         .with_increasing_time()
         .expecting_charges()
-        .add_msg_cycles_available(2 * crate::constants::GET_ACCOUNT_INFO_CYCLES + fee)
+        .add_msg_cycles_available(
+            2 * crate::constants::GET_ACCOUNT_INFO_CYCLES
+                + crate::constants::XRC_REQUEST_CYCLES
+                + fee,
+        )
         .add_msg_cycles_refunded(crate::constants::GET_ACCOUNT_INFO_CYCLES / 2)
         .add_msg_cycles_refunded(crate::constants::GET_ACCOUNT_INFO_CYCLES / 2)
+        .add_msg_cycles_refunded(crate::constants::XRC_REQUEST_CYCLES / 2)
         .add_stub_response(MultiRpcResult::Consistent(Ok(Some(source_account(
             &deposit,
             AccountState::Initialized,
         )))))
-        .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
+        .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
+        .add_stub_response(crate::test_fixtures::unit_xrc_rate());
     let result =
         crate::deposit::spl::deposit_spl(&runtime, deposit.account, deposit.mint.into()).await;
     assert_eq!(result, Ok(1));
     read_state(|state| {
-        assert_eq!(state.spl_deposits().queued()[&1], deposit);
+        assert_eq!(
+            state.spl_deposits().queued()[&1],
+            QueuedSplDeposit {
+                fee: 1,
+                ..deposit.clone()
+            }
+        );
         assert_eq!(
             state
                 .spl_deposits()
@@ -198,7 +212,7 @@ async fn should_drop_frozen_single_sweep_and_allow_a_new_deposit_request() {
 #[test]
 fn should_take_only_the_sweeps_the_balance_covers() {
     // A lone deposit costs two signatures and one treasury account, above the rent floor.
-    let single_sweep = 2 * FEE_PER_SIGNATURE + TOKEN_ACCOUNT_RENT_EXEMPTION;
+    let single_sweep = 2 * FEE_PER_SIGNATURE + CLASSIC_TOKEN_ACCOUNT_RENT_EXEMPTION;
     queue_deposits_with_balance(
         3,
         false,
@@ -232,7 +246,7 @@ fn should_take_only_the_sweeps_the_balance_covers() {
 #[tokio::test]
 async fn should_leave_deposits_queued_when_a_withdrawal_takes_the_balance_during_signing() {
     // The balance covers the sweep, until the withdrawal is created during the signing.
-    let single_sweep = 2 * FEE_PER_SIGNATURE + TOKEN_ACCOUNT_RENT_EXEMPTION;
+    let single_sweep = 2 * FEE_PER_SIGNATURE + CLASSIC_TOKEN_ACCOUNT_RENT_EXEMPTION;
     queue_deposits_with_balance(
         1,
         true,

@@ -1,4 +1,4 @@
-use crate::{Setup, validator::FEE_PER_SIGNATURE};
+use crate::{MockCanisterHttpResponse, Setup, validator::FEE_PER_SIGNATURE, xrc};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use cksol_types::Signature;
@@ -86,11 +86,64 @@ pub fn get_memo(block: ICRC3Value) -> Vec<u8> {
 ///
 /// [`PocketIcRuntime`]: ic_pocket_canister_runtime::PocketIcRuntime
 #[derive(Clone)]
-pub struct SharedMockHttpOutcalls(Arc<Mutex<MockHttpOutcalls>>);
+pub struct SharedMockHttpOutcalls(Arc<Mutex<HttpMocks>>);
 
 impl SharedMockHttpOutcalls {
-    pub fn new(mocks: MockHttpOutcalls) -> Self {
+    pub fn new(mocks: HttpMocks) -> Self {
         Self(Arc::new(Mutex::new(mocks)))
+    }
+}
+
+/// Answers SOL RPC requests from the builder and exchange requests from the real XRC.
+pub struct HttpMocks(MockHttpOutcalls);
+
+#[async_trait]
+impl ExecuteHttpOutcallMocks for HttpMocks {
+    async fn execute_http_outcall_mocks(&mut self, env: &PocketIc) {
+        if !env.canister_exists(xrc::CANISTER_ID).await {
+            self.0.execute_http_outcall_mocks(env).await;
+            return;
+        }
+        loop {
+            let mut requests = vec![];
+            for _ in 0..10 {
+                requests = env.get_canister_http().await;
+                if !requests.is_empty() {
+                    break;
+                }
+                env.tick().await;
+                env.advance_time(Duration::from_nanos(1)).await;
+            }
+            if requests.is_empty() {
+                return;
+            }
+            for request in requests {
+                let mut response = self
+                    .0
+                    .pop_matching(&request)
+                    .map(|mock| mock.response)
+                    .or_else(|| xrc::http_response(&request))
+                    .unwrap_or_else(|| panic!("No mocks matching the request: {request:?}"));
+                if let crate::CanisterHttpResponse::CanisterHttpReply(reply) = &response {
+                    let limit = request.max_response_bytes.unwrap_or(2_000_000);
+                    if reply.body.len() as u64 > limit {
+                        response = crate::CanisterHttpResponse::CanisterHttpReject(
+                            pocket_ic::common::rest::CanisterHttpReject {
+                                reject_code: pocket_ic::RejectCode::SysFatal as u64,
+                                message: format!("Http body exceeds size limit of {limit} bytes."),
+                            },
+                        );
+                    }
+                }
+                env.mock_canister_http_response(MockCanisterHttpResponse {
+                    subnet_id: request.subnet_id,
+                    request_id: request.request_id,
+                    response,
+                    additional_responses: vec![],
+                })
+                .await;
+            }
+        }
     }
 }
 
@@ -149,8 +202,8 @@ impl MockBuilder {
         self
     }
 
-    pub fn build(self) -> MockHttpOutcalls {
-        self.inner.build()
+    pub fn build(self) -> HttpMocks {
+        HttpMocks(self.inner.build())
     }
 
     /// Mock for `getBalance` returning the given balance for any address.

@@ -12,7 +12,7 @@ pub const LEDGER_TRANSFER_FEE: u64 = 50;
 /// id beyond `u32::MAX` would not fit. Raising it takes a ledger upgrade.
 const LEDGER_MAX_MEMO_BYTES: u16 = 80;
 const NNS_ROOT_PRINCIPAL: Principal = Principal::from_slice(&[0_u8, 0, 0, 0, 0, 0, 0, 3, 1, 1]);
-const FEE_COLLECTOR_SUBACCOUNT: [u8; 32] = [
+pub const FEE_COLLECTOR_SUBACCOUNT: [u8; 32] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0f,
     0xee,
 ];

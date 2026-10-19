@@ -29,7 +29,7 @@ use tokio::join;
 mod fixtures;
 
 use fixtures::spl::{
-    BALANCE_ABOVE_MINIMUM, DECIMALS, MINIMUM_DEPOSIT_AMOUNT, MINT, OTHER_MINT,
+    BALANCE_ABOVE_MINIMUM, DECIMALS, DEPOSIT_FEE, MINIMUM_DEPOSIT_AMOUNT, MINT, OTHER_MINT,
     RENT_EXEMPT_LAMPORTS, account_info, add_spl_token_args, associated_token_address,
     finalize_sweep, finalize_sweep_with_amount, frozen_token_account_data, queue_deposit,
     queue_deposit_for_caller, register_token, run_mint_timer, setup_with_registered_mint,
@@ -82,7 +82,7 @@ async fn sweep_finalize_and_mint(token_program: Address, extensions: &[Extension
         setup.minter().deposit_spl_status(deposit_id).await,
         DepositSplStatus::Queued {
             balance: BALANCE_ABOVE_MINIMUM,
-            fee: 0,
+            fee: DEPOSIT_FEE,
         }
     );
     assert_eq!(
@@ -118,19 +118,31 @@ async fn sweep_finalize_and_mint(token_program: Address, extensions: &[Extension
             lamports_spent: 2 * FEE_PER_SIGNATURE + RENT_EXEMPT_LAMPORTS,
             mints: vec![CreditedSplDeposit {
                 deposit_id,
-                amount_to_mint: BALANCE_ABOVE_MINIMUM
+                amount_to_mint: BALANCE_ABOVE_MINIMUM - DEPOSIT_FEE
             }],
         }));
     });
 
     run_mint_timer(&setup).await;
-    assert_eq!(ledger.balance_of(account).await, BALANCE_ABOVE_MINIMUM);
+    assert_eq!(
+        ledger.balance_of(account).await,
+        BALANCE_ABOVE_MINIMUM - DEPOSIT_FEE
+    );
+    assert_eq!(
+        ledger
+            .balance_of(Account {
+                owner: setup.minter_canister_id(),
+                subaccount: Some(cksol_int_tests::ledger_init_args::FEE_COLLECTOR_SUBACCOUNT),
+            })
+            .await,
+        DEPOSIT_FEE
+    );
     assert_eq!(
         setup.minter().deposit_spl_status(deposit_id).await,
         DepositSplStatus::Minted {
             block_index: 0,
-            minted_amount: BALANCE_ABOVE_MINIMUM,
-            fee: SplFeeMintStatus::None,
+            minted_amount: BALANCE_ABOVE_MINIMUM - DEPOSIT_FEE,
+            fee: SplFeeMintStatus::Minted { block_index: 1 },
         }
     );
     assert_eq!(
@@ -148,11 +160,13 @@ async fn sweep_finalize_and_mint(token_program: Address, extensions: &[Extension
             deposit_id,
             mint_block_index: 0
         }));
+        check!(events.contains(&EventType::MintedSplDepositFee {
+            deposit_id,
+            mint_block_index: 1
+        }));
         check!(!events.iter().any(|event| matches!(
             event,
-            EventType::MintedSplDepositFee { .. }
-                | EventType::QuarantinedSplSweep { .. }
-                | EventType::QuarantinedPendingSplMint { .. }
+            EventType::QuarantinedSplSweep { .. } | EventType::QuarantinedPendingSplMint { .. }
         )));
     });
     let memo: Memo = minicbor::decode(&get_memo(ledger.get_block(0).await)).unwrap();
@@ -433,13 +447,16 @@ async fn should_keep_in_flight_deposit_and_mint_it_after_upgrade() {
     assert_eq!(ledger.balance_of(account).await, 0);
 
     run_mint_timer(&setup).await;
-    assert_eq!(ledger.balance_of(account).await, BALANCE_ABOVE_MINIMUM);
+    assert_eq!(
+        ledger.balance_of(account).await,
+        BALANCE_ABOVE_MINIMUM - DEPOSIT_FEE
+    );
     assert_eq!(
         setup.minter().deposit_spl_status(deposit_id).await,
         DepositSplStatus::Minted {
             block_index: 0,
-            minted_amount: BALANCE_ABOVE_MINIMUM,
-            fee: SplFeeMintStatus::None,
+            minted_amount: BALANCE_ABOVE_MINIMUM - DEPOSIT_FEE,
+            fee: SplFeeMintStatus::Minted { block_index: 1 },
         }
     );
     setup.minter().assert_that_events().await.satisfy(|events| {
@@ -621,6 +638,7 @@ async fn should_queue_token_2022_deposit_with_immutable_owner() {
 
 mod cycles {
     use super::*;
+    use std::time::Duration;
 
     fn deposit_args() -> DepositSplArgs {
         DepositSplArgs {
@@ -662,6 +680,8 @@ mod cycles {
     async fn should_charge_both_reads_and_the_consolidation_fee() {
         let token_program: Address = spl_token_interface::id().to_bytes().into();
         let setup = setup_with_registered_mint(token_program).await;
+        // Registration quoted the same pair, so leave the XRC cache window for a fresh lookup.
+        setup.advance_time(Duration::from_secs(120)).await;
         let owner: Address = DEFAULT_CALLER_DEPOSIT_ADDRESS.parse().unwrap();
         let source = associated_token_address(&owner, &token_program);
         let destination = associated_token_address(&MINTER_ADDRESS, &token_program);
@@ -688,7 +708,7 @@ mod cycles {
         let (caller_after, minter_after) = cycle_balances(&setup).await;
         assert_eq!(
             caller_before - caller_after,
-            reads_cost + Setup::DEFAULT_DEPOSIT_SOL_FEE
+            reads_cost + cksol_int_tests::xrc::REQUEST_COST + Setup::DEFAULT_DEPOSIT_SOL_FEE
         );
         assert_eq!(minter_after - minter_before, Setup::DEFAULT_DEPOSIT_SOL_FEE);
         setup.drop().await;

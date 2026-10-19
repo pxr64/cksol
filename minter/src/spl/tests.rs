@@ -4,7 +4,9 @@ use crate::{
     lifecycle,
     state::{audit::replay_events, event::Event},
     storage::{total_event_count, with_event_iter},
-    test_fixtures::{deposit::DEPOSITOR_ACCOUNT, runtime::TestCanisterRuntime, valid_init_args},
+    test_fixtures::{
+        deposit::DEPOSITOR_ACCOUNT, runtime::TestCanisterRuntime, valid_init_args, xrc_rate,
+    },
 };
 use assert_matches::assert_matches;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -29,6 +31,7 @@ fn args() -> AddSplTokenArgs {
         ledger_id: Principal::from_slice(&[42, 1]),
         minimum_deposit_amount: 1_000_000,
         paused: false,
+        xrc_symbol: "USDC".to_string(),
     }
 }
 
@@ -60,6 +63,19 @@ fn with_mint(runtime: TestCanisterRuntime, account: Option<AccountInfo>) -> Test
     runtime.add_stub_response(MultiRpcResult::Consistent(Ok(account)))
 }
 
+/// A runtime that answers the mint read and the XRC probe of a registration.
+fn registration_runtime() -> TestCanisterRuntime {
+    with_mint(init(), Some(mint_account(&mint_data()))).add_stub_response(usdc_rate())
+}
+
+fn usdc_rate() -> ic_xrc_types::GetExchangeRateResult {
+    xrc_rate("USDC", 150_000_000_000)
+}
+
+fn expected_token(args: AddSplTokenArgs) -> SupportedSplToken {
+    SupportedSplToken::try_from(args).unwrap()
+}
+
 fn assert_not_registered(mint: &cksol_types::Address) {
     assert!(read_state(|state| state
         .supported_spl_token(&mint.clone().into())
@@ -83,14 +99,14 @@ fn token_2022_mint_account(data: &[u8]) -> AccountInfo {
 
 #[tokio::test]
 async fn should_register_and_replay_the_token_from_stable_events() {
-    let runtime = with_mint(init(), Some(mint_account(&mint_data())));
+    let runtime = registration_runtime();
     let args = args();
     assert_eq!(add_spl_token(&runtime, args.clone()).await, Ok(()));
     assert_eq!(
         read_state(|state| state
             .supported_spl_token(&args.mint.clone().into())
             .cloned()),
-        Some(SupportedSplToken::try_from(args.clone()).unwrap())
+        Some(expected_token(args.clone()))
     );
     let events = with_event_iter(|events| {
         events
@@ -101,13 +117,25 @@ async fn should_register_and_replay_the_token_from_stable_events() {
     assert_matches!(&events[1].payload, EventType::AddedSplToken(token) if cksol_types::Address::from(token.mint) == args.mint);
     let replayed = replay_events(events);
     read_state(|state| assert_eq!(state, &replayed));
-    assert_eq!(runtime.sent_update_calls().len(), 1);
+    assert_eq!(runtime.sent_update_calls().len(), 2);
     assert_eq!(runtime.sent_update_calls()[0].method, "getAccountInfo");
+    assert_eq!(runtime.sent_update_calls()[1].method, "get_exchange_rate");
+    assert_eq!(
+        runtime.sent_update_calls()[1].canister_id.to_text(),
+        "uf6dk-hyaaa-aaaaq-qaaaq-cai"
+    );
+    assert_eq!(
+        replayed
+            .supported_spl_token(&args.mint.into())
+            .unwrap()
+            .xrc_symbol,
+        "USDC"
+    );
 }
 
 #[tokio::test]
 async fn should_preserve_initial_paused_flag() {
-    let runtime = with_mint(init(), Some(mint_account(&mint_data())));
+    let runtime = registration_runtime();
     let args = AddSplTokenArgs {
         paused: true,
         ..args()
@@ -167,7 +195,7 @@ async fn should_reject_invalid_configuration_before_rpc() {
 
 #[tokio::test]
 async fn should_reject_duplicate_mint_and_ledger_without_overwriting_config() {
-    let runtime = with_mint(init(), Some(mint_account(&mint_data())));
+    let runtime = registration_runtime();
     let original = args();
     assert_eq!(add_spl_token(&runtime, original.clone()).await, Ok(()));
     let changed = AddSplTokenArgs {
@@ -191,24 +219,27 @@ async fn should_reject_duplicate_mint_and_ledger_without_overwriting_config() {
             ledger_id: original.ledger_id
         })
     );
-    assert_eq!(runtime.sent_update_calls().len(), 1);
+    assert_eq!(runtime.sent_update_calls().len(), 2);
     assert_eq!(total_event_count(), 2);
     assert_eq!(
         read_state(|state| state
             .supported_spl_token(&original.mint.clone().into())
             .cloned()),
-        Some(SupportedSplToken::try_from(original).unwrap())
+        Some(expected_token(original))
     );
 }
 
 #[tokio::test]
 async fn should_recheck_registration_after_concurrent_rpc_calls() {
-    let runtime = init();
-    let first = with_mint(runtime.clone(), Some(mint_account(&mint_data())));
-    let second = with_mint(runtime, Some(mint_account(&mint_data())));
+    let runtime = with_mint(
+        with_mint(init(), Some(mint_account(&mint_data()))),
+        Some(mint_account(&mint_data())),
+    )
+    .add_stub_response(usdc_rate())
+    .add_stub_response(usdc_rate());
     let (a, b) = futures::join!(
-        add_spl_token(&first, args()),
-        add_spl_token(&second, args())
+        add_spl_token(&runtime, args()),
+        add_spl_token(&runtime, args())
     );
     assert_matches!(
         (&a, &b),
@@ -267,7 +298,8 @@ async fn should_leave_registry_unchanged_when_rpc_results_are_inconsistent() {
 
 #[tokio::test]
 async fn should_register_and_replay_token_2022_without_extensions() {
-    let runtime = with_mint(init(), Some(token_2022_mint_account(&mint_data())));
+    let runtime = with_mint(init(), Some(token_2022_mint_account(&mint_data())))
+        .add_stub_response(usdc_rate());
     let args = token_2022_args();
 
     assert_eq!(add_spl_token(&runtime, args.clone()).await, Ok(()));
@@ -276,12 +308,55 @@ async fn should_register_and_replay_token_2022_without_extensions() {
         read_state(|state| state
             .supported_spl_token(&args.mint.clone().into())
             .cloned()),
-        Some(SupportedSplToken::try_from(args).unwrap())
+        Some(expected_token(args))
     );
     let replayed = with_event_iter(|events| replay_events(events));
     read_state(|state| assert_eq!(state, &replayed));
     assert_eq!(total_event_count(), 2);
-    assert_eq!(runtime.sent_update_calls().len(), 1);
+    assert_eq!(runtime.sent_update_calls().len(), 2);
+}
+
+#[tokio::test]
+async fn should_leave_registry_unchanged_when_the_xrc_call_fails() {
+    let runtime = with_mint(init(), Some(mint_account(&mint_data())))
+        .add_stub_error(ic_canister_runtime::IcError::CallPerformFailed);
+
+    assert_matches!(
+        add_spl_token(&runtime, args()).await,
+        Err(AddSplTokenError::TemporarilyUnavailable(_))
+    );
+    assert_not_registered(&args().mint);
+}
+
+#[tokio::test]
+async fn should_reject_a_symbol_the_xrc_does_not_quote() {
+    let runtime = with_mint(init(), Some(mint_account(&mint_data()))).add_stub_response(
+        ic_xrc_types::GetExchangeRateResult::Err(
+            ic_xrc_types::ExchangeRateError::CryptoQuoteAssetNotFound,
+        ),
+    );
+
+    assert_matches!(
+        add_spl_token(&runtime, args()).await,
+        Err(AddSplTokenError::InvalidToken(reason)) if reason.contains("no SOL rate")
+    );
+    assert_not_registered(&args().mint);
+}
+
+#[tokio::test]
+async fn should_reject_an_empty_xrc_symbol_before_any_call() {
+    let runtime = init();
+    let args = AddSplTokenArgs {
+        xrc_symbol: " ".to_string(),
+        ..args()
+    };
+
+    assert_matches!(
+        add_spl_token(&runtime, args.clone()).await,
+        Err(AddSplTokenError::InvalidToken(reason)) if reason.contains("XRC symbol")
+    );
+    assert!(runtime.sent_update_calls().is_empty());
+    assert_not_registered(&args.mint);
 }
 
 #[tokio::test]
