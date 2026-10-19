@@ -78,8 +78,11 @@ pub async fn sweep_queued_spl_deposits<R: CanisterRuntime>(runtime: R) {
     let batches = batches
         .into_iter()
         .map(|sweep| (batch_purpose(&sweep, block), sweep));
-    futures::future::join_all(retries.chain(batches).map(async |(purpose, sweep)| {
-        match submit_spl_sweep_transaction(&runtime, purpose, sweep, block).await {
+    let submissions = retries.chain(batches).map(async |(purpose, sweep)| {
+        let result = submit_spl_sweep_transaction(&runtime, purpose, sweep, block).await;
+        // A submission error still leaves a recorded sweep for finalization.
+        let submitted = matches!(&result, Ok(_) | Err(SweepError::SubmitTransactionFailed(_)));
+        match result {
             Ok(signature) => log!(
                 Priority::Info,
                 "Submitted SPL sweep transaction {signature}"
@@ -99,9 +102,14 @@ pub async fn sweep_queued_spl_deposits<R: CanisterRuntime>(runtime: R) {
                 "The balance no longer covers a signed SPL sweep, leaving its deposits queued"
             ),
         }
-    }))
-    .await;
-    if !leaves_deposits_queued {
+        submitted
+    });
+    let made_progress = futures::future::join_all(submissions)
+        .await
+        .into_iter()
+        .any(|submitted| submitted);
+    // With no progress, wait for the periodic timer instead of retrying immediately.
+    if !made_progress || !leaves_deposits_queued {
         scopeguard::ScopeGuard::into_inner(reschedule);
     }
 }

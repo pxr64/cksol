@@ -621,6 +621,31 @@ async fn should_leave_spl_deposits_queued_when_timer_signing_fails() {
 }
 
 #[tokio::test]
+async fn should_not_reschedule_spl_sweeps_when_all_signing_attempts_fail() {
+    queue_deposits(100, false, true, Some(TokenProgram::Classic));
+    let round = read_state(|state| SweepRound::take_from_queue(state, &schnorr_master_key()));
+    assert!(round.leaves_deposits_queued);
+    let before = EventsAssert::from_recorded();
+    let runtime = TestCanisterRuntime::new()
+        .add_recent_block(Ok(block().slot))
+        .add_signer(sign_as_minter().expect((0..round.batches.len()).map(|_| {
+            Err(SignCallError::CallFailed(
+                CallRejected::with_rejection(4, "signing unavailable".to_string()).into(),
+            ))
+        })));
+
+    sweep_queued_spl_deposits(runtime.clone()).await;
+
+    assert_eq!(EventsAssert::from_recorded(), before);
+    assert_eq!(runtime.set_timer_call_count(), 0);
+    read_state(|state| {
+        assert_eq!(state.spl_deposits().queued().len(), 100);
+        assert!(state.submitted_transactions().is_empty());
+    });
+    assert!(TimerGuard::new(TaskType::SweepSplDeposits).is_ok());
+}
+
+#[tokio::test]
 async fn should_reschedule_spl_sweep_round_until_all_deposits_are_submitted() {
     queue_deposits(100, false, true, Some(TokenProgram::Classic));
     let round = read_state(|state| SweepRound::take_from_queue(state, &schnorr_master_key()));
