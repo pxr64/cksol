@@ -297,6 +297,22 @@ async fn should_not_fetch_a_block_when_the_balance_covers_no_sweep() {
 }
 
 #[test]
+fn should_take_only_the_sweeps_the_operating_balance_covers() {
+    let single_sweep = 2 * FEE_PER_SIGNATURE + CLASSIC_TOKEN_ACCOUNT_RENT_EXEMPTION;
+    for (operating_balance, expected_sweeps) in [(0, 0), (single_sweep - 1, 0), (single_sweep, 1)] {
+        queue_deposits_with_balance(3, false, false, Some(TokenProgram::Classic), 0);
+        init_balance_to(BALANCE);
+        events::top_up_operating_balance(operating_balance);
+
+        let round = read_state(|state| SweepRound::take_from_queue(state, &schnorr_master_key()));
+
+        assert!(round.retries.is_empty());
+        assert_eq!(round.batches.len(), expected_sweeps);
+        assert!(round.leaves_deposits_queued);
+    }
+}
+
+#[test]
 fn should_sweep_retried_deposits_alone_and_first() {
     queue_deposits(6, false, true, Some(TokenProgram::Classic));
     split_batch(&[2, 3]);
@@ -921,6 +937,7 @@ fn queue_deposits_with_balance(
     mutate_state(|state| process_event(state, minter_public_key_fetched_event(), &runtime));
     if balance > 0 {
         init_balance_to(balance);
+        events::top_up_operating_balance(balance);
     }
     for id in 0..count {
         let mint: solana_address::Address = if same_mint {
@@ -1111,6 +1128,7 @@ fn should_pack_more_deposits_when_owners_and_mints_are_shared() {
     let runtime = TestCanisterRuntime::new().with_increasing_time();
     lifecycle::init(valid_init_args(), runtime.clone());
     init_balance_to(BALANCE);
+    events::top_up_operating_balance(BALANCE);
     for mint_index in 0..4 {
         let mint = [mint_index as u8 + 1; 32].into();
         let token_program = if mint_index % 2 == 0 {

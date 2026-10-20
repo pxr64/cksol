@@ -802,6 +802,7 @@ mod state_from_init_args {
                 pending_deposit_sol_request_guards: BTreeSet::new(),
                 pending_deposit_spl_request_guards: BTreeSet::new(),
                 pending_withdrawal_request_guards: BTreeSet::new(),
+                pending_operating_top_up_guards: BTreeSet::new(),
                 deposits: Deposits::default(),
                 spl_deposits: SplDeposits::default(),
                 supported_spl_tokens: BTreeMap::new(),
@@ -818,6 +819,7 @@ mod state_from_init_args {
                 active_tasks: BTreeSet::new(),
                 balance: 0,
                 spl_sweep_reservations: BTreeMap::new(),
+                operating_balance: 0,
             }
         );
     }

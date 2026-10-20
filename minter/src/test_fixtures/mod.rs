@@ -1138,6 +1138,19 @@ pub mod events {
         });
     }
 
+    pub fn top_up_operating_balance(amount: Lamport) {
+        mutate_state(|state| {
+            process_event(
+                state,
+                EventType::ToppedUpOperatingBalance {
+                    burn_block_index: LedgerBurnIndex::new(0xBEEF),
+                    amount,
+                },
+                &runtime(),
+            )
+        });
+    }
+
     /// Registers a classic SPL token, queues one deposit of it and submits its sweep under
     /// `signature`, which reserves the cost of the sweep from the balance.
     pub fn submit_spl_sweep(signature: Signature) -> SplSweep {
@@ -1887,6 +1900,12 @@ pub mod arb {
             }),
             any::<u64>()
                 .prop_map(|deposit_id| EventType::QuarantinedPendingSplFeeMint { deposit_id }),
+            (any::<u64>(), any::<u64>()).prop_map(|(burn_block_index, amount)| {
+                EventType::ToppedUpOperatingBalance {
+                    burn_block_index: LedgerBurnIndex::new(burn_block_index),
+                    amount,
+                }
+            }),
         ]
     }
 

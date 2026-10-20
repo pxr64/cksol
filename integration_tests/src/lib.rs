@@ -9,7 +9,8 @@ use cksol_types::{
     AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
     DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, DepositSplStatus,
     GetDepositAddressArgs, GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo,
-    WithdrawSolArgs, WithdrawSolError, WithdrawSolOk, WithdrawSolStatus, WithdrawSolStatusArgs,
+    OperatingBalance, OperatingTopUp, ProcessOperatingTopUpError, WithdrawSolArgs,
+    WithdrawSolError, WithdrawSolOk, WithdrawSolStatus, WithdrawSolStatusArgs,
 };
 use cksol_types_internal::{
     MinterArg,
@@ -21,7 +22,10 @@ use ic_http_types::{HttpRequest, HttpResponse};
 use ic_management_canister_types::{CanisterId, CanisterSettings};
 use ic_pocket_canister_runtime::{ExecuteHttpOutcallMocks, PocketIcRuntime};
 use icrc_ledger_types::{
-    icrc1::account::Account,
+    icrc1::{
+        account::Account,
+        transfer::{TransferArg, TransferError},
+    },
     icrc2::approve::{ApproveArgs, ApproveError},
     icrc3::blocks::{GetBlocksRequest, GetBlocksResult, ICRC3GenericBlock},
 };
@@ -148,6 +152,7 @@ impl Setup {
     pub const DEFAULT_DEPOSIT_SOL_REQUIRED_CYCLES: u128 = 1_000_000_000_000;
     pub const DEFAULT_DEPOSIT_SPL_REQUIRED_CYCLES: u128 = 1_000_000_000_000;
     pub const FUNDED_BALANCE: Lamport = fixtures::DEPOSIT_AMOUNT - validator::FEE_PER_SIGNATURE;
+    pub const OPERATING_TOP_UP: Lamport = 100_000_000; // 0.1 SOL
     pub const DEFAULT_MINIMUM_WITHDRAWAL_AMOUNT: Lamport = 2_000_000; // 0.002 SOL
     pub const DEFAULT_CALLER: Principal =
         Principal::from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x0, 0x3, 0x1, 0x1]);
@@ -317,6 +322,21 @@ impl Setup {
                 .build(),
         )
         .await;
+    }
+
+    /// Mints the ckSOL of [`Self::fund_minter`], then burns [`Self::OPERATING_TOP_UP`] of it
+    /// into the operating balance through the top-up account. Makes no HTTP outcalls.
+    pub async fn top_up_operating_balance(&self) {
+        self.advance_time_and_settle(fixtures::PROCESS_PENDING_MINTS_DELAY)
+            .await;
+        let top_up_account = self.minter().get_operating_balance().await.top_up_account;
+        self.ledger()
+            .transfer(top_up_account, Self::OPERATING_TOP_UP)
+            .await;
+        assert_matches::assert_matches!(
+            self.minter().process_operating_top_up().await,
+            Ok(OperatingTopUp { amount, .. }) if amount == Self::OPERATING_TOP_UP
+        );
     }
 
     async fn mock_sol_rpc_api_keys(env: &PocketIc, sol_rpc_canister_id: Principal) {
@@ -754,6 +774,16 @@ impl<'a> CkSolMinter<'a> {
         self.query_call("get_minter_info", ()).await
     }
 
+    pub async fn get_operating_balance(&self) -> OperatingBalance {
+        self.query_call("get_operating_balance", ()).await
+    }
+
+    pub async fn process_operating_top_up(
+        &self,
+    ) -> Result<OperatingTopUp, ProcessOperatingTopUpError> {
+        self.update_call("process_operating_top_up", (), 0).await
+    }
+
     pub async fn state(&self) -> MinterState {
         MinterState {
             info: self.get_minter_info().await,
@@ -861,6 +891,23 @@ impl Ledger<'_> {
     pub async fn balance_of(&self, account: Account) -> u64 {
         self.update_call::<_, Nat>("icrc1_balance_of", (account,), 0)
             .await
+            .0
+            .to_u64()
+            .unwrap()
+    }
+
+    pub async fn transfer(&self, to: Account, amount: u64) -> u64 {
+        let args = TransferArg {
+            from_subaccount: None,
+            to,
+            fee: None,
+            created_at_time: None,
+            memo: None,
+            amount: Nat::from(amount),
+        };
+        self.update_call::<_, Result<Nat, TransferError>>("icrc1_transfer", (args,), 0)
+            .await
+            .expect("transfer call failed")
             .0
             .to_u64()
             .unwrap()

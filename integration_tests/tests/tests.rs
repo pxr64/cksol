@@ -1332,6 +1332,74 @@ mod minter_owner_tests {
     }
 }
 
+mod operating_top_up_tests {
+    use super::*;
+    use cksol_int_tests::{fixtures::get_memo, ledger_init_args::LEDGER_TRANSFER_FEE};
+    use cksol_types::{BurnMemo, Memo, OperatingTopUp, ProcessOperatingTopUpError};
+
+    const TOP_UP: Lamport = 100_000_000;
+
+    #[tokio::test]
+    async fn should_burn_the_top_up_account_into_the_operating_balance() {
+        let setup = SetupBuilder::new()
+            .with_initial_ledger_balances(vec![(DEFAULT_CALLER_ACCOUNT, Nat::from(10 * TOP_UP))])
+            .build()
+            .await;
+        let mut beef = [0; 32];
+        beef[30] = 0xbe;
+        beef[31] = 0xef;
+        let top_up_account = setup.minter().get_operating_balance().await.top_up_account;
+        assert_eq!(
+            top_up_account,
+            Account {
+                owner: setup.minter_canister_id(),
+                subaccount: Some(beef),
+            }
+        );
+        assert_eq!(
+            setup.minter().process_operating_top_up().await,
+            Err(ProcessOperatingTopUpError::NoFunds)
+        );
+
+        setup.ledger().transfer(top_up_account, TOP_UP).await;
+        let OperatingTopUp {
+            block_index,
+            amount,
+        } = setup
+            .minter()
+            .process_operating_top_up()
+            .await
+            .expect("the top-up should burn the sent ckSOL");
+
+        assert_eq!(amount, TOP_UP);
+        assert_eq!(setup.minter().get_operating_balance().await.balance, TOP_UP);
+        assert_eq!(setup.minter().get_minter_info().await.balance, 0);
+        assert_eq!(setup.ledger().balance_of(top_up_account).await, 0);
+        assert_eq!(
+            setup.ledger().balance_of(DEFAULT_CALLER_ACCOUNT).await,
+            9 * TOP_UP - LEDGER_TRANSFER_FEE
+        );
+        let memo = get_memo(setup.ledger().get_block(block_index).await);
+        assert_eq!(
+            minicbor::decode::<Memo>(&memo).expect("failed to decode memo"),
+            Memo::from(BurnMemo::TopUp)
+        );
+        setup.minter().assert_that_events().await.satisfy(|events| {
+            check!(events.contains(&EventType::ToppedUpOperatingBalance {
+                burn_block_index: block_index,
+                amount: TOP_UP,
+            }));
+        });
+        setup
+            .check_metrics()
+            .await
+            .assert_contains_metric_matching(format!(r#"minter_operating_balance {TOP_UP} \d+"#))
+            .into()
+            .drop()
+            .await;
+    }
+}
+
 mod metrics_tests {
     use super::*;
 
@@ -1348,6 +1416,7 @@ mod metrics_tests {
             // Only the init and minter public key events should have been recorded
             .assert_contains_metric_matching(r#"total_event_count 2 \d+"#)
             .assert_contains_metric_matching(r#"minter_balance 0 \d+"#)
+            .assert_contains_metric_matching(r#"minter_operating_balance 0 \d+"#)
             .assert_contains_metric_matching(r#"oldest_in_flight_deposit_age_seconds 0 \d+"#)
             .assert_contains_metric_matching(r#"oldest_pending_mint_age_seconds 0 \d+"#)
             .assert_contains_metric_matching(

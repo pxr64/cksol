@@ -2,7 +2,8 @@ use super::*;
 use crate::state::MinterTransaction;
 use crate::{
     constants::{
-        CLASSIC_TOKEN_ACCOUNT_RENT_EXEMPTION, FEE_PER_SIGNATURE, TOKEN_ACCOUNT_RENT_EXEMPTION,
+        CLASSIC_TOKEN_ACCOUNT_RENT_EXEMPTION, FEE_PER_SIGNATURE, RENT_EXEMPTION_THRESHOLD,
+        TOKEN_ACCOUNT_RENT_EXEMPTION,
     },
     lifecycle,
     state::{
@@ -13,7 +14,7 @@ use crate::{
     },
     storage::{reset_events, with_event_iter},
     test_fixtures::{
-        DEFAULT_BLOCK_HEIGHT, account, classic_spl_tokens, minter_public_key_fetched_event,
+        DEFAULT_BLOCK_HEIGHT, account, classic_spl_tokens, events, minter_public_key_fetched_event,
         planned_spl_sweep, planned_sweep, queued_deposit_of, queued_spl_deposit,
         runtime::TestCanisterRuntime, schnorr_master_key, signature, spl_token, valid_init_args,
     },
@@ -65,11 +66,15 @@ fn submitted_spl_sweep() -> (TestCanisterRuntime, Signature, SplSweep) {
     (runtime, signature, sweep)
 }
 
+/// Covers the cost of the sweep that [`funded_spl_sweep`] submits, below the balance.
+const OPERATING_TOP_UP: u64 = 5_000_000;
+
 /// Submits the sweep with the balance of [`fund_minter`], so that it reserves its full cost.
 fn funded_spl_sweep() -> (TestCanisterRuntime, Signature, SplSweep, u64) {
     let runtime = TestCanisterRuntime::new().with_increasing_time();
     lifecycle::init(valid_init_args(), runtime.clone());
     let balance = fund_minter();
+    events::top_up_operating_balance(OPERATING_TOP_UP);
     let (signature, sweep) = submit_spl_sweep(&runtime);
     (runtime, signature, sweep, balance)
 }
@@ -248,6 +253,10 @@ mod credit_sweep {
         credit(signature, mints, LAMPORTS_SPENT);
         let replayed = assert_replay_matches_state();
         assert_eq!(replayed.balance(), initial_balance - LAMPORTS_SPENT);
+        assert_eq!(
+            replayed.operating_balance(),
+            OPERATING_TOP_UP - LAMPORTS_SPENT
+        );
         assert!(replayed.spl_sweep_reservations().is_empty());
         assert!(replayed.spl_deposits().finalized().is_empty());
         assert_eq!(
@@ -313,6 +322,7 @@ mod credit_sweep {
         credit(signature, mints, spent);
         let replayed = assert_replay_matches_state();
         assert_eq!(replayed.balance(), balance - spent);
+        assert_eq!(replayed.operating_balance(), OPERATING_TOP_UP - spent);
         assert!(replayed.spl_sweep_reservations().is_empty());
         assert!(replayed.spl_deposits().finalized().is_empty());
         assert_eq!(replayed.spl_deposits().pending_mints().len(), 2);
@@ -330,6 +340,10 @@ mod credit_sweep {
         });
         let replayed = assert_replay_matches_state();
         assert_eq!(replayed.balance(), balance - sweep.max_lamports_spent());
+        assert_eq!(
+            replayed.operating_balance(),
+            OPERATING_TOP_UP - sweep.max_lamports_spent()
+        );
         assert!(replayed.spl_sweep_reservations().is_empty());
     }
 
@@ -549,6 +563,7 @@ fn should_reserve_the_maximum_cost_of_a_submitted_spl_sweep() {
     assert_eq!(sweep.max_lamports_spent(), expected);
     let replayed = assert_replay_matches_state();
     assert_eq!(replayed.balance(), balance - expected);
+    assert_eq!(replayed.operating_balance(), OPERATING_TOP_UP - expected);
     assert_eq!(
         replayed.spl_sweep_reservations(),
         &BTreeMap::from([(signature, expected)])
@@ -583,6 +598,10 @@ fn should_keep_only_the_fee_of_a_failed_spl_sweep_reserved() {
 
         let replayed = assert_replay_matches_state();
         assert_eq!(replayed.balance(), initial_balance - 2 * FEE_PER_SIGNATURE);
+        assert_eq!(
+            replayed.operating_balance(),
+            OPERATING_TOP_UP - 2 * FEE_PER_SIGNATURE
+        );
         assert!(replayed.spl_sweep_reservations().is_empty());
     }
 }
@@ -597,8 +616,51 @@ fn should_release_the_reservation_of_an_expired_spl_sweep() {
 
     let replayed = assert_replay_matches_state();
     assert_eq!(replayed.balance(), initial_balance);
+    assert_eq!(replayed.operating_balance(), OPERATING_TOP_UP);
     assert!(replayed.spl_sweep_reservations().is_empty());
     assert!(replayed.spl_deposits().swept().is_empty());
+}
+
+#[test]
+fn should_add_top_ups_to_the_operating_balance_without_changing_the_balance() {
+    let runtime = TestCanisterRuntime::new().with_increasing_time();
+    lifecycle::init(valid_init_args(), runtime);
+    let balance = fund_minter();
+
+    events::top_up_operating_balance(1_000);
+    events::top_up_operating_balance(2_000);
+
+    let replayed = assert_replay_matches_state();
+    assert_eq!(replayed.operating_balance(), 3_000);
+    assert_eq!(replayed.balance(), balance);
+}
+
+#[test]
+fn should_cover_an_spl_sweep_only_within_the_operating_and_spendable_balances() {
+    let runtime = TestCanisterRuntime::new().with_increasing_time();
+    lifecycle::init(valid_init_args(), runtime);
+    let balance = fund_minter();
+    let sweep = planned_spl_sweep(BTreeMap::from([(0, deposit(account(1), [1; 32].into()))]));
+    let cost = sweep.max_lamports_spent();
+
+    read_state(|state| {
+        assert_eq!(state.spl_sweep_allowance(), 0);
+        assert!(!state.covers_spl_sweep(&sweep));
+    });
+    events::top_up_operating_balance(cost - 1);
+    read_state(|state| {
+        assert_eq!(state.spl_sweep_allowance(), cost - 1);
+        assert!(!state.covers_spl_sweep(&sweep));
+    });
+    events::top_up_operating_balance(1);
+    read_state(|state| assert!(state.covers_spl_sweep(&sweep)));
+    events::top_up_operating_balance(balance);
+    read_state(|state| {
+        assert_eq!(
+            state.spl_sweep_allowance(),
+            balance - RENT_EXEMPTION_THRESHOLD
+        )
+    });
 }
 
 #[test]

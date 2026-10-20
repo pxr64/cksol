@@ -6,7 +6,7 @@ use cksol_int_tests::{
     fixtures::{
         DEFAULT_CALLER_ACCOUNT, DEFAULT_CALLER_DEPOSIT_ADDRESS, EXPIRY_BLOCK_HEIGHT,
         FINALIZE_TRANSACTIONS_DELAY, MINTER_ADDRESS, MockBuilder, SUBMISSION_BLOCK_HEIGHT,
-        SharedMockHttpOutcalls, get_memo,
+        SWEEP_DEPOSITS_DELAY, SharedMockHttpOutcalls, get_memo,
     },
     validator::FEE_PER_SIGNATURE,
 };
@@ -66,6 +66,7 @@ async fn should_quote_and_mint_the_spl_deposit_fee_using_xrc() {
         .build()
         .await;
     setup.fund_minter().await;
+    setup.top_up_operating_balance().await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
     register_token(&setup, ledger.canister_id(), token_program, 32).await;
     // Move past the cached registration quote so XRC fetches the new prices.
@@ -138,6 +139,10 @@ async fn should_quote_and_mint_the_spl_deposit_fee_using_xrc() {
         setup.minter().get_minter_info().await.balance,
         Setup::FUNDED_BALANCE - 2 * FEE_PER_SIGNATURE
     );
+    assert_eq!(
+        setup.minter().get_operating_balance().await.balance,
+        Setup::OPERATING_TOP_UP - 2 * FEE_PER_SIGNATURE
+    );
 
     run_mint_timer(&setup).await;
     let user_balance = ledger.balance_of(account).await;
@@ -161,6 +166,39 @@ async fn should_quote_and_mint_the_spl_deposit_fee_using_xrc() {
     setup.drop().await;
 }
 
+#[tokio::test]
+async fn should_sweep_spl_deposits_only_after_an_operating_top_up() {
+    let token_program: Address = spl_token_interface::id().to_bytes().into();
+    let setup = SetupBuilder::new()
+        .with_proxy_canister()
+        .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
+        .build()
+        .await;
+    setup.fund_minter().await;
+    let ledger = setup.install_spl_ledger(DECIMALS).await;
+    register_token(&setup, ledger.canister_id(), token_program, 32).await;
+    let account = Account {
+        owner: setup.proxy_canister_id(),
+        subaccount: Some([1; 32]),
+    };
+    let deposit_id = queue_deposit(&setup, account, token_program, &[], 36).await;
+
+    setup.advance_time_and_settle(SWEEP_DEPOSITS_DELAY).await;
+    assert_matches!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Queued { .. }
+    );
+    assert_eq!(setup.minter().get_operating_balance().await.balance, 0);
+
+    setup.top_up_operating_balance().await;
+    let (signature, _) = sweep_queued_deposit(&setup, deposit_id, 44).await;
+    assert_eq!(
+        setup.minter().deposit_spl_status(deposit_id).await,
+        DepositSplStatus::Swept { signature }
+    );
+    setup.drop().await;
+}
+
 /// Queues a deposit, sweeps it on the timers, settles it and mints it on the ledger.
 async fn sweep_finalize_and_mint(token_program: Address, extensions: &[ExtensionType]) {
     let setup = SetupBuilder::new()
@@ -169,6 +207,7 @@ async fn sweep_finalize_and_mint(token_program: Address, extensions: &[Extension
         .build()
         .await;
     setup.fund_minter().await;
+    setup.top_up_operating_balance().await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
     register_token(&setup, ledger.canister_id(), token_program, 32).await;
     let account = Account {
@@ -221,6 +260,10 @@ async fn sweep_finalize_and_mint(token_program: Address, extensions: &[Extension
     assert_eq!(
         setup.minter().get_minter_info().await.balance,
         Setup::FUNDED_BALANCE - 2 * FEE_PER_SIGNATURE - RENT_EXEMPT_LAMPORTS
+    );
+    assert_eq!(
+        setup.minter().get_operating_balance().await.balance,
+        Setup::OPERATING_TOP_UP - 2 * FEE_PER_SIGNATURE - RENT_EXEMPT_LAMPORTS
     );
     setup.minter().assert_that_events().await.satisfy(|events| {
         check!(events.contains(&EventType::CreditedSplSweep {
@@ -500,6 +543,7 @@ async fn should_keep_in_flight_deposit_and_mint_it_after_upgrade() {
         .build()
         .await;
     setup.fund_minter().await;
+    setup.top_up_operating_balance().await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
     register_token(&setup, ledger.canister_id(), token_program, 32).await;
     let account = Account {

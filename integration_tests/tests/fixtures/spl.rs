@@ -133,6 +133,7 @@ pub async fn setup_with_registered_mint(token_program: Address) -> Setup {
         .build()
         .await;
     setup.fund_minter().await;
+    setup.top_up_operating_balance().await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
     register_token(&setup, ledger.canister_id(), token_program, 32).await;
     setup

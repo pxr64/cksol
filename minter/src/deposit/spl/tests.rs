@@ -715,7 +715,7 @@ mod lifecycle {
             BLOCK_INDEX, DEFAULT_BLOCK_HEIGHT, EventsAssert, GetTransactionResult, account,
             confirmed_block, confirmed_block_with,
             deposit::DEPOSITOR_ACCOUNT,
-            devnet_sweep,
+            devnet_sweep, events,
             runtime::{SentUpdateCall, TestCanisterRuntime},
             signer::{sign_as_devnet_minter, sign_for},
             spl_fee_mint_arg,
@@ -754,6 +754,7 @@ mod lifecycle {
         lifecycle::init(valid_init_args(), runtime.clone());
         devnet_sweep::record_master_key(&runtime);
         devnet_sweep::init_balance_to(INITIAL_BALANCE);
+        events::top_up_operating_balance(INITIAL_BALANCE);
     }
 
     fn source_account_info(

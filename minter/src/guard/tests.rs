@@ -1,7 +1,7 @@
 use crate::{
     guard::{
         GuardError, MAX_CONCURRENT, TimerGuard, TimerGuardError, deposit_sol_guard,
-        deposit_spl_guard, withdrawal_guard,
+        deposit_spl_guard, operating_top_up_guard, withdrawal_guard,
     },
     state::TaskType,
     test_fixtures::init_state,
@@ -147,6 +147,23 @@ mod spl_guard {
 
         drop(guards);
         let _guard = deposit_spl_guard(account(1, None), mint(1)).unwrap();
+    }
+}
+
+mod operating_top_up_guard {
+    use super::*;
+
+    #[test]
+    fn should_allow_one_top_up_at_a_time() {
+        init_state();
+        {
+            let _guard = operating_top_up_guard(account(0, None)).unwrap();
+            assert_eq!(
+                operating_top_up_guard(account(0, None)).err(),
+                Some(GuardError::AlreadyProcessing)
+            );
+        }
+        let _guard = operating_top_up_guard(account(0, None)).unwrap();
     }
 }
 

@@ -5,7 +5,7 @@ use crate::{
 use icrc_ledger_types::icrc1::transfer::Memo as Icrc1Memo;
 use proptest::{
     array::uniform,
-    prelude::{Strategy, any},
+    prelude::{Just, Strategy, any},
     prop_assert, prop_oneof, proptest,
 };
 
@@ -106,5 +106,8 @@ fn arb_signature() -> impl Strategy<Value = solana_signature::Signature> {
 }
 
 fn arb_burn_memo() -> impl Strategy<Value = BurnMemo> {
-    any::<[u8; 32]>().prop_map(|to_address| BurnMemo::Convert { to_address })
+    prop_oneof![
+        any::<[u8; 32]>().prop_map(|to_address| BurnMemo::Convert { to_address }),
+        Just(BurnMemo::TopUp),
+    ]
 }

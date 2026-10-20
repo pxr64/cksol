@@ -38,6 +38,7 @@ async fn should_sweep_and_mint_a_classic_spl_deposit_on_the_validator() {
         .await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
     validator.fund_minter(&setup).await;
+    setup.top_up_operating_balance().await;
 
     let funder = Keypair::new();
     validator
@@ -138,6 +139,10 @@ async fn should_sweep_and_mint_a_classic_spl_deposit_on_the_validator() {
     setup.advance_time(PROCESS_PENDING_MINTS_DELAY).await;
     setup.execute_http_mocks(http_mocks()).await;
     assert_eq!(setup.minter().get_minter_info().await.balance, sol_after);
+    assert_eq!(
+        setup.minter().get_operating_balance().await.balance,
+        Setup::OPERATING_TOP_UP - 2 * FEE_PER_SIGNATURE - rent
+    );
     let user_balance = ledger.balance_of(account).await;
     let fee_balance = ledger
         .balance_of(Account {
