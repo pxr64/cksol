@@ -1,4 +1,7 @@
-use crate::{MockCanisterHttpResponse, Setup, validator::FEE_PER_SIGNATURE, xrc};
+use crate::{
+    CanisterHttpReply, CanisterHttpRequest, CanisterHttpResponse, MockCanisterHttpResponse, Setup,
+    validator::FEE_PER_SIGNATURE, xrc,
+};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use cksol_types::Signature;
@@ -94,17 +97,45 @@ impl SharedMockHttpOutcalls {
     }
 }
 
-/// Answers SOL RPC requests from the builder and exchange requests from the real XRC.
+/// Answers mocked HTTP requests and can forward Solana RPC calls to a local validator.
 pub struct HttpMocks {
     inner: MockHttpOutcalls,
     sol_price: f64,
     spl_price: f64,
+    solana_rpc_url: Option<String>,
+}
+
+impl HttpMocks {
+    async fn response(&self, request: &CanisterHttpRequest) -> CanisterHttpResponse {
+        if let Some(response) = xrc::http_response(request, self.sol_price, self.spl_price) {
+            return response;
+        }
+        if let Some(url) = &self.solana_rpc_url
+            && request.url.trim_end_matches('/') == url.trim_end_matches('/')
+        {
+            let response = reqwest::Client::new()
+                .post(url)
+                .header("Content-Type", "application/json")
+                .body(request.body.clone())
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+                .expect("Failed to call the local Solana validator");
+            let status = response.status().as_u16();
+            return CanisterHttpResponse::CanisterHttpReply(CanisterHttpReply {
+                status,
+                headers: vec![],
+                body: response.bytes().await.unwrap().to_vec(),
+            });
+        }
+        panic!("No mocks matching the request: {request:?}")
+    }
 }
 
 #[async_trait]
 impl ExecuteHttpOutcallMocks for HttpMocks {
     async fn execute_http_outcall_mocks(&mut self, env: &PocketIc) {
-        if !env.canister_exists(xrc::CANISTER_ID).await {
+        if self.solana_rpc_url.is_none() && !env.canister_exists(xrc::CANISTER_ID).await {
             self.inner.execute_http_outcall_mocks(env).await;
             return;
         }
@@ -121,13 +152,27 @@ impl ExecuteHttpOutcallMocks for HttpMocks {
             if requests.is_empty() {
                 return;
             }
-            for request in requests {
-                let mut response = self
-                    .inner
-                    .pop_matching(&request)
-                    .map(|mock| mock.response)
-                    .or_else(|| xrc::http_response(&request, self.sol_price, self.spl_price))
-                    .unwrap_or_else(|| panic!("No mocks matching the request: {request:?}"));
+            let requests: Vec<_> = requests
+                .into_iter()
+                .map(|request| {
+                    let response = self.inner.pop_matching(&request).map(|mock| mock.response);
+                    (request, response)
+                })
+                .collect();
+            // Read all providers together so slot queries see the same validator window.
+            let responses =
+                futures::future::join_all(requests.into_iter().map(|(request, response)| {
+                    let handler = &*self;
+                    async move {
+                        let response = match response {
+                            Some(response) => response,
+                            None => handler.response(&request).await,
+                        };
+                        (request, response)
+                    }
+                }))
+                .await;
+            for (request, mut response) in responses {
                 if let crate::CanisterHttpResponse::CanisterHttpReply(reply) = &response {
                     let limit = request.max_response_bytes.unwrap_or(2_000_000);
                     if reply.body.len() as u64 > limit {
@@ -169,6 +214,7 @@ pub struct MockBuilder {
     next_id: u64,
     sol_price: f64,
     spl_price: f64,
+    solana_rpc_url: Option<String>,
 }
 
 /// Number of Solana RPC providers used for redundancy.
@@ -193,6 +239,7 @@ impl MockBuilder {
             // These synthetic prices quote a one-unit deposit fee by default.
             sol_price: 0.000_000_001,
             spl_price: 1.0,
+            solana_rpc_url: None,
         }
     }
 
@@ -200,6 +247,12 @@ impl MockBuilder {
     pub fn with_xrc_prices(mut self, sol_price: f64, spl_price: f64) -> Self {
         self.sol_price = sol_price;
         self.spl_price = spl_price;
+        self
+    }
+
+    /// Forwards requests for this URL to the local validator, preserving its real RPC responses.
+    pub fn with_solana_rpc_url(mut self, url: &str) -> Self {
+        self.solana_rpc_url = Some(url.to_string());
         self
     }
 
@@ -220,6 +273,7 @@ impl MockBuilder {
             inner: self.inner.build(),
             sol_price: self.sol_price,
             spl_price: self.spl_price,
+            solana_rpc_url: self.solana_rpc_url,
         }
     }
 

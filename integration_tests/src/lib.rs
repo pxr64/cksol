@@ -96,6 +96,11 @@ impl SetupBuilder {
         self
     }
 
+    pub fn with_pocket_ic_non_live_mode(mut self) -> Self {
+        self.make_live = Some(PocketIcMode::NonLiveMode);
+        self
+    }
+
     pub fn with_sol_rpc_install_args(mut self, args: sol_rpc_types::InstallArgs) -> Self {
         self.sol_rpc_install_args = Some(args);
         self

@@ -18,6 +18,7 @@ cksol-test-utils = { version = "0.1.0", path = "../libs/test-utils" }
 cksol-types = { version = "0.1.0", path = "../libs/types" }
 cksol-types-internal = { version = "0.1.0", path = "../libs/types-internal", features = ["log", "event"] }
 flate2 = { workspace = true }
+futures = { workspace = true }
 ic-canister-runtime = { workspace = true }
 ic-http-types = { workspace = true }
 ic-management-canister-types = { workspace = true }
@@ -41,20 +42,19 @@ solana-keypair = { workspace = true }
 solana-message = { workspace = true }
 solana-native-token = { workspace = true }
 solana-nonce = { workspace = true }
+solana-program-pack = { workspace = true }
 solana-signature = { workspace = true }
 solana-system-interface = { workspace = true, features = ["bincode"] }
 solana-system-transaction = { workspace = true }
 solana-transaction = { workspace = true, features = ["bincode"] }
+spl-associated-token-account-interface = { workspace = true }
+spl-token-interface = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 assert2 = { workspace = true }
-futures = { workspace = true }
 icrc-ledger-types = { workspace = true }
 minicbor = { workspace = true }
-solana-program-pack = { workspace = true }
-spl-associated-token-account-interface = { workspace = true }
 spl-token-2022-interface = { workspace = true }
-spl-token-interface = { workspace = true }

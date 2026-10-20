@@ -62,13 +62,13 @@ cargo test --lib
 
 ```sh
 ./scripts/build --cksol_minter
-cargo test -p cksol-int-tests --test tests
+cargo test -p cksol-int-tests --test tests --test deposit_spl
 ```
 
 **Solana validator integration tests** — require the [Solana CLI](https://solana.com/docs/intro/installation) to be installed, so that each test can start its own `solana-test-validator`:
 
 ```sh
-cargo test -p cksol-int-tests --test solana_test_validator
+cargo test -p cksol-int-tests --test solana_test_validator --test solana_test_validator_spl
 ```
 
 > [!CAUTION]
