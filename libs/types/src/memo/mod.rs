@@ -93,6 +93,9 @@ pub enum BurnMemo {
         #[cbor(n(0), with = "minicbor::bytes")]
         to_address: [u8; 32],
     },
+    /// The minter burned ckSOL from its top-up account to fund its operating balance.
+    #[n(1)]
+    TopUp,
 }
 
 impl MintMemo {

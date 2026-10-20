@@ -18,7 +18,8 @@ use cksol_types::{
     AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
     DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, DepositSplStatus,
     GetDepositAddressArgs, GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo,
-    WithdrawSolArgs, WithdrawSolError, WithdrawSolOk, WithdrawSolStatus, WithdrawSolStatusArgs,
+    OperatingBalance, OperatingTopUp, ProcessOperatingTopUpError, WithdrawSolArgs,
+    WithdrawSolError, WithdrawSolOk, WithdrawSolStatus, WithdrawSolStatusArgs,
 };
 use cksol_types_internal::{MinterArg, log::Priority};
 use ic_http_types::{HttpRequest, HttpResponse, HttpResponseBuilder};
@@ -121,6 +122,21 @@ async fn withdraw_sol(args: WithdrawSolArgs) -> Result<WithdrawSolOk, WithdrawSo
 #[ic_cdk::update]
 fn withdraw_sol_status(args: WithdrawSolStatusArgs) -> WithdrawSolStatus {
     cksol_minter::withdraw::withdrawal_status(args.block_index)
+}
+
+#[ic_cdk::update]
+async fn process_operating_top_up() -> Result<OperatingTopUp, ProcessOperatingTopUpError> {
+    cksol_minter::operating_balance::process_operating_top_up(&IcCanisterRuntime::new()).await
+}
+
+#[ic_cdk::query]
+fn get_operating_balance() -> OperatingBalance {
+    OperatingBalance {
+        balance: read_state(|s| s.operating_balance()),
+        top_up_account: cksol_minter::operating_balance::operating_top_up_account(
+            ic_cdk::api::canister_self(),
+        ),
+    }
 }
 
 #[ic_cdk::query]

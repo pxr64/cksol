@@ -3,7 +3,10 @@ use canlog::log;
 use cksol_types::{BurnMemo, Memo};
 use cksol_types_internal::log::Priority;
 use icrc_ledger_types::{
-    icrc1::{account::Account, transfer::NumTokens},
+    icrc1::{
+        account::{Account, Subaccount},
+        transfer::{NumTokens, TransferArg, TransferError},
+    },
     icrc2::transfer_from::{TransferFromArgs, TransferFromError},
 };
 use num_traits::cast::ToPrimitive;
@@ -59,6 +62,74 @@ pub async fn burn<R: CanisterRuntime>(
     );
 
     Ok(block_index)
+}
+
+/// Burns `burn_amount` from the given subaccount of the minter.
+pub async fn burn_from_subaccount<R: CanisterRuntime>(
+    runtime: &R,
+    minter_account: Account,
+    from_subaccount: Subaccount,
+    burn_amount: Lamport,
+    burn_memo: BurnMemo,
+) -> Result<u64, BurnError> {
+    let result = read_state(|state| state.ledger_client(runtime.inter_canister_call_runtime()))
+        .transfer(TransferArg {
+            from_subaccount: Some(from_subaccount),
+            to: minter_account,
+            fee: None,
+            created_at_time: None,
+            memo: Some(Memo::from(burn_memo).into()),
+            amount: NumTokens::from(burn_amount),
+        })
+        .await;
+
+    let block_index = match result {
+        Ok(Ok(block_index)) => *block_index.get(),
+        Ok(Err(transfer_error)) => {
+            return Err(parse_burn_transfer_error(transfer_error));
+        }
+        Err(ic_error) => {
+            return Err(BurnError::TemporarilyUnavailable(format!(
+                "Failed to burn tokens: {ic_error}"
+            )));
+        }
+    };
+
+    let from = Account {
+        owner: minter_account.owner,
+        subaccount: Some(from_subaccount),
+    };
+    log!(
+        Priority::Info,
+        "Burned {burn_amount} lamports from {from:?} (ledger block index {block_index})"
+    );
+
+    Ok(block_index)
+}
+
+fn parse_burn_transfer_error(error: TransferError) -> BurnError {
+    parse_burn_transfer_from_error(match error {
+        TransferError::BadFee { expected_fee } => TransferFromError::BadFee { expected_fee },
+        TransferError::BadBurn { min_burn_amount } => {
+            TransferFromError::BadBurn { min_burn_amount }
+        }
+        TransferError::InsufficientFunds { balance } => {
+            TransferFromError::InsufficientFunds { balance }
+        }
+        TransferError::TooOld => TransferFromError::TooOld,
+        TransferError::CreatedInFuture { ledger_time } => {
+            TransferFromError::CreatedInFuture { ledger_time }
+        }
+        TransferError::Duplicate { duplicate_of } => TransferFromError::Duplicate { duplicate_of },
+        TransferError::TemporarilyUnavailable => TransferFromError::TemporarilyUnavailable,
+        TransferError::GenericError {
+            error_code,
+            message,
+        } => TransferFromError::GenericError {
+            error_code,
+            message,
+        },
+    })
 }
 
 fn parse_burn_transfer_from_error(error: TransferFromError) -> BurnError {

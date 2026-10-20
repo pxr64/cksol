@@ -304,6 +304,17 @@ pub enum EventType {
         #[n(0)]
         deposit_id: DepositSplId,
     },
+    /// The minter burned the ckSOL of its top-up account. No ckSOL backs that SOL anymore,
+    /// so the minter may spend it on its own costs.
+    #[n(24)]
+    ToppedUpOperatingBalance {
+        /// The burn transaction index on the ckSOL ledger.
+        #[cbor(n(0), with = "cbor::id")]
+        burn_block_index: LedgerBurnIndex,
+        /// The burned amount.
+        #[n(1)]
+        amount: Lamport,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

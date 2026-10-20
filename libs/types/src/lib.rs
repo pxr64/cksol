@@ -377,6 +377,36 @@ pub struct WithdrawSolStatusArgs {
     pub block_index: LedgerBurnIndex,
 }
 
+/// The result of a `get_operating_balance` call.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
+pub struct OperatingBalance {
+    /// The part of the minter balance that no ckSOL backs and that the minter may spend on
+    /// its own costs, in lamports.
+    pub balance: Lamport,
+    /// The ckSOL ledger account that receives operating top-ups.
+    pub top_up_account: Account,
+}
+
+/// The successful result of a `process_operating_top_up` call.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
+pub struct OperatingTopUp {
+    /// The index of the burn block on the ckSOL ledger.
+    pub block_index: LedgerBurnIndex,
+    /// The burned amount added to the operating balance, in lamports.
+    pub amount: Lamport,
+}
+
+/// The error result of a `process_operating_top_up` call.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
+pub enum ProcessOperatingTopUpError {
+    /// Another call is processing the top-up account.
+    AlreadyProcessing,
+    /// The top-up account holds no ckSOL.
+    NoFunds,
+    /// The ledger cannot process the request now, retry later.
+    TemporarilyUnavailable(String),
+}
+
 /// The error result of a withdrawal request.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
 pub enum WithdrawSolError {

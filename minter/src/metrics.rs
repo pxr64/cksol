@@ -138,6 +138,11 @@ pub fn encode_metrics(w: &mut MetricsEncoder<Vec<u8>>, s: &State) -> std::io::Re
         "Minter balance in Lamports.",
     )?;
     w.encode_gauge(
+        "minter_operating_balance",
+        s.operating_balance().metric_value(),
+        "Part of the minter balance that no ckSOL backs, in Lamports.",
+    )?;
+    w.encode_gauge(
         "post_upgrade_instructions_consumed",
         storage::with_unstable_metrics(|m| m.post_upgrade_instructions_consumed).metric_value(),
         "Number of instructions consumed during the last post-upgrade.",

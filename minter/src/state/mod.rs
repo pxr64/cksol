@@ -126,6 +126,7 @@ pub struct State {
     pending_deposit_sol_request_guards: BTreeSet<Account>,
     pending_deposit_spl_request_guards: BTreeSet<(Account, Address)>,
     pending_withdrawal_request_guards: BTreeSet<Account>,
+    pending_operating_top_up_guards: BTreeSet<Account>,
     deposits: Deposits,
     spl_deposits: SplDeposits,
     supported_spl_tokens: BTreeMap<Address, SupportedSplToken>,
@@ -142,6 +143,7 @@ pub struct State {
     active_tasks: BTreeSet<TaskType>,
     balance: Lamport,
     spl_sweep_reservations: BTreeMap<Signature, Lamport>,
+    operating_balance: Lamport,
 }
 
 impl State {
@@ -349,6 +351,10 @@ impl State {
 
     pub fn pending_withdrawal_request_guards_mut(&mut self) -> &mut BTreeSet<Account> {
         &mut self.pending_withdrawal_request_guards
+    }
+
+    pub fn pending_operating_top_up_guards_mut(&mut self) -> &mut BTreeSet<Account> {
+        &mut self.pending_operating_top_up_guards
     }
 
     pub fn active_tasks_mut(&mut self) -> &mut BTreeSet<TaskType> {
@@ -571,6 +577,7 @@ impl State {
             .max_lamports_spent()
             .min(self.balance);
         self.balance -= reserved;
+        self.operating_balance = self.operating_balance.saturating_sub(reserved);
         self.spl_sweep_reservations.insert(*signature, reserved);
     }
 
@@ -582,6 +589,14 @@ impl State {
             .remove(signature)
             .unwrap_or_default();
         self.balance = self.balance.saturating_add(reserved).saturating_sub(spent);
+        self.operating_balance = self
+            .operating_balance
+            .saturating_add(reserved)
+            .saturating_sub(spent);
+    }
+
+    fn process_operating_top_up(&mut self, amount: Lamport) {
+        self.operating_balance = self.operating_balance.saturating_add(amount);
     }
 
     /// A failed sweep paid the fee of its signatures on chain, never the rent.
@@ -688,8 +703,18 @@ impl State {
         self.balance.saturating_sub(RENT_EXEMPTION_THRESHOLD)
     }
 
+    /// The part of the balance that no ckSOL backs, so the minter may spend it on its own costs.
+    pub fn operating_balance(&self) -> Lamport {
+        self.operating_balance
+    }
+
+    /// The lamports that SPL sweeps may spend: held by the minter and backed by no ckSOL.
+    pub fn spl_sweep_allowance(&self) -> Lamport {
+        self.spendable_balance().min(self.operating_balance())
+    }
+
     pub fn covers_spl_sweep(&self, sweep: &SplSweep) -> bool {
-        self.spendable_balance() >= sweep.max_lamports_spent()
+        self.spl_sweep_allowance() >= sweep.max_lamports_spent()
     }
 
     pub fn covers_withdrawal_batch(&self, requests: &[WithdrawalRequest]) -> bool {
@@ -1142,6 +1167,7 @@ impl TryFrom<InitArgs> for State {
             pending_deposit_sol_request_guards: BTreeSet::new(),
             pending_deposit_spl_request_guards: BTreeSet::new(),
             pending_withdrawal_request_guards: BTreeSet::new(),
+            pending_operating_top_up_guards: BTreeSet::new(),
             deposits: Deposits::default(),
             spl_deposits: SplDeposits::default(),
             supported_spl_tokens: BTreeMap::new(),
@@ -1158,6 +1184,7 @@ impl TryFrom<InitArgs> for State {
             active_tasks: BTreeSet::new(),
             balance: 0,
             spl_sweep_reservations: BTreeMap::new(),
+            operating_balance: 0,
         };
         state.validate()?;
         Ok(state)

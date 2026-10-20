@@ -1,5 +1,5 @@
 use crate::state::{State, TaskType, mutate_state};
-use cksol_types::{DepositSolError, DepositSplError, WithdrawSolError};
+use cksol_types::{DepositSolError, DepositSplError, ProcessOperatingTopUpError, WithdrawSolError};
 use icrc_ledger_types::icrc1::account::Account;
 use solana_address::Address;
 use std::{collections::BTreeSet, marker::PhantomData};
@@ -38,6 +38,17 @@ impl From<GuardError> for DepositSplError {
 }
 
 impl From<GuardError> for WithdrawSolError {
+    fn from(e: GuardError) -> Self {
+        match e {
+            GuardError::AlreadyProcessing => Self::AlreadyProcessing,
+            GuardError::TooManyConcurrentRequests => {
+                Self::TemporarilyUnavailable("too many concurrent requests".to_string())
+            }
+        }
+    }
+}
+
+impl From<GuardError> for ProcessOperatingTopUpError {
     fn from(e: GuardError) -> Self {
         match e {
             GuardError::AlreadyProcessing => Self::AlreadyProcessing,
@@ -119,6 +130,16 @@ impl PendingRequests for PendingWithdrawalRequests {
     }
 }
 
+pub struct PendingOperatingTopUps;
+
+impl PendingRequests for PendingOperatingTopUps {
+    type Key = Account;
+
+    fn pending_requests(state: &mut State) -> &mut BTreeSet<Account> {
+        state.pending_operating_top_up_guards_mut()
+    }
+}
+
 pub fn deposit_sol_guard(account: Account) -> Result<Guard<PendingDepositSolRequests>, GuardError> {
     Guard::new(account)
 }
@@ -132,6 +153,12 @@ pub fn deposit_spl_guard(
 
 pub fn withdrawal_guard(account: Account) -> Result<Guard<PendingWithdrawalRequests>, GuardError> {
     Guard::new(account)
+}
+
+pub fn operating_top_up_guard(
+    top_up_account: Account,
+) -> Result<Guard<PendingOperatingTopUps>, GuardError> {
+    Guard::new(top_up_account)
 }
 
 #[derive(Eq, PartialEq, Debug)]

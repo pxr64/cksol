@@ -94,6 +94,9 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
         EventType::QuarantinedPendingSplFeeMint { deposit_id } => {
             state.process_quarantined_pending_spl_fee_mint(*deposit_id)
         }
+        EventType::ToppedUpOperatingBalance { amount, .. } => {
+            state.process_operating_top_up(*amount)
+        }
         EventType::QuarantinedPendingSplMint { deposit_id } => {
             state.process_quarantined_pending_spl_mint(*deposit_id)
         }

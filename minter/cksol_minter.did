@@ -404,6 +404,35 @@ type WithdrawSolError = variant {
 // The result of a call to the `withdraw_sol` endpoint.
 type WithdrawSolResult = variant { Ok : WithdrawSolOk; Err : WithdrawSolError };
 
+type OperatingBalance = record {
+    // The part of the minter balance that no ckSOL backs and that the minter may spend on
+    // its own costs.
+    balance : Lamport;
+    // The ckSOL ledger account that receives operating top-ups.
+    top_up_account : Account;
+};
+
+type OperatingTopUp = record {
+    // The burn transaction index on the ckSOL ledger.
+    block_index : LedgerBurnIndex;
+    // The burned amount added to the operating balance.
+    amount : Lamport;
+};
+
+type ProcessOperatingTopUpError = variant {
+    // Another call is processing the top-up account.
+    AlreadyProcessing;
+    // The top-up account holds no ckSOL.
+    NoFunds;
+    // The ledger cannot process the request now, retry later.
+    TemporarilyUnavailable : text;
+};
+
+type ProcessOperatingTopUpResult = variant {
+    Ok : OperatingTopUp;
+    Err : ProcessOperatingTopUpError;
+};
+
 // Status of a finalized transaction.
 type TxFinalizedStatus = variant {
     // Transaction was successful.
@@ -630,6 +659,13 @@ type EventType = variant {
         // The identifier of the deposit whose pending fee mint was quarantined.
         deposit_id: DepositSplId;
     };
+    // The minter burned the ckSOL of its top-up account and added it to the operating balance.
+    ToppedUpOperatingBalance : record {
+        // The burn transaction index on the ckSOL ledger.
+        burn_block_index : LedgerBurnIndex;
+        // The burned amount.
+        amount : Lamport;
+    };
     // A batch failed on chain and its SPL deposits were requeued for individual sweeps.
     SplitFailedSplSweep : record {
         // The signature of the confirmed failed batch transaction.
@@ -791,6 +827,13 @@ service : (MinterArg) -> {
 
     // Retrieve the status of a Solana withdrawal request.
     withdraw_sol_status : (WithdrawSolStatusArgs) -> (WithdrawSolStatus);
+
+    // Burns the ckSOL in the operating top-up account and adds it to the operating balance,
+    // which pays the minter's own Solana costs, such as SPL sweeps.
+    process_operating_top_up : () -> (ProcessOperatingTopUpResult);
+
+    // Returns the operating balance and the account that receives operating top-ups.
+    get_operating_balance : () -> (OperatingBalance) query;
 
     // *WARNING*: This is a debug endpoint, backwards-compatibility is not guaranteed.
     // Returns events from the event log starting at the given index.

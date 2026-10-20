@@ -53,8 +53,8 @@ pub async fn sweep_queued_spl_deposits<R: CanisterRuntime>(runtime: R) {
     if retries.is_empty() && batches.is_empty() {
         log!(
             Priority::Info,
-            "The spendable balance of {} lamports does not cover the next SPL sweep",
-            read_state(|state| state.spendable_balance())
+            "The SPL sweep allowance of {} lamports does not cover the next SPL sweep",
+            read_state(|state| state.spl_sweep_allowance())
         );
         return;
     }
@@ -141,7 +141,7 @@ impl SweepRound {
     /// Sweeps each retried deposit alone first, then fills the remaining slots of the round
     /// with batches of queued deposits, as far as the balance covers their cost.
     fn take_from_queue(state: &State, master_key: &SchnorrPublicKey) -> Self {
-        let mut balance = state.spendable_balance();
+        let mut balance = state.spl_sweep_allowance();
         let retries = Self::take_retries(state, master_key, MAX_CONCURRENT_RPC_CALLS, &mut balance);
         let batches = Self::take_batches(
             state,

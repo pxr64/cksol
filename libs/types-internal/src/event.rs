@@ -110,6 +110,13 @@ pub enum EventType {
         /// The identifier of the deposit whose pending fee mint was quarantined.
         deposit_id: u64,
     },
+    /// The minter burned the ckSOL of its top-up account and added it to the operating balance.
+    ToppedUpOperatingBalance {
+        /// The burn transaction index on the ckSOL ledger.
+        burn_block_index: u64,
+        /// The burned amount.
+        amount: Lamport,
+    },
     /// A finalized SPL sweep was validated and its deposits queued for ledger minting.
     CreditedSplSweep {
         /// The signature of the finalized sweep transaction.

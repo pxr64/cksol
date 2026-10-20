@@ -182,6 +182,13 @@ impl From<EventType> for CandidEventType {
             EventType::QuarantinedPendingSplFeeMint { deposit_id } => {
                 CandidEventType::QuarantinedPendingSplFeeMint { deposit_id }
             }
+            EventType::ToppedUpOperatingBalance {
+                burn_block_index,
+                amount,
+            } => CandidEventType::ToppedUpOperatingBalance {
+                burn_block_index: *burn_block_index.get(),
+                amount,
+            },
         }
     }
 }
@@ -430,6 +437,13 @@ impl TryFrom<CandidEventType> for EventType {
             CandidEventType::QuarantinedPendingSplFeeMint { deposit_id } => {
                 EventType::QuarantinedPendingSplFeeMint { deposit_id }
             }
+            CandidEventType::ToppedUpOperatingBalance {
+                burn_block_index,
+                amount,
+            } => EventType::ToppedUpOperatingBalance {
+                burn_block_index: LedgerBurnIndex::new(burn_block_index),
+                amount,
+            },
         })
     }
 }

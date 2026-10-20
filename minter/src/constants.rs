@@ -9,6 +9,14 @@ pub const SPL_FEE_SUBACCOUNT: [u8; 32] = {
     subaccount
 };
 
+/// The minter-owned ckSOL ledger subaccount that receives operating top-ups, `0xbeef`.
+pub const OPERATING_TOP_UP_SUBACCOUNT: [u8; 32] = {
+    let mut subaccount = [0; 32];
+    subaccount[30] = 0xbe;
+    subaccount[31] = 0xef;
+    subaccount
+};
+
 /// Maximum number of concurrent calls to the SOL RPC canister.
 pub const MAX_CONCURRENT_RPC_CALLS: usize = 10;
 
