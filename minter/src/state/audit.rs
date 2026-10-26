@@ -1,7 +1,7 @@
 use crate::{
     runtime::CanisterRuntime,
     state::{
-        QueuedDeposit, SchnorrPublicKey, State,
+        QueuedDeposit, QueuedSplDeposit, SchnorrPublicKey, State,
         event::{Event, EventType},
     },
     storage,
@@ -127,7 +127,16 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
             balance,
             fee,
         } => {
-            state.process_queued_spl_deposit(*deposit_id, account, mint, address, *balance, *fee);
+            state.process_queued_spl_deposit(
+                *deposit_id,
+                QueuedSplDeposit {
+                    account: *account,
+                    mint: *mint,
+                    address: *address,
+                    balance: *balance,
+                    fee: *fee,
+                },
+            );
         }
         EventType::CreatedWithdrawalTransaction {
             burn_indices,

@@ -546,29 +546,13 @@ impl State {
         self.deposits.queue(deposit_id, deposit, queued_at);
     }
 
-    fn process_queued_spl_deposit(
-        &mut self,
-        deposit_id: DepositSplId,
-        account: &Account,
-        mint: &Address,
-        address: &Address,
-        balance: u64,
-        fee: u64,
-    ) {
+    fn process_queued_spl_deposit(&mut self, deposit_id: DepositSplId, deposit: QueuedSplDeposit) {
         assert!(
-            self.supported_spl_tokens.contains_key(mint),
-            "Attempted to queue an unsupported SPL mint {mint}"
+            self.supported_spl_tokens.contains_key(&deposit.mint),
+            "Attempted to queue an unsupported SPL mint {}",
+            deposit.mint
         );
-        self.spl_deposits.queue(
-            deposit_id,
-            QueuedSplDeposit {
-                account: *account,
-                mint: *mint,
-                address: *address,
-                balance,
-                fee,
-            },
-        );
+        self.spl_deposits.queue(deposit_id, deposit);
     }
 
     fn process_credited_sweep(

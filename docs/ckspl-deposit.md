@@ -97,7 +97,7 @@ sequenceDiagram
 
 `deposit_spl` does these checks in this order:
 
-1. The owner must not be anonymous or the minter.
+1. The owner must not be anonymous or the minter. The owner may differ from the caller, as in `deposit_sol`, so that a frontend or another canister can pay for the deposit of a user. The caller pays the cycles, and the owner only gets the sweep that the funds on the token account wait for. The deposit fee that the owner pays is bounded by the quote, and a repeated call for a pair in flight queues nothing. A free SPL scan must not accept another owner, because the scan would let any caller force sweeps and fees on the account of a victim.
 2. A concurrent request for the same account and mint fails with `AlreadyProcessing`.
 3. If a deposit for the account and mint is in flight, the call makes no quote, no RPC call and no cycle charge. A deposit that is queued, swept, finalized or waiting for a mint makes the call return its ID. A quarantined deposit makes the call fail with `Quarantined` and its ID. The pair stays rejected until a minter upgrade resolves the deposit, so a new deposit needs a different subaccount. This step also applies when the token is paused.
 4. The mint must be registered (`UnsupportedToken`) and not paused (`TokenPaused`).
@@ -250,4 +250,5 @@ A fee mint uses the timestamp of the user mint event. Thus its retry window star
 - **Fee conversion:** Convert the collected ckSPL fees into SOL for the operating balance. The plan is to withdraw the fees as SPL, swap them to SOL outside the minter, deposit the SOL with `deposit_sol` and top up with the minted ckSOL. This needs SPL withdrawals.
 - **Who pays:** Decide if users pay the SOL cost directly, in ckSOL or in ckSPL. Decide if a separate fee payer must make the cost visible on chain.
 - **Observability:** Show the SPL stages, which include the fee stages, on the dashboard and in the metrics. The operating balance already has a metric.
+- **Automatic flow:** Add an SPL scan on the model of the SOL watchlist, once the upstream flow is complete. `deposit_spl` is ready for it: the queue step is separate, and a call yields to a deposit that a scan queues during its reads. Decide then if a dropped SPL deposit of the scan is re-armed, as a dropped SOL deposit is.
 - **Validator coverage:** Extend the validator test from one classic deposit to Token-2022 deposits and batches.

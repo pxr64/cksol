@@ -28,6 +28,7 @@ pub struct SplDeposits {
     dropped: BTreeMap<DepositSplId, SweptSplDeposit>,
     quarantined: BTreeMap<DepositSplId, SweptSplDeposit>,
     in_flight_ids: BTreeMap<(Account, Address), DepositSplId>,
+    latest_ids: BTreeMap<(Account, Address), DepositSplId>,
     pending_fee_mints: BTreeMap<DepositSplId, PendingSplFeeMint>,
     minted_fees: BTreeMap<DepositSplId, LedgerMintIndex>,
     quarantined_fee_mints: BTreeMap<DepositSplId, PendingSplFeeMint>,
@@ -91,6 +92,12 @@ impl SplDeposits {
 
     pub fn in_flight_id(&self, account: &Account, mint: &Address) -> Option<DepositSplId> {
         self.in_flight_ids.get(&(*account, *mint)).copied()
+    }
+
+    /// The id of the latest deposit queued for the account and mint pair, whatever stage it
+    /// reached since.
+    pub fn latest_id(&self, account: &Account, mint: &Address) -> Option<DepositSplId> {
+        self.latest_ids.get(&(*account, *mint)).copied()
     }
 
     /// The deposit of the account and mint pair that is in flight, with whether it is still
@@ -198,6 +205,7 @@ impl SplDeposits {
             "Attempted to queue SPL deposit {deposit_id} with a fee at or above its balance"
         );
         self.in_flight_ids.insert(key, deposit_id);
+        self.latest_ids.insert(key, deposit_id);
         self.queued.insert(deposit_id, deposit);
         self.next_id += 1;
     }

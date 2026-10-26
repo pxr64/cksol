@@ -7,8 +7,8 @@ use crate::{
     runtime::CanisterRuntime,
     spl_fee::{FeeEstimator, XrcPriceOracle, estimate_sol_cost},
     state::{
-        InFlightSplDeposit, SupportedSplToken, audit::process_event, event::EventType,
-        mutate_state, read_state,
+        InFlightSplDeposit, QueuedSplDeposit, State, SupportedSplToken, audit::process_event,
+        event::EventType, mutate_state, read_state,
     },
     utils::{assert_valid_deposit_owner, assert_valid_deposit_token},
 };
@@ -56,11 +56,45 @@ pub async fn deposit_spl<R: CanisterRuntime>(
         minter_public_key().map_err(|e| DepositSplError::TemporarilyUnavailable(e.to_string()))?;
     let owner = account_address(&master_key, &account);
     let address = associated_token_address(&owner, &token.mint, &token.token_program.id());
+    let latest_id_before = read_state(|state| state.spl_deposits().latest_id(&account, &mint));
     let balance = read_deposit_balance(runtime, &token, address, owner).await?;
     let rent = read_destination_rent(runtime, &token, minter_address(&master_key)).await?;
-    let fee = quote_deposit_fee(runtime, &token, balance, rent, consolidation_fee).await?;
+    let result = quote_deposit_fee(runtime, &token, balance, rent).await;
+    // A scan may have queued a deposit of the pair during the reads: its sweep moves this
+    // balance, so this call yields to it and charges only the calls it made.
+    let queued_by_scan = read_state(|state| state.spl_deposits().latest_id(&account, &mint))
+        .filter(|latest_id| Some(*latest_id) != latest_id_before);
+    charge_rpc_call(
+        runtime,
+        RpcCallCharge {
+            attached_cycles: XRC_REQUEST_CYCLES,
+            fee_on_success: if queued_by_scan.is_some() {
+                0
+            } else {
+                consolidation_fee
+            },
+        },
+        &result,
+    );
+    let fee = result?;
+    if let Some(deposit_id) = queued_by_scan {
+        return Ok(deposit_id);
+    }
 
-    Ok(queue_deposit(runtime, account, mint, address, balance, fee))
+    let deposit_id = mutate_state(|state| {
+        queue_deposit(
+            runtime,
+            state,
+            QueuedSplDeposit {
+                account,
+                mint,
+                address,
+                balance,
+                fee,
+            },
+        )
+    });
+    Ok(deposit_id)
 }
 
 pub fn deposit_spl_status(deposit_id: DepositSplId) -> DepositSplStatus {
@@ -114,14 +148,12 @@ fn charge_account_read<R: CanisterRuntime, T>(runtime: &R, result: &Result<T, De
     );
 }
 
-/// Quotes the fee and checks the net minimum, charging the actual XRC call cost.
-/// Accepts the consolidation fee only when both steps succeed.
+/// Quotes the fee and checks the net minimum. The caller charges the XRC call.
 async fn quote_deposit_fee<R: CanisterRuntime>(
     runtime: &R,
     token: &SupportedSplToken,
     balance: u64,
     rent: Lamport,
-    consolidation_fee: u128,
 ) -> Result<u64, DepositSplError> {
     // Quote a standalone sweep; batching can reduce its actual cost.
     let cost = estimate_sol_cost(2 * FEE_PER_SIGNATURE, rent);
@@ -131,53 +163,48 @@ async fn quote_deposit_fee<R: CanisterRuntime>(
         token.xrc_symbol.clone(),
         token.decimals,
     );
-    let result = FeeEstimator::new(oracle)
+    let fee = FeeEstimator::new(oracle)
         .estimate_fee(token.mint, cost)
         .await
-        .map_err(DepositSplError::TemporarilyUnavailable)
-        .and_then(|fee| {
-            balance_above_minimum(balance, token.minimum_deposit_amount, fee)?;
-            Ok(fee)
-        });
-    charge_rpc_call(
-        runtime,
-        RpcCallCharge {
-            attached_cycles: XRC_REQUEST_CYCLES,
-            fee_on_success: consolidation_fee,
-        },
-        &result,
-    );
-    result
+        .map_err(DepositSplError::TemporarilyUnavailable)?;
+    balance_above_minimum(balance, token.minimum_deposit_amount, fee)?;
+    Ok(fee)
 }
 
-/// Records the accepted balance and fixed fee quote before returning the deposit ID.
-fn queue_deposit<R: CanisterRuntime>(
+/// Queues the deposit under the next deposit id, which both `deposit_spl` and a balance
+/// scan of a future automatic flow do once a token account holds at least the minimum
+/// deposit amount plus the fee, and returns that id.
+///
+/// # Panics
+///
+/// If the account and mint pair of the deposit already has a deposit in flight, which
+/// callers must rule out after their balance read.
+pub(crate) fn queue_deposit<R: CanisterRuntime>(
     runtime: &R,
-    account: Account,
-    mint: Address,
-    address: Address,
-    balance: u64,
-    fee: u64,
+    state: &mut State,
+    deposit: QueuedSplDeposit,
 ) -> DepositSplId {
-    let deposit_id = mutate_state(|state| {
-        let deposit_id = state.spl_deposits().next_id();
-        process_event(
-            state,
-            EventType::QueuedSplDeposit {
-                deposit_id,
-                account,
-                mint,
-                address,
-                balance,
-                fee,
-            },
-            runtime,
-        );
-        deposit_id
-    });
+    let deposit_id = state.spl_deposits().next_id();
+    process_event(
+        state,
+        EventType::QueuedSplDeposit {
+            deposit_id,
+            account: deposit.account,
+            mint: deposit.mint,
+            address: deposit.address,
+            balance: deposit.balance,
+            fee: deposit.fee,
+        },
+        runtime,
+    );
     log!(
         Priority::Info,
-        "Queued SPL deposit {deposit_id} for account {account:?}: {balance} units of mint {mint} sweepable from {address}, with a fee of {fee} units"
+        "Queued SPL deposit {deposit_id} for account {:?}: {} units of mint {} sweepable from {}, with a fee of {} units",
+        deposit.account,
+        deposit.balance,
+        deposit.mint,
+        deposit.address,
+        deposit.fee
     );
     deposit_id
 }

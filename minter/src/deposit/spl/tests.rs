@@ -58,7 +58,7 @@ mod balance_reading {
             account_address, associated_token_address, get_spl_deposit_address, minter_address,
         },
         constants::{GET_ACCOUNT_INFO_CYCLES, XRC_REQUEST_CYCLES},
-        deposit::spl::deposit_spl,
+        deposit::spl::{deposit_spl, queue_deposit},
         guard::deposit_spl_guard,
         state::{
             SupportedSplToken, TokenProgram, audit::process_event, event::EventType, mutate_state,
@@ -67,7 +67,7 @@ mod balance_reading {
         storage::total_event_count,
         test_fixtures::{
             DEPOSIT_SOL_FEE, deposit::DEPOSITOR_ACCOUNT, init_schnorr_master_key, init_state,
-            runtime::TestCanisterRuntime, spl_token, unit_xrc_rate, xrc_rate,
+            queued_spl_deposit, runtime::TestCanisterRuntime, spl_token, unit_xrc_rate, xrc_rate,
         },
     };
     use assert_matches::assert_matches;
@@ -370,6 +370,47 @@ mod balance_reading {
 
         assert_eq!(result, Ok(0));
         assert_queued_deposit(&runtime, &token, MINIMUM_DEPOSIT_WITH_FEE);
+    }
+
+    #[tokio::test]
+    async fn should_yield_to_a_deposit_queued_during_the_reads_and_charge_only_the_calls() {
+        let token = init_token(false);
+        let account = token_account_info(&token, MINIMUM_DEPOSIT_WITH_FEE);
+        let runtime = runtime()
+            .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))))
+            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
+            .add_stub_response(crate::test_fixtures::unit_xrc_rate());
+
+        let mut call = Box::pin(deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()));
+        // The call suspends in the balance read.
+        assert!(futures::poll!(call.as_mut()).is_pending());
+        let scanned_id = mutate_state(|state| {
+            queue_deposit(
+                &runtime,
+                state,
+                queued_spl_deposit(DEPOSITOR_ACCOUNT, token.mint, TokenProgram::Classic),
+            )
+        });
+
+        assert_eq!(call.await, Ok(scanned_id));
+        assert_eq!(
+            runtime.msg_cycles_accepted(),
+            [
+                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
+                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
+                XRC_REQUEST_CYCLES / 2
+            ]
+        );
+        read_state(|state| {
+            assert_eq!(state.spl_deposits().queued().len(), 1);
+            assert_eq!(
+                state
+                    .spl_deposits()
+                    .in_flight_id(&DEPOSITOR_ACCOUNT, &token.mint),
+                Some(scanned_id)
+            );
+        });
+        assert_eq!(total_event_count(), 2); // Token registration and the scanned deposit.
     }
 
     #[tokio::test]

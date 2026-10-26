@@ -959,6 +959,34 @@ fn should_reject_fee_consuming_entire_deposit() {
 }
 
 #[test]
+fn should_keep_the_latest_id_of_a_dropped_deposit() {
+    let (runtime, signature, sweep) = submitted_spl_sweep();
+    let (deposit_id, deposit) = sweep.deposits().iter().next().unwrap();
+    let (account, mint) = (deposit.account, deposit.mint);
+    read_state(|state| {
+        assert_eq!(
+            state.spl_deposits().latest_id(&account, &mint),
+            Some(*deposit_id)
+        );
+        assert_eq!(
+            state.spl_deposits().latest_id(&account, &[9; 32].into()),
+            None
+        );
+    });
+
+    mutate_state(|state| {
+        process_event(state, EventType::ExpiredTransaction { signature }, &runtime)
+    });
+
+    let replayed = assert_replay_matches_state();
+    assert_eq!(replayed.spl_deposits().in_flight_id(&account, &mint), None);
+    assert_eq!(
+        replayed.spl_deposits().latest_id(&account, &mint),
+        Some(*deposit_id)
+    );
+}
+
+#[test]
 #[should_panic(expected = "unsupported SPL mint")]
 fn should_reject_queued_deposit_for_unsupported_mint() {
     let runtime = TestCanisterRuntime::new().with_increasing_time();
