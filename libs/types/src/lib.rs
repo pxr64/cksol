@@ -238,7 +238,7 @@ pub enum DepositSplStatus {
     /// was minted, or the mint could not be retried safely, so the mint outcome requires
     /// manual verification. Releasing or crediting the deposit requires a minter upgrade.
     /// Meanwhile the account and mint pair stays in flight, so `deposit_spl` keeps
-    /// returning this identifier.
+    /// rejecting it and a new deposit has to use a different subaccount.
     Quarantined {
         /// The signature of the sweep transaction.
         signature: Signature,
@@ -340,6 +340,15 @@ pub enum DepositSplError {
     /// or does not match the mint or the owner. A retry fails the same way.
     #[error("Invalid SPL token account: {0}")]
     InvalidTokenAccount(String),
+    /// The latest deposit of this account and mint is quarantined: the outcome of its sweep
+    /// did not match the plan, or its mint could not be retried safely. The pair stays
+    /// rejected until a minter upgrade resolves the deposit; a new deposit has to use a
+    /// different subaccount.
+    #[error("The latest deposit {deposit_id} of this account and mint is quarantined")]
+    Quarantined {
+        /// The identifier of the quarantined deposit.
+        deposit_id: DepositSplId,
+    },
     /// SPL deposit processing is currently unavailable.
     #[error("SPL deposit processing is unavailable: {0}")]
     TemporarilyUnavailable(String),

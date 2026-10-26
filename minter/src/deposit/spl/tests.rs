@@ -724,7 +724,9 @@ mod lifecycle {
         },
     };
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use cksol_types::{DepositSplId, DepositSplStatus, Memo, MintMemo, SplFeeMintStatus};
+    use cksol_types::{
+        DepositSplError, DepositSplId, DepositSplStatus, Memo, MintMemo, SplFeeMintStatus,
+    };
     use ic_stable_structures::Storable;
     use icrc_ledger_types::icrc1::{
         account::Account,
@@ -1507,7 +1509,7 @@ mod lifecycle {
                 token.mint.into()
             )
             .await,
-            Ok(deposit_id)
+            Err(DepositSplError::Quarantined { deposit_id })
         );
         let other_subaccount = Account {
             subaccount: Some([1; 32]),

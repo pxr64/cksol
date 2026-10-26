@@ -370,7 +370,7 @@ async fn should_quarantine_deposit_when_finalized_sweep_does_not_match_its_plan(
             signature: signature.clone()
         }
     );
-    // The pair stays locked, so a new request returns the quarantined deposit.
+    // The pair stays locked, so a new request is rejected with the quarantined deposit.
     assert_eq!(
         setup
             .minter()
@@ -380,7 +380,7 @@ async fn should_quarantine_deposit_when_finalized_sweep_does_not_match_its_plan(
                 mint: MINT.into(),
             })
             .await,
-        Ok(deposit_id)
+        Err(DepositSplError::Quarantined { deposit_id })
     );
     setup.drop().await;
 }

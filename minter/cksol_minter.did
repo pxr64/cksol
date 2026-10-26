@@ -190,6 +190,14 @@ type DepositSplError = variant {
     // The source or destination token account is frozen, has an unsupported extension,
     // or does not match the expected token program, mint, or owner.
     InvalidTokenAccount: text;
+    // The latest deposit of this account and mint is quarantined: the outcome of its
+    // sweep did not match the plan, or its mint could not be retried safely. The pair
+    // stays rejected until a minter upgrade resolves the deposit; a new deposit has to
+    // use a different subaccount.
+    Quarantined : record {
+        // The identifier of the quarantined deposit.
+        deposit_id: DepositSplId;
+    };
     TemporarilyUnavailable: text;
 };
 type DepositSplResult = variant { Ok: DepositSplId; Err: DepositSplError };
@@ -253,7 +261,7 @@ type DepositSplStatus = variant {
     // was minted, or the mint could not be retried safely, so the mint outcome requires
     // manual verification. Releasing or crediting the deposit requires a minter upgrade.
     // Meanwhile the account and mint pair stays in flight, so `deposit_spl` keeps
-    // returning this identifier.
+    // rejecting it and a new deposit has to use a different subaccount.
     Quarantined : record {
         // The signature of the sweep transaction.
         signature: Signature;

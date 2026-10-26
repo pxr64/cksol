@@ -6,7 +6,10 @@ use crate::{
     rpc::{get_spl_token_account, get_spl_token_balance},
     runtime::CanisterRuntime,
     spl_fee::{FeeEstimator, XrcPriceOracle, estimate_sol_cost},
-    state::{SupportedSplToken, audit::process_event, event::EventType, mutate_state, read_state},
+    state::{
+        InFlightSplDeposit, SupportedSplToken, audit::process_event, event::EventType,
+        mutate_state, read_state,
+    },
     utils::{assert_valid_deposit_owner, assert_valid_deposit_token},
 };
 use canlog::log;
@@ -36,9 +39,12 @@ pub async fn deposit_spl<R: CanisterRuntime>(
     let mint = Address::from(mint);
     let _guard = deposit_spl_guard(account, mint)?;
     // A pause stops new deposits only, so an in-flight deposit stays reachable.
-    if let Some(deposit_id) = read_state(|state| state.spl_deposits().in_flight_id(&account, &mint))
-    {
-        return Ok(deposit_id);
+    match read_state(|state| state.spl_deposits().in_flight(&account, &mint)) {
+        Some(InFlightSplDeposit::Processing(deposit_id)) => return Ok(deposit_id),
+        Some(InFlightSplDeposit::Quarantined(deposit_id)) => {
+            return Err(DepositSplError::Quarantined { deposit_id });
+        }
+        None => {}
     }
     let token = assert_valid_deposit_token(&mint)?;
     let consolidation_fee = read_state(|state| state.deposit_sol_fee());

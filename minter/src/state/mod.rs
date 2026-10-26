@@ -49,8 +49,9 @@ use sweep::validate_sweep_transaction;
 
 pub use spl::{SupportedSplToken, TokenProgram};
 pub use spl_deposits::{
-    MintedSplSweep, PendingSplFeeMint, PendingSplMint, QueuedSplDeposit, SettledSplSweep,
-    SplDeposits, SplSweep, SplSweepRecoveryError, SplSweeps, SplTransfer, SweptSplDeposit,
+    InFlightSplDeposit, MintedSplSweep, PendingSplFeeMint, PendingSplMint, QueuedSplDeposit,
+    SettledSplSweep, SplDeposits, SplSweep, SplSweepRecoveryError, SplSweeps, SplTransfer,
+    SweptSplDeposit,
 };
 mod watchlist;
 

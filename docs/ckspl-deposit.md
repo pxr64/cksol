@@ -99,7 +99,7 @@ sequenceDiagram
 
 1. The owner must not be anonymous or the minter.
 2. A concurrent request for the same account and mint fails with `AlreadyProcessing`.
-3. If a deposit for the account and mint is in flight, the call returns its ID. In flight means queued, swept, finalized, waiting for a mint, or quarantined. This step makes no quote, no RPC call and no cycle charge. It also applies when the token is paused.
+3. If a deposit for the account and mint is in flight, the call makes no quote, no RPC call and no cycle charge. A deposit that is queued, swept, finalized or waiting for a mint makes the call return its ID. A quarantined deposit makes the call fail with `Quarantined` and its ID. The pair stays rejected until a minter upgrade resolves the deposit, so a new deposit needs a different subaccount. This step also applies when the token is paused.
 4. The mint must be registered (`UnsupportedToken`) and not paused (`TokenPaused`).
 5. The caller must attach cycles for two account reads, one XRC request and the consolidation fee (`InsufficientCycles`).
 6. The source account `A` must have the expected token program, mint and owner, and it must not be frozen. A Token-2022 account can have only the `ImmutableOwner` and `MemoTransfer` extensions. A missing account has a zero balance. The minter rejects a balance below the configured minimum before it makes more calls.

@@ -93,6 +93,28 @@ impl SplDeposits {
         self.in_flight_ids.get(&(*account, *mint)).copied()
     }
 
+    /// The deposit of the account and mint pair that is in flight, with whether it is still
+    /// processed or quarantined.
+    ///
+    /// # Panics
+    ///
+    /// If the in-flight deposit is minted, dropped or unknown, since such a deposit must
+    /// have released its pair.
+    pub fn in_flight(&self, account: &Account, mint: &Address) -> Option<InFlightSplDeposit> {
+        let deposit_id = self.in_flight_id(account, mint)?;
+        Some(match self.status(deposit_id) {
+            DepositSplStatus::Queued { .. }
+            | DepositSplStatus::Swept { .. }
+            | DepositSplStatus::Finalized { .. } => InFlightSplDeposit::Processing(deposit_id),
+            DepositSplStatus::Quarantined { .. } => InFlightSplDeposit::Quarantined(deposit_id),
+            status @ (DepositSplStatus::Dropped { .. }
+            | DepositSplStatus::Minted { .. }
+            | DepositSplStatus::NotFound) => panic!(
+                "BUG: in-flight SPL deposit {deposit_id} of account {account:?} and mint {mint} has status {status:?}"
+            ),
+        })
+    }
+
     pub fn status(&self, deposit_id: DepositSplId) -> DepositSplStatus {
         if let Some(deposit) = self
             .queued
@@ -427,6 +449,17 @@ impl SplDeposits {
             },
         );
     }
+}
+
+/// The deposit that reserves its account and mint pair: no other deposit can be queued for
+/// the pair until it is minted or dropped, and a quarantined one keeps the pair reserved
+/// until a minter upgrade resolves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InFlightSplDeposit {
+    /// The deposit is queued, swept, finalized or waiting for its mint.
+    Processing(DepositSplId),
+    /// The deposit is quarantined and keeps its pair rejected until a minter upgrade.
+    Quarantined(DepositSplId),
 }
 
 /// A finalized token-account balance accepted for a future sweep.
