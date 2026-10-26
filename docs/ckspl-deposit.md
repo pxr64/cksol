@@ -109,6 +109,8 @@ sequenceDiagram
 
 A failed check of a token account fails with `InvalidTokenAccount` and the reason. The minter charges the actual cost of each external call. It keeps the consolidation fee only when it queues the deposit.
 
+After both account reads and the fee quote, or when one of these steps fails, the minter checks whether a scan queued a deposit for the same account and mint while it waited. If so, it returns the ID of that deposit, or `Quarantined` if the deposit is quarantined, even if an external call failed. It charges only the calls it made, without the consolidation fee, and queues no new deposit. A deposit that has already been minted or dropped still returns its ID.
+
 ## 5. Fees and accounting
 
 There are three separate costs:

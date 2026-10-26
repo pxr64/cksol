@@ -179,7 +179,7 @@ mod balance_reading {
         );
         assert_eq!(runtime.sent_update_calls().len(), 1);
         assert_eq!(runtime.sent_update_calls()[0].method, "getAccountInfo");
-        assert!(read_state(|state| state.deposits().queued().is_empty()));
+        assert!(read_state(|state| state.spl_deposits().queued().is_empty()));
         assert_eq!(total_event_count(), 1); // Token registration only.
     }
 
@@ -193,7 +193,8 @@ mod balance_reading {
             [
                 GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
                 GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
-                XRC_REQUEST_CYCLES / 2 + DEPOSIT_SOL_FEE
+                XRC_REQUEST_CYCLES / 2,
+                DEPOSIT_SOL_FEE
             ]
         );
         assert_eq!(runtime.sent_update_calls().len(), 3);
@@ -382,8 +383,10 @@ mod balance_reading {
             .add_stub_response(crate::test_fixtures::unit_xrc_rate());
 
         let mut call = Box::pin(deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()));
-        // The call suspends in the balance read.
+        // The call suspends in the source read.
         assert!(futures::poll!(call.as_mut()).is_pending());
+        assert_eq!(runtime.sent_update_calls().len(), 1);
+        assert!(runtime.msg_cycles_accepted().is_empty());
         let scanned_id = mutate_state(|state| {
             queue_deposit(
                 &runtime,
@@ -401,6 +404,7 @@ mod balance_reading {
                 XRC_REQUEST_CYCLES / 2
             ]
         );
+        assert_eq!(runtime.sent_update_calls().len(), 3);
         read_state(|state| {
             assert_eq!(state.spl_deposits().queued().len(), 1);
             assert_eq!(
@@ -411,6 +415,101 @@ mod balance_reading {
             );
         });
         assert_eq!(total_event_count(), 2); // Token registration and the scanned deposit.
+    }
+
+    #[tokio::test]
+    async fn should_yield_to_a_scanned_deposit_when_the_fee_quote_fails() {
+        let token = init_token(false);
+        let runtime = runtime()
+            .add_stub_response(MultiRpcResult::Consistent(Ok(Some(token_account_info(
+                &token,
+                MINIMUM_DEPOSIT_WITH_FEE,
+            )))))
+            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
+            .add_stub_error(IcError::CallPerformFailed);
+
+        let mut call = Box::pin(deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()));
+        // The source read, the treasury read, then the XRC await.
+        for _ in 0..2 {
+            assert!(futures::poll!(call.as_mut()).is_pending());
+        }
+        let scanned_id = mutate_state(|state| {
+            queue_deposit(
+                &runtime,
+                state,
+                queued_spl_deposit(DEPOSITOR_ACCOUNT, token.mint, TokenProgram::Classic),
+            )
+        });
+
+        assert_eq!(call.await, Ok(scanned_id));
+        assert_eq!(
+            runtime.msg_cycles_accepted(),
+            [
+                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
+                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
+                XRC_REQUEST_CYCLES / 2
+            ]
+        );
+        assert_eq!(total_event_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_yield_to_a_scanned_deposit_when_the_source_balance_is_too_small() {
+        let token = init_token(false);
+        let runtime = runtime().add_stub_response(MultiRpcResult::Consistent(Ok(Some(
+            token_account_info(&token, 0),
+        ))));
+
+        let mut call = Box::pin(deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()));
+        assert!(futures::poll!(call.as_mut()).is_pending());
+        let scanned_id = mutate_state(|state| {
+            queue_deposit(
+                &runtime,
+                state,
+                queued_spl_deposit(DEPOSITOR_ACCOUNT, token.mint, TokenProgram::Classic),
+            )
+        });
+
+        assert_eq!(call.await, Ok(scanned_id));
+        assert_eq!(
+            runtime.msg_cycles_accepted(),
+            [GET_ACCOUNT_INFO_CYCLES - RPC_REFUND]
+        );
+        assert_eq!(runtime.sent_update_calls().len(), 1);
+        assert_eq!(total_event_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_yield_to_a_scanned_deposit_when_the_treasury_read_fails() {
+        let token = init_token(false);
+        let runtime = runtime()
+            .add_stub_response(MultiRpcResult::Consistent(Ok(Some(token_account_info(
+                &token,
+                MINIMUM_DEPOSIT_WITH_FEE,
+            )))))
+            .add_stub_error(IcError::CallPerformFailed);
+
+        let mut call = Box::pin(deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()));
+        // The call suspends in the source read; the treasury read fails after the scan.
+        assert!(futures::poll!(call.as_mut()).is_pending());
+        let scanned_id = mutate_state(|state| {
+            queue_deposit(
+                &runtime,
+                state,
+                queued_spl_deposit(DEPOSITOR_ACCOUNT, token.mint, TokenProgram::Classic),
+            )
+        });
+
+        assert_eq!(call.await, Ok(scanned_id));
+        assert_eq!(
+            runtime.msg_cycles_accepted(),
+            [
+                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
+                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND
+            ]
+        );
+        assert_eq!(runtime.sent_update_calls().len(), 2);
+        assert_eq!(total_event_count(), 2);
     }
 
     #[tokio::test]
@@ -564,8 +663,7 @@ mod balance_reading {
     async fn should_reject_missing_token_account_as_zero_balance() {
         let token = init_token(false);
         let runtime = runtime()
-            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
-            .add_stub_response(crate::test_fixtures::unit_xrc_rate());
+            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
 
         let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
@@ -613,8 +711,7 @@ mod balance_reading {
         init_schnorr_master_key();
         let token = register_token(false);
         let first_runtime = runtime()
-            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
-            .add_stub_response(crate::test_fixtures::unit_xrc_rate());
+            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
         let mut first = Box::pin(deposit_spl(
             &first_runtime,
             DEPOSITOR_ACCOUNT,
@@ -739,7 +836,7 @@ mod lifecycle {
     };
     use crate::{
         address::{account_address, associated_token_address},
-        constants::FEE_PER_SIGNATURE,
+        constants::{FEE_PER_SIGNATURE, GET_ACCOUNT_INFO_CYCLES, XRC_REQUEST_CYCLES},
         deposit::spl::{
             deposit_spl, deposit_spl_status, process_pending_spl_mints, sweep_queued_spl_deposits,
         },
@@ -1493,6 +1590,89 @@ mod lifecycle {
             );
         });
         assert_replay_matches();
+    }
+
+    #[tokio::test]
+    async fn should_return_the_scanned_deposit_outcome_if_it_finishes_during_a_read() {
+        for suspended_call in 1..=2 {
+            for quarantined in [false, true] {
+                setup();
+                let token = register_token(false);
+                let runtime = runtime()
+                    .add_stub_response(MultiRpcResult::Consistent(Ok(Some(source_account_info(
+                        &token,
+                        DEPOSITOR_ACCOUNT,
+                        MINIMUM_DEPOSIT_WITH_FEE,
+                    )))))
+                    .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
+                    .add_stub_response(crate::test_fixtures::unit_xrc_rate());
+                let mut call =
+                    Box::pin(deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()));
+                for _ in 0..suspended_call {
+                    assert!(futures::poll!(call.as_mut()).is_pending());
+                }
+
+                let deposit_id = mutate_state(|state| {
+                    crate::deposit::spl::queue_deposit(
+                        &runtime,
+                        state,
+                        crate::test_fixtures::queued_spl_deposit_under(
+                            &devnet_sweep::master_key(),
+                            DEPOSITOR_ACCOUNT,
+                            token.mint,
+                            TokenProgram::Classic,
+                        ),
+                    )
+                });
+                let sweep = sweep(&[DEPOSITOR_ACCOUNT]).await;
+                mutate_state(|state| {
+                    let runtime = TestCanisterRuntime::new().with_increasing_time();
+                    if quarantined {
+                        process_event(
+                            state,
+                            EventType::SucceededTransaction {
+                                signature: sweep.signature,
+                            },
+                            &runtime,
+                        );
+                        process_event(
+                            state,
+                            EventType::QuarantinedSplSweep {
+                                signature: sweep.signature,
+                            },
+                            &runtime,
+                        );
+                    } else {
+                        process_event(
+                            state,
+                            EventType::ExpiredTransaction {
+                                signature: sweep.signature,
+                            },
+                            &runtime,
+                        );
+                    }
+                });
+
+                let event_count = total_event_count();
+                let expected = if quarantined {
+                    Err(DepositSplError::Quarantined { deposit_id })
+                } else {
+                    Ok(deposit_id)
+                };
+                assert_eq!(call.await, expected);
+                assert_eq!(total_event_count(), event_count);
+                assert_eq!(runtime.sent_update_calls().len(), 3);
+                assert_eq!(
+                    runtime.msg_cycles_accepted(),
+                    [
+                        GET_ACCOUNT_INFO_CYCLES / 2,
+                        GET_ACCOUNT_INFO_CYCLES / 2,
+                        XRC_REQUEST_CYCLES / 2,
+                    ]
+                );
+                assert_replay_matches();
+            }
+        }
     }
 
     #[tokio::test]
