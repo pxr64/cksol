@@ -52,13 +52,17 @@ pub use spl_deposits::{
     MintedSplSweep, PendingSplFeeMint, PendingSplMint, QueuedSplDeposit, SettledSplSweep,
     SplDeposits, SplSweep, SplSweepRecoveryError, SplSweeps, SplTransfer, SweptSplDeposit,
 };
+mod watchlist;
 
 pub use deposits::{
-    DepositBalance, Deposits, MintedSweep, PendingMint, QuarantineCause, QuarantinedDeposit,
-    QueuedDeposit, SettledSweep, Sweep, SweepMismatch, SweepRecoveryError, SweepSettlementError,
-    Sweeps, SweptDeposit, Transfer, UnreadableOutcome,
+    DepositBalance, Deposits, InFlightDeposit, MintedSweep, PendingMint, QuarantineCause,
+    QuarantinedDeposit, QueuedDeposit, SettledSweep, Sweep, SweepMismatch, SweepRecoveryError,
+    SweepSettlementError, Sweeps, SweptDeposit, Transfer, UnreadableOutcome,
 };
 pub use nonce_pool::{DurableNoncePool, NoncePoolError, NonceRead};
+pub use watchlist::{
+    MAX_WATCHED_ADDRESSES, WATCH_WINDOW, WatchedAddress, Watchlist, WatchlistFull,
+};
 
 thread_local! {
     static STATE: RefCell<Option<State>> = RefCell::default();
@@ -110,7 +114,7 @@ where
 ///   to ensure that the state is only mutating through events.
 /// * Having public methods mutating the state may be acceptable for transient data (e.g. guards)
 ///   that do not need to be preserved across canister upgrades.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     minter_public_key: Option<SchnorrPublicKey>,
     master_key_name: Ed25519KeyName,
@@ -123,6 +127,7 @@ pub struct State {
     minimum_deposit_amount: Lamport,
     deposit_sol_required_cycles: u128,
     deposit_sol_fee: u128,
+    automatic_deposit_fee: Option<Lamport>,
     pending_deposit_sol_request_guards: BTreeSet<Account>,
     pending_deposit_spl_request_guards: BTreeSet<(Account, Address)>,
     pending_withdrawal_request_guards: BTreeSet<Account>,
@@ -240,12 +245,24 @@ impl State {
         self.deposit_sol_required_cycles
     }
 
+    pub fn automatic_deposit_fee(&self) -> Option<Lamport> {
+        self.automatic_deposit_fee
+    }
+
     pub fn deposits(&self) -> &Deposits {
         &self.deposits
     }
 
     pub fn spl_deposits(&self) -> &SplDeposits {
         &self.spl_deposits
+    }
+
+    pub fn watchlist(&self) -> &Watchlist {
+        self.deposits.watchlist()
+    }
+
+    pub fn watchlist_mut(&mut self) -> &mut Watchlist {
+        self.deposits.watchlist_mut()
     }
 
     pub fn sent_withdrawal_requests(&self) -> &BTreeMap<LedgerBurnIndex, SentWithdrawalRequest> {
@@ -413,7 +430,22 @@ impl State {
                 deposit_sol_fee: self.deposit_sol_fee,
             });
         }
+        if let Some(automatic_deposit_fee) = self.automatic_deposit_fee
+            && automatic_deposit_fee > self.max_automatic_deposit_fee()
+        {
+            return Err(InvalidStateError::AutomaticDepositFeeTooHigh {
+                automatic_deposit_fee,
+                max_automatic_deposit_fee: self.max_automatic_deposit_fee(),
+            });
+        }
         Ok(())
+    }
+
+    fn max_automatic_deposit_fee(&self) -> Lamport {
+        self.minimum_deposit_amount
+            .saturating_sub(RENT_EXEMPTION_THRESHOLD)
+            .saturating_sub(FEE_PER_SIGNATURE)
+            .saturating_sub(1)
     }
 
     fn upgrade(
@@ -427,6 +459,7 @@ impl State {
             deposit_sol_required_cycles,
             deposit_sol_fee,
             nonce_accounts_to_add,
+            automatic_deposit_fee,
         }: UpgradeArgs,
     ) -> Result<(), InvalidStateError> {
         if let Some(id) = ledger_suite_orchestrator_id {
@@ -449,6 +482,9 @@ impl State {
         }
         if let Some(deposit_sol_fee) = deposit_sol_fee {
             self.deposit_sol_fee = deposit_sol_fee as u128;
+        }
+        if let Some(automatic_deposit_fee) = automatic_deposit_fee {
+            self.automatic_deposit_fee = Some(automatic_deposit_fee);
         }
         if let Some(nonce_accounts) = nonce_accounts_to_add {
             let nonce_accounts = parse_nonce_accounts(nonce_accounts)?;
@@ -491,30 +527,22 @@ impl State {
     fn process_queued_deposit(
         &mut self,
         deposit_id: DepositSolId,
-        account: &Account,
-        address: &Address,
-        balance: DepositBalance,
+        deposit: QueuedDeposit,
         queued_at: u64,
     ) {
         debug_assert_eq!(
-            *address,
+            deposit.address,
             account_address(
                 self.minter_public_key
                     .as_ref()
                     .expect("BUG: a deposit was queued before the minter public key was recorded"),
-                account,
+                &deposit.account,
             ),
-            "Attempted to queue deposit {deposit_id} with address {address} not derived from account {account:?}",
+            "Attempted to queue deposit {deposit_id} with address {} not derived from account {:?}",
+            deposit.address,
+            deposit.account,
         );
-        self.deposits.queue(
-            deposit_id,
-            QueuedDeposit {
-                account: *account,
-                address: *address,
-                balance,
-            },
-            queued_at,
-        );
+        self.deposits.queue(deposit_id, deposit, queued_at);
     }
 
     fn process_queued_spl_deposit(
@@ -1107,6 +1135,10 @@ pub enum InvalidStateError {
         get_balance_cycles: u128,
         deposit_sol_fee: u128,
     },
+    AutomaticDepositFeeTooHigh {
+        automatic_deposit_fee: Lamport,
+        max_automatic_deposit_fee: Lamport,
+    },
     InvalidNonceAccount(String),
     DuplicateNonceAccount(Address),
     NonceAccountIsWithdrawalDestination(Address),
@@ -1149,6 +1181,7 @@ impl TryFrom<InitArgs> for State {
             solana_network,
             deposit_sol_fee,
             nonce_accounts,
+            automatic_deposit_fee,
         }: InitArgs,
     ) -> Result<Self, Self::Error> {
         let nonce_pool = DurableNoncePool::new(parse_nonce_accounts(nonce_accounts)?)?;
@@ -1164,6 +1197,7 @@ impl TryFrom<InitArgs> for State {
             minimum_deposit_amount,
             deposit_sol_required_cycles: deposit_sol_required_cycles as u128,
             deposit_sol_fee: deposit_sol_fee as u128,
+            automatic_deposit_fee,
             pending_deposit_sol_request_guards: BTreeSet::new(),
             pending_deposit_spl_request_guards: BTreeSet::new(),
             pending_withdrawal_request_guards: BTreeSet::new(),

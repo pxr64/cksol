@@ -9,8 +9,9 @@ use cksol_types::{
     AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
     DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, DepositSplStatus,
     GetDepositAddressArgs, GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo,
-    OperatingBalance, OperatingTopUp, ProcessOperatingTopUpError, WithdrawSolArgs,
-    WithdrawSolError, WithdrawSolOk, WithdrawSolStatus, WithdrawSolStatusArgs,
+    OperatingBalance, OperatingTopUp, ProcessOperatingTopUpError, WatchDepositAddressArgs,
+    WatchDepositAddressError, WatchDepositAddressOk, WithdrawSolArgs, WithdrawSolError,
+    WithdrawSolOk, WithdrawSolStatus, WithdrawSolStatusArgs,
 };
 use cksol_types_internal::{
     MinterArg,
@@ -23,7 +24,7 @@ use ic_management_canister_types::{CanisterId, CanisterSettings};
 use ic_pocket_canister_runtime::{ExecuteHttpOutcallMocks, PocketIcRuntime};
 use icrc_ledger_types::{
     icrc1::{
-        account::Account,
+        account::{Account, Subaccount},
         transfer::{TransferArg, TransferError},
     },
     icrc2::approve::{ApproveArgs, ApproveError},
@@ -33,13 +34,18 @@ use num_traits::cast::ToPrimitive;
 pub use pocket_ic::common::rest::{
     CanisterHttpReply, CanisterHttpRequest, CanisterHttpResponse, MockCanisterHttpResponse,
 };
-use pocket_ic::{PocketIcBuilder, RejectResponse, nonblocking::PocketIc};
+use pocket_ic::{
+    PocketIcBuilder, RejectResponse, common::rest::RawMessageId, nonblocking::PocketIc,
+};
 use serde::de::DeserializeOwned;
 use sol_rpc_client::SolRpcClient;
 use sol_rpc_types::{Lamport, RpcAccess};
 use solana_address::address;
 use solana_transaction::Transaction;
-use std::{default::Default, env::var, fs, ops::Deref, path::PathBuf, time::Duration, vec};
+use std::{
+    default::Default, env::var, fs, marker::PhantomData, ops::Deref, path::PathBuf, time::Duration,
+    vec,
+};
 
 pub mod events;
 pub mod fixtures;
@@ -62,6 +68,7 @@ pub struct SetupBuilder {
     proxy_canister: bool,
     ledger_suite_orchestrator_id: Option<Principal>,
     nonce_accounts: Vec<String>,
+    automatic_deposit_fee: Option<Lamport>,
 }
 
 impl Default for SetupBuilder {
@@ -73,6 +80,7 @@ impl Default for SetupBuilder {
             proxy_canister: false,
             ledger_suite_orchestrator_id: None,
             nonce_accounts: vec![Setup::DEFAULT_NONCE_ACCOUNT.to_string()],
+            automatic_deposit_fee: Some(Setup::DEFAULT_AUTOMATIC_DEPOSIT_FEE),
         }
     }
 }
@@ -120,17 +128,34 @@ impl SetupBuilder {
         self
     }
 
+    /// Installs the minter without an automatic deposit fee, which keeps the automatic
+    /// deposit flow unavailable until an upgrade configures the fee.
+    pub fn without_automatic_deposit_fee(mut self) -> Self {
+        self.automatic_deposit_fee = None;
+        self
+    }
+
     pub async fn build(self) -> Setup {
         Setup::new(
             self.make_live.unwrap_or_default(),
             self.sol_rpc_install_args.unwrap_or_default(),
             self.initial_ledger_balances,
             self.proxy_canister,
-            self.ledger_suite_orchestrator_id,
-            self.nonce_accounts,
+            MinterInitArgs {
+                nonce_accounts: self.nonce_accounts,
+                automatic_deposit_fee: self.automatic_deposit_fee,
+                ledger_suite_orchestrator_id: self.ledger_suite_orchestrator_id,
+            },
         )
         .await
     }
+}
+
+/// The installation arguments of the minter a test chooses.
+pub struct MinterInitArgs {
+    pub nonce_accounts: Vec<String>,
+    pub automatic_deposit_fee: Option<Lamport>,
+    pub ledger_suite_orchestrator_id: Option<Principal>,
 }
 
 pub struct Setup {
@@ -154,6 +179,7 @@ impl Setup {
     pub const FUNDED_BALANCE: Lamport = fixtures::DEPOSIT_AMOUNT - validator::FEE_PER_SIGNATURE;
     pub const OPERATING_TOP_UP: Lamport = 100_000_000; // 0.1 SOL
     pub const DEFAULT_MINIMUM_WITHDRAWAL_AMOUNT: Lamport = 2_000_000; // 0.002 SOL
+    pub const DEFAULT_AUTOMATIC_DEPOSIT_FEE: Lamport = 2_000_000; // 0.002 SOL
     pub const DEFAULT_CALLER: Principal =
         Principal::from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xe0, 0x0, 0x3, 0x1, 0x1]);
     pub const DEFAULT_NONCE_ACCOUNT: solana_address::Address =
@@ -164,8 +190,7 @@ impl Setup {
         sol_rpc_install_args: sol_rpc_types::InstallArgs,
         initial_ledger_balances: Option<Vec<(Account, Nat)>>,
         with_proxy_canister: bool,
-        ledger_suite_orchestrator_id: Option<Principal>,
-        nonce_accounts: Vec<String>,
+        minter_init_args: MinterInitArgs,
     ) -> Self {
         let env = PocketIcBuilder::new()
             .with_nns_subnet() //make_live requires NNS subnet.
@@ -210,8 +235,7 @@ impl Setup {
             Encode!(&cksol_minter_init_args(
                 sol_rpc_canister_id,
                 ledger_canister_id,
-                ledger_suite_orchestrator_id,
-                nonce_accounts,
+                minter_init_args,
             ))
             .unwrap(),
             Some(Self::DEFAULT_CONTROLLER),
@@ -379,10 +403,15 @@ impl Setup {
     }
 
     pub fn minter_with_caller(&self, caller: Principal) -> CkSolMinter<'_> {
-        CkSolMinter(Canister {
+        CkSolMinter(self.canister(self.minter_canister_id, caller))
+    }
+
+    fn canister(&self, id: CanisterId, caller: Principal) -> Canister<'_> {
+        Canister {
             runtime: self.runtime(caller),
-            id: self.minter_canister_id,
-        })
+            id,
+            caller,
+        }
     }
 
     pub fn minter_canister_id(&self) -> Principal {
@@ -397,10 +426,7 @@ impl Setup {
     }
 
     pub fn ledger(&self) -> Ledger<'_> {
-        Ledger(Canister {
-            runtime: self.runtime(Setup::DEFAULT_CALLER),
-            id: self.ledger_canister_id,
-        })
+        Ledger(self.canister(self.ledger_canister_id, Setup::DEFAULT_CALLER))
     }
 
     /// Installs a separate SPL ledger with the minter as its minting account.
@@ -425,17 +451,11 @@ impl Setup {
         )
         .await;
 
-        Ledger(Canister {
-            runtime: self.runtime(Self::DEFAULT_CALLER),
-            id: ledger_canister_id,
-        })
+        Ledger(self.canister(ledger_canister_id, Self::DEFAULT_CALLER))
     }
 
     pub fn proxy(&self) -> Canister<'_> {
-        Canister {
-            runtime: self.runtime(Setup::DEFAULT_CALLER),
-            id: self.proxy_canister_id(),
-        }
+        self.canister(self.proxy_canister_id(), Setup::DEFAULT_CALLER)
     }
 
     pub fn proxy_canister_id(&self) -> Principal {
@@ -579,6 +599,7 @@ impl<'a> CkSolMinter<'a> {
         CkSolMinter(Canister {
             runtime: PocketIcRuntime::new(env, Setup::DEFAULT_CALLER),
             id: canister_id,
+            caller: Setup::DEFAULT_CALLER,
         })
     }
 
@@ -745,6 +766,27 @@ impl<'a> CkSolMinter<'a> {
         self.query_call("deposit_spl_status", (deposit_id,)).await
     }
 
+    pub async fn watch_deposit_address(
+        &self,
+        subaccount: Option<Subaccount>,
+    ) -> Result<WatchDepositAddressOk, WatchDepositAddressError> {
+        self.try_watch_deposit_address(subaccount)
+            .await
+            .expect("watch_deposit_address failed")
+    }
+
+    pub async fn try_watch_deposit_address(
+        &self,
+        subaccount: Option<Subaccount>,
+    ) -> Result<Result<WatchDepositAddressOk, WatchDepositAddressError>, String> {
+        self.try_update_call(
+            "watch_deposit_address",
+            (WatchDepositAddressArgs { subaccount },),
+            0,
+        )
+        .await
+    }
+
     pub async fn withdraw_sol(
         &self,
         args: WithdrawSolArgs,
@@ -759,6 +801,13 @@ impl<'a> CkSolMinter<'a> {
         args: WithdrawSolArgs,
     ) -> Result<Result<WithdrawSolOk, WithdrawSolError>, String> {
         self.try_update_call("withdraw_sol", (args,), 0).await
+    }
+
+    pub async fn submit_withdraw_sol(
+        &self,
+        args: WithdrawSolArgs,
+    ) -> PendingCall<'_, Result<WithdrawSolOk, WithdrawSolError>> {
+        self.submit_update_call("withdraw_sol", (args,)).await
     }
 
     pub async fn withdraw_sol_status(&self, block_index: u64) -> WithdrawSolStatus {
@@ -952,6 +1001,59 @@ impl Ledger<'_> {
 pub struct Canister<'a> {
     runtime: PocketIcRuntime<'a>,
     id: CanisterId,
+    caller: Principal,
+}
+
+/// An update call whose ingress message has been submitted but not yet executed.
+///
+/// Submitting several calls before executing a round puts all of their ingress
+/// messages into the same round, so they are guaranteed to execute concurrently.
+/// Their order within that round is unspecified.
+///
+/// The message is submitted directly to the canister, so it carries no cycles, and
+/// HTTP outcalls it makes are not served: a call waiting on one stays pending.
+pub struct PendingCall<'a, Out> {
+    env: &'a PocketIc,
+    message_id: RawMessageId,
+    response: PhantomData<Out>,
+}
+
+impl<Out> PendingCall<'_, Out>
+where
+    Out: CandidType + DeserializeOwned,
+{
+    pub async fn await_response(self) -> Out {
+        let reply = self
+            .env
+            .await_call(self.message_id)
+            .await
+            .unwrap_or_else(|e| panic!("Update call failed: {e:?}"));
+        Decode!(&reply, Out).unwrap_or_else(|e| panic!("Failed to decode response: {e}"))
+    }
+}
+
+impl Canister<'_> {
+    async fn submit_update_call<In, Out>(&self, method: &str, args: In) -> PendingCall<'_, Out>
+    where
+        In: ArgumentEncoder + Send,
+        Out: CandidType + DeserializeOwned,
+    {
+        let env = self.runtime.as_ref();
+        assert!(
+            !env.auto_progress_enabled().await,
+            "a live instance may execute a round between two submissions"
+        );
+        let payload = candid::encode_args(args).expect("Failed to encode arguments");
+        let message_id = env
+            .submit_call(self.id, self.caller, method, payload)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to submit update call: {e:?}"));
+        PendingCall {
+            env,
+            message_id,
+            response: PhantomData,
+        }
+    }
 }
 
 impl Canister<'_> {
@@ -1063,12 +1165,11 @@ fn cksol_minter_wasm() -> Vec<u8> {
 fn cksol_minter_init_args(
     sol_rpc_canister_id: Principal,
     ledger_canister_id: Principal,
-    ledger_suite_orchestrator_id: Option<Principal>,
-    nonce_accounts: Vec<String>,
+    minter_init_args: MinterInitArgs,
 ) -> MinterArg {
     use cksol_types_internal::{Ed25519KeyName, InitArgs, MinterArg, SolanaNetwork};
     MinterArg::Init(InitArgs {
-        ledger_suite_orchestrator_id,
+        ledger_suite_orchestrator_id: minter_init_args.ledger_suite_orchestrator_id,
         sol_rpc_canister_id,
         ledger_canister_id,
         master_key_name: Ed25519KeyName::MainnetProdKey1,
@@ -1078,7 +1179,8 @@ fn cksol_minter_init_args(
         deposit_sol_required_cycles: Setup::DEFAULT_DEPOSIT_SOL_REQUIRED_CYCLES as u64,
         solana_network: SolanaNetwork::Mainnet,
         deposit_sol_fee: Setup::DEFAULT_DEPOSIT_SOL_FEE as u64,
-        nonce_accounts,
+        nonce_accounts: minter_init_args.nonce_accounts,
+        automatic_deposit_fee: minter_init_args.automatic_deposit_fee,
     })
 }
 

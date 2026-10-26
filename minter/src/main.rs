@@ -18,8 +18,9 @@ use cksol_types::{
     AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
     DepositSolStatus, DepositSplArgs, DepositSplError, DepositSplId, DepositSplStatus,
     GetDepositAddressArgs, GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo,
-    OperatingBalance, OperatingTopUp, ProcessOperatingTopUpError, WithdrawSolArgs,
-    WithdrawSolError, WithdrawSolOk, WithdrawSolStatus, WithdrawSolStatusArgs,
+    OperatingBalance, OperatingTopUp, ProcessOperatingTopUpError, WatchDepositAddressArgs,
+    WatchDepositAddressError, WatchDepositAddressOk, WithdrawSolArgs, WithdrawSolError,
+    WithdrawSolOk, WithdrawSolStatus, WithdrawSolStatusArgs,
 };
 use cksol_types_internal::{MinterArg, log::Priority};
 use ic_http_types::{HttpRequest, HttpResponse, HttpResponseBuilder};
@@ -107,6 +108,14 @@ fn get_spl_deposit_address(
 }
 
 #[ic_cdk::update]
+fn watch_deposit_address(
+    args: WatchDepositAddressArgs,
+) -> Result<WatchDepositAddressOk, WatchDepositAddressError> {
+    let account = assert_non_anonymous_account(None, args.subaccount);
+    cksol_minter::deposit::automatic::watch_deposit_address(&IcCanisterRuntime::new(), account)
+}
+
+#[ic_cdk::update]
 async fn withdraw_sol(args: WithdrawSolArgs) -> Result<WithdrawSolOk, WithdrawSolError> {
     let account = assert_non_anonymous_account(None, args.from_subaccount);
 
@@ -176,6 +185,7 @@ fn get_minter_info() -> MinterInfo {
             .iter()
             .map(|address| address.to_string())
             .collect(),
+        automatic_deposit_fee: s.automatic_deposit_fee(),
     })
 }
 

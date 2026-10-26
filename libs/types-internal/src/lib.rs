@@ -60,8 +60,12 @@ pub struct InitArgs {
     /// The base58 addresses of the durable nonce accounts reserved for withdrawal transactions.
     #[cfg_attr(feature = "event", n(9))]
     pub nonce_accounts: Vec<String>,
+    /// The fee in lamports deducted from the minted amount of a deposit detected by the
+    /// automatic flow. The automatic flow stays unavailable until it is set.
+    #[cfg_attr(feature = "event", n(10))]
+    pub automatic_deposit_fee: Option<Lamport>,
     /// The only principal allowed to register SPL tokens. If absent, registration is disabled.
-    #[cfg_attr(feature = "event", n(10), cbor(with = "icrc_cbor::principal::option"))]
+    #[cfg_attr(feature = "event", n(11), cbor(with = "icrc_cbor::principal::option"))]
     pub ledger_suite_orchestrator_id: Option<Principal>,
 }
 
@@ -90,9 +94,13 @@ pub struct UpgradeArgs {
     /// The base58 addresses of durable nonce accounts to add to the withdrawal pool.
     #[cfg_attr(feature = "event", n(6))]
     pub nonce_accounts_to_add: Option<Vec<String>>,
+    /// The new fee in lamports deducted from the minted amount of a deposit detected by the
+    /// automatic flow.
+    #[cfg_attr(feature = "event", n(7))]
+    pub automatic_deposit_fee: Option<Lamport>,
     /// Sets or replaces the principal allowed to register SPL tokens.
     /// If absent, the existing configuration is preserved.
-    #[cfg_attr(feature = "event", n(7), cbor(with = "icrc_cbor::principal::option"))]
+    #[cfg_attr(feature = "event", n(8), cbor(with = "icrc_cbor::principal::option"))]
     pub ledger_suite_orchestrator_id: Option<Principal>,
 }
 

@@ -5,11 +5,12 @@ use crate::{
     sol_transfer::build_batch_withdrawal_message,
     state::{
         DepositBalance, QueuedDeposit, QueuedSplDeposit, SchnorrPublicKey, SplSweep, State,
-        SupportedSplToken, Sweep, TokenProgram,
+        SupportedSplToken, Sweep, TokenProgram, WATCH_WINDOW, WatchedAddress, Watchlist,
         event::{Event, EventType, VersionedMessage},
         init_once_state, mutate_state,
     },
     storage::with_event_iter,
+    utils::timed_sized_map::Timestamp,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use candid::Principal;
@@ -36,6 +37,7 @@ use solana_transaction_status_client_types::{
 use std::{
     collections::{BTreeMap, VecDeque},
     str::FromStr,
+    time::Duration,
 };
 
 pub mod flow;
@@ -63,6 +65,11 @@ pub const MINTER_ADDRESS: Address = address!("Fkt68XQXBDDBGBNNjFh8GM27ffpZGmncUd
 pub const NONCE_ACCOUNT: Address = address!("US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx");
 pub const MINIMUM_DEPOSIT_AMOUNT: Lamport = 20_000_000; // 0.02 SOL
 pub const DEPOSIT_SOL_REQUIRED_CYCLES: u128 = 1_000_000_000_000;
+pub const AUTOMATIC_DEPOSIT_FEE: Lamport = 2_000_000; // 0.002 SOL
+pub const REGISTERED_AT: u64 = 1_700_000_000_000_000_000;
+pub const WATCH_WINDOW_NANOS: u64 = WATCH_WINDOW.as_nanos() as u64;
+pub const MINUTE_NANOS: u64 = Duration::from_mins(1).as_nanos() as u64;
+pub const HOUR_NANOS: u64 = Duration::from_hours(1).as_nanos() as u64;
 
 pub fn sol_rpc_canister_id() -> Principal {
     Principal::from_slice(&[1_u8; 20])
@@ -85,6 +92,7 @@ pub fn valid_init_args() -> InitArgs {
         solana_network: SolanaNetwork::Mainnet,
         deposit_sol_fee: DEPOSIT_SOL_FEE as u64,
         nonce_accounts: vec![],
+        automatic_deposit_fee: Some(AUTOMATIC_DEPOSIT_FEE),
     }
 }
 
@@ -160,6 +168,23 @@ pub fn minter_public_key_fetched_event() -> EventType {
         public_key: master_key.public_key,
         chain_code: master_key.chain_code,
     }
+}
+
+/// The timestamp of `nanos` nanoseconds since the epoch.
+pub fn at(nanos: u64) -> Timestamp {
+    Timestamp::from_nanos(nanos)
+}
+
+/// Registers the deposit address of the account on the watchlist of the state at `now`.
+pub fn watch(now: Timestamp, account: Account) -> WatchedAddress {
+    mutate_state(|state| register(state.watchlist_mut(), now, account))
+}
+
+/// Registers the deposit address of the account on the watchlist at `now`.
+pub fn register(watchlist: &mut Watchlist, now: Timestamp, account: Account) -> WatchedAddress {
+    watchlist
+        .register(now, account, deposit_address(account))
+        .expect("BUG: the watchlist has room for the registration")
 }
 
 /// Returns a [`Signature`] unique for any `usize` index, derived from `i as u64` via le_bytes.
@@ -1597,7 +1622,11 @@ pub mod arb {
             any::<u64>(),
             any::<u64>(),
             arb_solana_network(),
-            (any::<u64>(), arb_nonce_accounts()),
+            (
+                any::<u64>(),
+                arb_nonce_accounts(),
+                prop::option::of(any::<u64>()),
+            ),
         )
             .prop_map(
                 |(
@@ -1609,7 +1638,7 @@ pub mod arb {
                     withdrawal_fee,
                     deposit_sol_required_cycles,
                     solana_network,
-                    (deposit_sol_fee, nonce_accounts),
+                    (deposit_sol_fee, nonce_accounts, automatic_deposit_fee),
                 )| {
                     InitArgs {
                         ledger_suite_orchestrator_id: None,
@@ -1623,6 +1652,7 @@ pub mod arb {
                         solana_network,
                         deposit_sol_fee,
                         nonce_accounts,
+                        automatic_deposit_fee,
                     }
                 },
             )
@@ -1641,6 +1671,7 @@ pub mod arb {
             prop::option::of(any::<u64>()),
             prop::option::of(any::<u64>()),
             prop::option::of(arb_nonce_accounts()),
+            prop::option::of(any::<u64>()),
         )
             .prop_map(
                 |(
@@ -1651,6 +1682,7 @@ pub mod arb {
                     deposit_sol_required_cycles,
                     deposit_sol_fee,
                     nonce_accounts_to_add,
+                    automatic_deposit_fee,
                 )| UpgradeArgs {
                     ledger_suite_orchestrator_id: None,
                     sol_rpc_canister_id,
@@ -1660,6 +1692,7 @@ pub mod arb {
                     deposit_sol_required_cycles,
                     deposit_sol_fee,
                     nonce_accounts_to_add,
+                    automatic_deposit_fee,
                 },
             )
     }

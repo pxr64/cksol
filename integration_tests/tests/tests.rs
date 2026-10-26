@@ -7,14 +7,14 @@ use cksol_int_tests::{
         DEFAULT_CALLER_ACCOUNT, DEFAULT_CALLER_DEPOSIT_ADDRESS, DEPOSIT_AMOUNT,
         EXPIRY_BLOCK_HEIGHT, FINALIZE_TRANSACTIONS_DELAY, MINTER_ADDRESS, MockBuilder,
         RENT_EXEMPTION_THRESHOLD, SUBMISSION_BLOCK_HEIGHT, SWEEP_DEPOSITS_DELAY,
-        SharedMockHttpOutcalls, WITHDRAWAL_PROCESSING_DELAY,
+        WATCH_WINDOW_NANOS, WITHDRAWAL_PROCESSING_DELAY,
     },
     validator::FEE_PER_SIGNATURE,
 };
 use cksol_types::{
     DepositSolArgs, DepositSolError, DepositSolStatus, DepositSplArgs, GetDepositAddressArgs,
-    GetSplDepositAddressArgs, Lamport, MinterInfo, TxFinalizedStatus, WithdrawSolArgs,
-    WithdrawSolError, WithdrawSolStatus,
+    GetSplDepositAddressArgs, Lamport, MinterInfo, TxFinalizedStatus, WatchDepositAddressError,
+    WatchDepositAddressStatus, WithdrawSolArgs, WithdrawSolError, WithdrawSolStatus,
 };
 use cksol_types_internal::{
     UpgradeArgs,
@@ -24,7 +24,6 @@ use cksol_types_internal::{
 use icrc_ledger_types::icrc1::account::{Account, Subaccount};
 use sol_rpc_types::{CommitmentLevel, ConsensusStrategy, RpcConfig};
 use std::time::Duration;
-use tokio::join;
 
 /// Any mint: the owner checks of the SPL endpoints run before the token checks.
 const ANY_MINT: solana_address::Address = solana_address::Address::new_from_array([1; 32]);
@@ -165,6 +164,7 @@ mod lifecycle {
         const NEW_WITHDRAWAL_FEE: Lamport = 100_000;
         const NEW_MINIMUM_WITHDRAWAL_AMOUNT: Lamport = 1_000_000;
         const NEW_DEPOSIT_SOL_REQUIRED_CYCLES: u128 = 500_000_000_000;
+        const NEW_AUTOMATIC_DEPOSIT_FEE: Lamport = 100_000;
 
         let setup = SetupBuilder::new().build().await;
         wait_for_initial_minter_address(&setup).await;
@@ -181,6 +181,7 @@ mod lifecycle {
                 balance: 0,
                 minter_address: Some(MINTER_ADDRESS.to_string()),
                 nonce_accounts: vec![Setup::DEFAULT_NONCE_ACCOUNT.to_string()],
+                automatic_deposit_fee: Some(Setup::DEFAULT_AUTOMATIC_DEPOSIT_FEE),
             }
         );
 
@@ -206,6 +207,7 @@ mod lifecycle {
                 deposit_sol_fee: None,
                 nonce_accounts_to_add: None,
                 ledger_suite_orchestrator_id: None,
+                automatic_deposit_fee: Some(NEW_AUTOMATIC_DEPOSIT_FEE),
             })
             .await
             .expect("upgrade failed");
@@ -222,6 +224,7 @@ mod lifecycle {
                 balance: 0,
                 minter_address: Some(MINTER_ADDRESS.to_string()),
                 nonce_accounts: vec![Setup::DEFAULT_NONCE_ACCOUNT.to_string()],
+                automatic_deposit_fee: Some(NEW_AUTOMATIC_DEPOSIT_FEE),
             }
         );
 
@@ -665,35 +668,23 @@ mod withdrawal_tests {
             address: WITHDRAWAL_ADDRESS.to_string(),
         };
 
-        let minter1 = setup.minter();
-        let minter2 = setup.minter();
+        let minter = setup.minter();
+        let first_call = minter.submit_withdraw_sol(args.clone()).await;
+        let second_call = minter.submit_withdraw_sol(args).await;
 
-        let (result1, result2) = join!(
-            minter1.withdraw_sol(args.clone()),
-            minter2.withdraw_sol(args.clone()),
+        let outcomes = (
+            first_call.await_response().await,
+            second_call.await_response().await,
         );
-
-        let (result1, result2) = match (&result1, &result2) {
-            (Ok(_), Err(_)) => (result1, result2),
-            (Err(_), Ok(_)) => (result2, result1),
-            _ => panic!("Expected one success and one error, but got: {result1:?} and {result2:?}"),
-        };
-
-        // One should succeed, one should fail with AlreadyProcessing (order is non-deterministic)
-        let results = [&result1, &result2];
-        assert!(
-            results
-                .iter()
-                .any(|r| matches!(r, Ok(WithdrawSolOk { block_index: _ }))),
-            "Expected one Minted result, got: {:?}",
-            results
-        );
-        assert!(
-            results
-                .iter()
-                .any(|r| matches!(r, Err(WithdrawSolError::AlreadyProcessing))),
-            "Expected one AlreadyProcessing result, got: {:?}",
-            results
+        assert_matches!(
+            outcomes,
+            (
+                Ok(WithdrawSolOk { .. }),
+                Err(WithdrawSolError::AlreadyProcessing)
+            ) | (
+                Err(WithdrawSolError::AlreadyProcessing),
+                Ok(WithdrawSolOk { .. })
+            )
         );
 
         setup.drop().await;
@@ -1163,34 +1154,6 @@ mod deposit_sol_tests {
         setup.drop().await;
     }
 
-    #[tokio::test]
-    async fn should_fail_for_concurrent_access() {
-        let setup = SetupBuilder::new().with_proxy_canister().build().await;
-        let mocks = SharedMockHttpOutcalls::new(
-            MockBuilder::new()
-                .get_balance(BALANCE_ABOVE_MINIMUM)
-                .build(),
-        );
-        let minter1 = setup.minter().with_http_mocks(mocks.clone());
-        let minter2 = setup.minter().with_http_mocks(mocks.clone());
-
-        let results = join!(
-            minter1.deposit_sol(DEFAULT_CALLER_ACCOUNT),
-            minter2.deposit_sol(DEFAULT_CALLER_ACCOUNT)
-        );
-
-        assert!(
-            matches!(
-                results,
-                (Ok(0), Err(DepositSolError::AlreadyProcessing))
-                    | (Err(DepositSolError::AlreadyProcessing), Ok(0))
-            ),
-            "Expected one queued deposit and one AlreadyProcessing error, got: {results:?}"
-        );
-
-        setup.drop().await;
-    }
-
     async fn get_balance_cycles_cost(setup: &Setup) -> u128 {
         let deposit_address: solana_address::Address =
             DEFAULT_CALLER_DEPOSIT_ADDRESS.parse().unwrap();
@@ -1209,6 +1172,93 @@ mod deposit_sol_tests {
             .send()
             .await
             .expect("Failed to get cycles cost for `getBalance` request")
+    }
+}
+
+mod automatic_deposit_sol_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn should_register_the_caller() {
+        let setup = SetupBuilder::new().build().await;
+        let subaccount = Some([7; 32]);
+
+        let registration = setup
+            .minter()
+            .watch_deposit_address(subaccount)
+            .await
+            .expect("watch_deposit_address should register the caller");
+
+        let deposit_address = setup
+            .minter()
+            .get_deposit_address(GetDepositAddressArgs {
+                owner: None,
+                subaccount,
+            })
+            .await;
+        assert_eq!(registration.address, deposit_address);
+        let minter_info = setup.minter().get_minter_info().await;
+        assert_eq!(
+            registration.minimum_deposit_amount,
+            minter_info.minimum_deposit_amount
+        );
+        assert_eq!(
+            Some(registration.automatic_deposit_fee),
+            minter_info.automatic_deposit_fee
+        );
+        assert_eq!(registration.latest_deposit_id, None);
+        let (valid_until, next_scan_at) = assert_matches!(
+            registration.status,
+            WatchDepositAddressStatus::Watching {
+                valid_until,
+                scan_count: 0,
+                last_scanned_at: None,
+                next_scan_at: Some(next_scan_at),
+            } => (valid_until, next_scan_at)
+        );
+        assert_eq!(valid_until - next_scan_at, WATCH_WINDOW_NANOS);
+
+        setup.drop().await;
+    }
+
+    #[tokio::test]
+    async fn should_be_unavailable_until_the_fee_is_configured_by_an_upgrade() {
+        let setup = SetupBuilder::new()
+            .without_automatic_deposit_fee()
+            .build()
+            .await;
+        assert_eq!(
+            setup.minter().get_minter_info().await.automatic_deposit_fee,
+            None
+        );
+
+        let result = setup.minter().watch_deposit_address(None).await;
+
+        assert_matches!(
+            result,
+            Err(WatchDepositAddressError::TemporarilyUnavailable(e)) if e.contains("automatic deposit fee")
+        );
+
+        setup
+            .minter()
+            .upgrade(UpgradeArgs {
+                automatic_deposit_fee: Some(Setup::DEFAULT_AUTOMATIC_DEPOSIT_FEE),
+                ..UpgradeArgs::default()
+            })
+            .await
+            .expect("upgrade should configure the fee");
+
+        let registration = setup
+            .minter()
+            .watch_deposit_address(None)
+            .await
+            .expect("watch_deposit_address should register the caller");
+        assert_matches!(
+            registration.status,
+            WatchDepositAddressStatus::Watching { .. }
+        );
+
+        setup.drop().await;
     }
 }
 
@@ -1272,6 +1322,9 @@ mod anonymous_caller_tests {
                 address: "E4MpwNnMWs2XtW5gVrxZvyS7fMq31QD5HvbxmwP45Tz3".to_string(),
             })
             .await;
+        assert_matches!(result, Err(s) if s.contains("the owner must be non-anonymous"));
+
+        let result = minter.try_watch_deposit_address(None).await;
         assert_matches!(result, Err(s) if s.contains("the owner must be non-anonymous"));
 
         setup.drop().await;

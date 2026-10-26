@@ -1,3 +1,4 @@
+pub mod automatic;
 mod finalize;
 mod mint;
 pub mod spl;

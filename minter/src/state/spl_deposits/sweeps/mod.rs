@@ -25,7 +25,7 @@ use thiserror::Error;
 mod tests;
 
 /// The SPL sweep transactions at one stage of the deposit lifecycle, keyed by signature.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SplSweeps {
     by_signature: BTreeMap<Signature, SplSweep>,
 }

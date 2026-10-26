@@ -16,7 +16,7 @@ mod sweeps;
 pub use sweeps::{SettledSplSweep, SplSweep, SplSweepRecoveryError, SplSweeps, SplTransfer};
 
 /// SPL deposits grouped by their progress towards a token mint.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SplDeposits {
     next_id: DepositSplId,
     queued: BTreeMap<DepositSplId, QueuedSplDeposit>,

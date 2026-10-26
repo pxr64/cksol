@@ -1,7 +1,10 @@
 use crate::{
     constants::RENT_EXEMPTION_THRESHOLD,
     numeric::LedgerMintIndex,
-    state::event::{CreditedDeposit, VersionedMessage},
+    state::{
+        Watchlist,
+        event::{CreditedDeposit, VersionedMessage},
+    },
 };
 use cksol_types::{DepositSolId, DepositSolStatus};
 use icrc_ledger_types::icrc1::account::Account;
@@ -52,7 +55,7 @@ mod tests;
 ///
 /// Every account has at most one deposit in flight, so that `deposit_sol` can report the
 /// deposit it is already tracking instead of queueing the same balance twice.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Deposits {
     next_id: DepositSolId,
     queued: BTreeMap<DepositSolId, QueuedDeposit>,
@@ -63,7 +66,9 @@ pub struct Deposits {
     dropped: BTreeMap<DepositSolId, SweptDeposit>,
     quarantined: BTreeMap<DepositSolId, QuarantinedDeposit>,
     in_flight_ids: BTreeMap<Account, DepositSolId>,
+    latest_ids: BTreeMap<Account, DepositSolId>,
     queued_at_by_id: BTreeMap<DepositSolId, u64>,
+    watchlist: Watchlist,
 }
 
 impl Deposits {
@@ -99,8 +104,45 @@ impl Deposits {
         &self.quarantined
     }
 
+    pub fn watchlist(&self) -> &Watchlist {
+        &self.watchlist
+    }
+
+    /// The watchlist is transient state: registrations are not recorded as events, so it is
+    /// mutated directly and carried across upgrades by a snapshot taken before the upgrade.
+    pub fn watchlist_mut(&mut self) -> &mut Watchlist {
+        &mut self.watchlist
+    }
+
     pub fn in_flight_id(&self, account: &Account) -> Option<DepositSolId> {
         self.in_flight_ids.get(account).copied()
+    }
+
+    /// The deposit of the account that is in flight, with whether it is still processed
+    /// or quarantined.
+    ///
+    /// # Panics
+    ///
+    /// If the in-flight deposit is minted, dropped or unknown, since such a deposit must
+    /// have released its account.
+    pub fn in_flight(&self, account: &Account) -> Option<InFlightDeposit> {
+        let deposit_id = self.in_flight_id(account)?;
+        Some(match self.status(deposit_id) {
+            DepositSolStatus::Queued { .. }
+            | DepositSolStatus::Swept { .. }
+            | DepositSolStatus::Finalized { .. } => InFlightDeposit::Processing(deposit_id),
+            DepositSolStatus::Quarantined { .. } => InFlightDeposit::Quarantined(deposit_id),
+            status @ (DepositSolStatus::Dropped { .. }
+            | DepositSolStatus::Minted { .. }
+            | DepositSolStatus::NotFound) => panic!(
+                "BUG: in-flight deposit {deposit_id} of account {account:?} has status {status:?}"
+            ),
+        })
+    }
+
+    /// The id of the latest deposit queued for the account, whatever stage it reached since.
+    pub fn latest_id(&self, account: &Account) -> Option<DepositSolId> {
+        self.latest_ids.get(account).copied()
     }
 
     /// Returns the timestamp (in nanoseconds) at which the oldest in-flight deposit was queued.
@@ -177,6 +219,8 @@ impl Deposits {
             "Attempted to queue a deposit for account {:?} that already has one in flight",
             deposit.account
         );
+        self.latest_ids.insert(deposit.account, deposit_id);
+        self.watchlist.remove(&deposit.account);
         self.queued.insert(deposit_id, deposit);
         self.queued_at_by_id.insert(deposit_id, queued_at);
         self.next_id += 1;
@@ -353,6 +397,17 @@ impl Deposits {
             },
         );
     }
+}
+
+/// The deposit that reserves its account: no other deposit can be queued for the account
+/// until it is minted or dropped, and a quarantined one keeps the account reserved until
+/// a minter upgrade resolves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InFlightDeposit {
+    /// The deposit is queued, swept or finalized.
+    Processing(DepositSolId),
+    /// The deposit is quarantined and keeps its account rejected until a minter upgrade.
+    Quarantined(DepositSolId),
 }
 
 /// A deposit address queued for a sweep to the minter's main account.

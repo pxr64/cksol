@@ -5,6 +5,7 @@ use icrc_ledger_types::icrc1::account::Account;
 use solana_address::Address;
 
 pub mod insertion_ordered_map;
+pub mod timed_sized_map;
 
 #[cfg(test)]
 mod tests;

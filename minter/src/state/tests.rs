@@ -5,8 +5,8 @@ use crate::{
     sol_transfer::MAX_SIGNATURES,
     state::{audit::process_event, read_state},
     test_fixtures::{
-        DEPOSIT_SOL_FEE, DEPOSIT_SOL_REQUIRED_CYCLES, MINIMUM_DEPOSIT_AMOUNT,
-        MINIMUM_WITHDRAWAL_AMOUNT, WITHDRAWAL_FEE, account, address,
+        AUTOMATIC_DEPOSIT_FEE, DEPOSIT_SOL_FEE, DEPOSIT_SOL_REQUIRED_CYCLES,
+        MINIMUM_DEPOSIT_AMOUNT, MINIMUM_WITHDRAWAL_AMOUNT, WITHDRAWAL_FEE, account, address,
         arb::arb_event,
         deposit_id,
         events::{
@@ -222,12 +222,9 @@ mod queued_deposits {
         let mut expected = State::try_from(valid_init_args()).unwrap();
         expected.cache_minter_public_key(crate::test_fixtures::schnorr_master_key());
         for deposit_id in 0..2 {
-            let deposit = queued_deposit(deposit_id);
             expected.process_queued_deposit(
                 deposit_id,
-                &deposit.account,
-                &deposit.address,
-                deposit.balance,
+                queued_deposit(deposit_id),
                 queued_at(deposit_id),
             );
         }
@@ -239,6 +236,28 @@ mod queued_deposits {
             replayed.deposits().oldest_in_flight_queued_at(),
             Some(queued_at(0))
         );
+    }
+}
+
+mod watched_deposit_addresses {
+    use super::*;
+    use crate::test_fixtures::{
+        MINIMUM_DEPOSIT_AMOUNT, REGISTERED_AT, at, flow::deposit::DepositFlow, watch,
+    };
+
+    #[test]
+    fn should_leave_the_watchlist_when_a_deposit_is_queued() {
+        init_state();
+        init_schnorr_master_key();
+        watch(at(REGISTERED_AT), account(1));
+        watch(at(REGISTERED_AT), account(2));
+
+        DepositFlow::queue(account(1), MINIMUM_DEPOSIT_AMOUNT);
+
+        read_state(|s| {
+            assert_eq!(s.watchlist().get(at(REGISTERED_AT), &account(1)), None);
+            assert!(s.watchlist().get(at(REGISTERED_AT), &account(2)).is_some());
+        });
     }
 }
 
@@ -707,22 +726,71 @@ mod state_validation {
                 }
             },
         );
+        let maximum_automatic_deposit_fee =
+            MINIMUM_DEPOSIT_AMOUNT - RENT_EXEMPTION_THRESHOLD - FEE_PER_SIGNATURE - 1;
+        assert_fails_both(
+            InitArgs {
+                automatic_deposit_fee: Some(maximum_automatic_deposit_fee + 1),
+                ..valid_init_args()
+            },
+            UpgradeArgs {
+                automatic_deposit_fee: Some(maximum_automatic_deposit_fee + 1),
+                ..Default::default()
+            },
+            |e| {
+                e == &InvalidStateError::AutomaticDepositFeeTooHigh {
+                    automatic_deposit_fee: maximum_automatic_deposit_fee + 1,
+                    max_automatic_deposit_fee: maximum_automatic_deposit_fee,
+                }
+            },
+        );
+        let minimum_deposit_amount_for_fee =
+            AUTOMATIC_DEPOSIT_FEE + RENT_EXEMPTION_THRESHOLD + FEE_PER_SIGNATURE;
+        assert_fails_both(
+            InitArgs {
+                minimum_deposit_amount: minimum_deposit_amount_for_fee,
+                ..valid_init_args()
+            },
+            UpgradeArgs {
+                minimum_deposit_amount: Some(minimum_deposit_amount_for_fee),
+                ..Default::default()
+            },
+            |e| matches!(e, InvalidStateError::AutomaticDepositFeeTooHigh { .. }),
+        );
+    }
+
+    #[test]
+    fn should_not_constrain_an_unconfigured_automatic_deposit_fee() {
+        let minimum_deposit_amount = 2 * RENT_EXEMPTION_THRESHOLD + FEE_PER_SIGNATURE;
+
+        State::try_from(InitArgs {
+            minimum_deposit_amount,
+            automatic_deposit_fee: None,
+            ..valid_init_args()
+        })
+        .unwrap();
     }
 
     #[test]
     fn should_succeed_at_boundary_conditions() {
         // minimum_deposit_amount can equal twice the rent exemption threshold + one signature fee
         let minimum_required = 2 * RENT_EXEMPTION_THRESHOLD + FEE_PER_SIGNATURE;
-        assert_succeeds_both(
-            InitArgs {
-                minimum_deposit_amount: minimum_required,
-                ..valid_init_args()
-            },
-            UpgradeArgs {
+        let init_args_without_automatic_deposit_fee = InitArgs {
+            automatic_deposit_fee: None,
+            ..valid_init_args()
+        };
+        State::try_from(InitArgs {
+            minimum_deposit_amount: minimum_required,
+            ..init_args_without_automatic_deposit_fee.clone()
+        })
+        .unwrap();
+        State::try_from(init_args_without_automatic_deposit_fee)
+            .unwrap()
+            .upgrade(UpgradeArgs {
                 minimum_deposit_amount: Some(minimum_required),
                 ..Default::default()
-            },
-        );
+            })
+            .unwrap();
         // minimum_withdrawal_amount can equal withdrawal_fee + rent exemption threshold
         let minimum_required = WITHDRAWAL_FEE + RENT_EXEMPTION_THRESHOLD;
         assert_succeeds_both(
@@ -754,6 +822,18 @@ mod state_validation {
             },
             UpgradeArgs {
                 deposit_sol_fee: Some(maximum_fee as u64),
+                ..Default::default()
+            },
+        );
+        let maximum_automatic_deposit_fee =
+            MINIMUM_DEPOSIT_AMOUNT - RENT_EXEMPTION_THRESHOLD - FEE_PER_SIGNATURE - 1;
+        assert_succeeds_both(
+            InitArgs {
+                automatic_deposit_fee: Some(maximum_automatic_deposit_fee),
+                ..valid_init_args()
+            },
+            UpgradeArgs {
+                automatic_deposit_fee: Some(maximum_automatic_deposit_fee),
                 ..Default::default()
             },
         );
@@ -799,6 +879,7 @@ mod state_from_init_args {
                 minimum_withdrawal_amount: MINIMUM_WITHDRAWAL_AMOUNT,
                 minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
                 deposit_sol_required_cycles: DEPOSIT_SOL_REQUIRED_CYCLES,
+                automatic_deposit_fee: Some(AUTOMATIC_DEPOSIT_FEE),
                 pending_deposit_sol_request_guards: BTreeSet::new(),
                 pending_deposit_spl_request_guards: BTreeSet::new(),
                 pending_withdrawal_request_guards: BTreeSet::new(),
@@ -872,6 +953,7 @@ mod state_upgrade {
         let new_minimum_withdrawal_amount = MINIMUM_WITHDRAWAL_AMOUNT * 2;
         let new_withdrawal_fee = WITHDRAWAL_FEE / 2;
         let new_deposit_sol_required_cycles = (DEPOSIT_SOL_REQUIRED_CYCLES * 2) as u64;
+        let new_automatic_deposit_fee = AUTOMATIC_DEPOSIT_FEE * 2;
 
         let mut state = initial_state();
         state
@@ -930,6 +1012,38 @@ mod state_upgrade {
             state.deposit_sol_required_cycles(),
             new_deposit_sol_required_cycles as u128
         );
+
+        let mut state = initial_state();
+        state
+            .upgrade(UpgradeArgs {
+                automatic_deposit_fee: Some(new_automatic_deposit_fee),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            state.automatic_deposit_fee(),
+            Some(new_automatic_deposit_fee)
+        );
+    }
+
+    #[test]
+    fn should_keep_the_automatic_deposit_fee_when_the_upgrade_omits_it() {
+        let mut state = State::try_from(InitArgs {
+            automatic_deposit_fee: None,
+            ..valid_init_args()
+        })
+        .unwrap();
+        assert_eq!(state.automatic_deposit_fee(), None);
+
+        state
+            .upgrade(UpgradeArgs {
+                automatic_deposit_fee: Some(AUTOMATIC_DEPOSIT_FEE),
+                ..Default::default()
+            })
+            .unwrap();
+        state.upgrade(UpgradeArgs::default()).unwrap();
+
+        assert_eq!(state.automatic_deposit_fee(), Some(AUTOMATIC_DEPOSIT_FEE));
     }
 
     #[test]
