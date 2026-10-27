@@ -11,21 +11,22 @@ use icrc_ledger_types::{
 };
 use num_traits::cast::ToPrimitive;
 use sol_rpc_types::Lamport;
-use solana_address::Address;
 use thiserror::Error;
 
 pub mod client;
 pub mod spl;
 
+#[cfg(test)]
+mod tests;
+
+/// Burns ckSOL on the configured ledger with the supplied withdrawal memo.
 pub async fn burn<R: CanisterRuntime>(
     runtime: &R,
     minter_account: Account,
     from: Account,
     burn_amount: Lamport,
-    to_address: Address,
+    burn_memo: Memo,
 ) -> Result<u64, BurnError> {
-    let burn_memo = BurnMemo::convert(to_address);
-
     let result = read_state(|state| state.ledger_client(runtime.inter_canister_call_runtime()))
         .transfer_from(TransferFromArgs {
             spender_subaccount: None,
@@ -35,7 +36,7 @@ pub async fn burn<R: CanisterRuntime>(
             // TODO DEFI-2671 If we deduplicate we probably want to do it on the Account level with a guard
             // and not using the ledger deduplication mechanism.
             created_at_time: None,
-            memo: Some(Memo::from(burn_memo).into()),
+            memo: Some(burn_memo.into()),
             amount: NumTokens::from(burn_amount),
         })
         .await;
@@ -59,7 +60,7 @@ pub async fn burn<R: CanisterRuntime>(
 
     log!(
         Priority::Info,
-        "Burned {burn_amount} lamports from {from:?} for withdrawal to {to_address} (ledger block index {block_index})"
+        "Burned {burn_amount} lamports from {from:?} (ledger block index {block_index})"
     );
 
     Ok(block_index)

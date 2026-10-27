@@ -4,8 +4,14 @@ use crate::{
     state::{TokenProgram, audit::process_event, event::EventType, mutate_state},
     test_fixtures::{
         EventsAssert, MINTER_ADDRESS, NONCE_ACCOUNT, account, init_schnorr_master_key, init_state,
-        runtime::TestCanisterRuntime, spl_token,
+        ledger_canister_id, runtime::TestCanisterRuntime, spl_token,
     },
+};
+use candid::Nat;
+use ic_canister_runtime::IcError;
+use icrc_ledger_types::{
+    icrc1::account::Account,
+    icrc2::transfer_from::{TransferFromArgs, TransferFromError},
 };
 
 fn register_token(token_program: TokenProgram) -> SupportedSplToken {
@@ -25,6 +31,28 @@ fn assert_only_registration(token: SupportedSplToken) {
     EventsAssert::from_recorded()
         .expect_event_eq(EventType::AddedSplToken(token))
         .assert_no_more_events();
+}
+
+fn withdrawal_terms(token: &SupportedSplToken) -> SplWithdrawalRequestTerms {
+    SplWithdrawalRequestTerms {
+        account: Account {
+            subaccount: Some([7; 32]),
+            ..account(1)
+        },
+        mint: token.mint,
+        ledger_id: token.ledger_id,
+        address: "E4MpwNnMWs2XtW5gVrxZvyS7fMq31QD5HvbxmwP45Tz3"
+            .parse()
+            .unwrap(),
+        amount: u64::MAX,
+        fee: quote_withdrawal_fee(
+            read_state(|state| state.withdrawal_fee()),
+            token.token_program,
+            true,
+        )
+        .unwrap(),
+        create_destination_account: true,
+    }
 }
 
 #[test]
@@ -201,4 +229,119 @@ fn should_reject_a_fee_that_overflows_when_rent_is_added() {
             Err(WithdrawSplError::TemporarilyUnavailable(_))
         ));
     }
+}
+
+#[tokio::test]
+async fn should_record_the_fee_checkpoint_after_the_cksol_burn() {
+    init_state();
+    init_schnorr_master_key();
+    let token = register_token(TokenProgram::Classic);
+    let request = withdrawal_terms(&token);
+    let _guard = withdrawal_guard(request.account).unwrap();
+    let runtime = TestCanisterRuntime::new()
+        .add_stub_response(Ok::<Nat, TransferFromError>(42_u64.into()))
+        .with_time(123);
+
+    assert_eq!(burn_withdrawal_fee(&runtime, &request).await, Ok(42.into()));
+
+    let calls = runtime.sent_update_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].canister_id, ledger_canister_id());
+    assert_eq!(calls[0].method, "icrc2_transfer_from");
+    assert_eq!(
+        calls[0].single_arg::<TransferFromArgs>(),
+        TransferFromArgs {
+            spender_subaccount: None,
+            from: request.account,
+            to: runtime.canister_self().into(),
+            amount: request.fee.into(),
+            fee: None,
+            memo: Some(
+                Memo::spl_withdrawal_fee(request.mint, request.amount, request.address).into()
+            ),
+            created_at_time: None,
+        }
+    );
+    EventsAssert::from_recorded()
+        .expect_event_eq(EventType::AddedSplToken(token))
+        .expect_event_eq(EventType::BurnedCkSolWithdrawalFee {
+            cksol_burn_block_index: 42.into(),
+            request: request.clone(),
+        })
+        .assert_no_more_events();
+    read_state(|state| {
+        assert_eq!(state.fee_burned_spl_withdrawal_requests().len(), 1);
+        assert_eq!(
+            state.fee_burned_spl_withdrawal_requests()[&42.into()],
+            crate::state::FeeBurnedSplWithdrawalRequest {
+                request: request.clone(),
+                created_at: 123,
+            }
+        );
+        assert!(state.pending_spl_withdrawal_requests().is_empty());
+        assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
+    });
+    // The caller retains the guard for the next token burn.
+    assert_eq!(
+        withdrawal_guard(request.account).err(),
+        Some(GuardError::AlreadyProcessing)
+    );
+}
+
+#[tokio::test]
+async fn should_not_record_a_fee_checkpoint_when_the_ledger_rejects_the_burn() {
+    init_state();
+    let token = register_token(TokenProgram::Classic);
+    let request = withdrawal_terms(&token);
+    let _guard = withdrawal_guard(request.account).unwrap();
+    for (error, expected) in [
+        (
+            TransferFromError::InsufficientFunds {
+                balance: 10_u64.into(),
+            },
+            BurnError::InsufficientFunds { balance: 10 },
+        ),
+        (
+            TransferFromError::InsufficientAllowance {
+                allowance: 20_u64.into(),
+            },
+            BurnError::InsufficientAllowance { allowance: 20 },
+        ),
+        (
+            TransferFromError::TemporarilyUnavailable,
+            BurnError::TemporarilyUnavailable("Ledger is temporarily unavailable".to_string()),
+        ),
+    ] {
+        let runtime = TestCanisterRuntime::new().add_stub_response(Err::<Nat, _>(error));
+
+        assert_eq!(burn_withdrawal_fee(&runtime, &request).await, Err(expected));
+
+        assert_eq!(runtime.sent_update_calls().len(), 1);
+        assert_only_registration(token.clone());
+        read_state(|state| {
+            assert!(state.fee_burned_spl_withdrawal_requests().is_empty());
+            assert!(state.pending_spl_withdrawal_requests().is_empty());
+            assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
+        });
+    }
+}
+
+#[tokio::test]
+async fn should_not_record_a_fee_checkpoint_when_the_ledger_call_fails() {
+    init_state();
+    let token = register_token(TokenProgram::Classic);
+    let request = withdrawal_terms(&token);
+    let _guard = withdrawal_guard(request.account).unwrap();
+    let runtime = TestCanisterRuntime::new().add_stub_error(IcError::CallPerformFailed);
+
+    assert!(matches!(burn_withdrawal_fee(&runtime, &request).await,
+        Err(BurnError::TemporarilyUnavailable(message)) if message.contains("Failed to burn tokens")));
+
+    assert_eq!(runtime.sent_update_calls().len(), 1);
+    assert_only_registration(token);
+    read_state(|state| {
+        assert!(state.fee_burned_spl_withdrawal_requests().is_empty());
+        assert!(state.pending_spl_withdrawal_requests().is_empty());
+        assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
+    });
 }

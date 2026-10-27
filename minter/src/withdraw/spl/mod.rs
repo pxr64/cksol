@@ -1,8 +1,17 @@
 use crate::{
     address::{associated_token_address, minter_address, minter_public_key},
     guard::GuardError,
-    state::{SupportedSplToken, TokenProgram, read_state},
+    ledger::{self, BurnError},
+    numeric::LedgerBurnIndex,
+    runtime::CanisterRuntime,
+    state::{
+        SupportedSplToken, TokenProgram,
+        audit::process_event,
+        event::{EventType, SplWithdrawalRequestTerms},
+        mutate_state, read_state,
+    },
 };
+use cksol_types::Memo;
 use sol_rpc_types::Lamport;
 use solana_address::Address;
 use std::str::FromStr;
@@ -107,4 +116,33 @@ pub fn quote_withdrawal_fee(
             "SPL withdrawal fee exceeds the maximum lamport amount".to_string(),
         )
     })
+}
+
+/// Burns the ckSOL fee and saves the terms before the token burn is attempted.
+/// The caller must validate the terms and hold the account withdrawal guard
+/// across both burns.
+pub async fn burn_withdrawal_fee<R: CanisterRuntime>(
+    runtime: &R,
+    request: &SplWithdrawalRequestTerms,
+) -> Result<LedgerBurnIndex, BurnError> {
+    let burn_index = ledger::burn(
+        runtime,
+        runtime.canister_self().into(),
+        request.account,
+        request.fee,
+        Memo::spl_withdrawal_fee(request.mint, request.amount, request.address),
+    )
+    .await?;
+    let cksol_burn_block_index = LedgerBurnIndex::new(burn_index);
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::BurnedCkSolWithdrawalFee {
+                cksol_burn_block_index,
+                request: request.clone(),
+            },
+            runtime,
+        );
+    });
+    Ok(cksol_burn_block_index)
 }

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use cksol_types::{WithdrawSolError, WithdrawSolOk, WithdrawSolStatus};
+use cksol_types::{BurnMemo, Memo, WithdrawSolError, WithdrawSolOk, WithdrawSolStatus};
 use icrc_ledger_types::icrc1::account::Account;
 use sol_rpc_types::Lamport;
 use solana_address::Address;
@@ -69,7 +69,7 @@ pub async fn withdraw<R: CanisterRuntime>(
         minter_account,
         from,
         amount_to_burn,
-        solana_address,
+        Memo::from(BurnMemo::convert(solana_address)),
     )
     .await
     .map_err(|e| match e {

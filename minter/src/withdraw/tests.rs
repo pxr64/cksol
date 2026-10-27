@@ -188,6 +188,19 @@ async fn should_return_ok_if_burn_succeeds() {
             block_index: 123u64
         })
     );
+    let calls = runtime.sent_update_calls();
+    assert_eq!(calls.len(), 1);
+    let args = calls[0].single_arg::<icrc_ledger_types::icrc2::transfer_from::TransferFromArgs>();
+    let mut expected_memo = vec![0x82, 1, 0x81, 0x82, 0, 0x81, 0x58, 0x20];
+    expected_memo.extend_from_slice(
+        &VALID_ADDRESS
+            .parse::<solana_address::Address>()
+            .unwrap()
+            .to_bytes(),
+    );
+    assert_eq!(args.memo.unwrap().0.as_ref(), expected_memo.as_slice());
+    assert_eq!(args.amount, Nat::from(MINIMUM_WITHDRAWAL_AMOUNT));
+    assert_eq!(args.created_at_time, None);
 }
 
 #[tokio::test]
