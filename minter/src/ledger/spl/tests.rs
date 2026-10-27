@@ -6,13 +6,6 @@ const LEDGER_ID: Principal = Principal::from_slice(&[1; 10]);
 const CREATED_AT_TIME: u64 = 123_456;
 const AMOUNT: u64 = 1_000_000;
 
-fn minting_account() -> Account {
-    Account {
-        owner: Principal::from_slice(&[2; 10]),
-        subaccount: Some([3; 32]),
-    }
-}
-
 fn from_account() -> Account {
     Account {
         owner: Principal::from_slice(&[4; 10]),
@@ -28,7 +21,6 @@ async fn burn_tokens(runtime: &TestCanisterRuntime) -> Result<u64, BurnError> {
     burn(
         runtime,
         LEDGER_ID,
-        minting_account(),
         from_account(),
         AMOUNT,
         burn_memo(),
@@ -53,7 +45,7 @@ async fn should_burn_on_token_ledger_with_fixed_arguments() {
         TransferFromArgs {
             spender_subaccount: None,
             from: from_account(),
-            to: minting_account(),
+            to: runtime.canister_self().into(),
             amount: AMOUNT.into(),
             fee: None,
             memo: Some(Memo::from(burn_memo()).into()),
@@ -140,32 +132,4 @@ async fn should_keep_too_old_after_unknown_outcome_as_an_error() {
         calls[0].single_arg::<TransferFromArgs>(),
         calls[1].single_arg::<TransferFromArgs>()
     );
-}
-
-#[tokio::test]
-async fn should_read_token_ledger_minting_account() {
-    for account in [Some(minting_account()), None] {
-        let runtime = TestCanisterRuntime::new().add_stub_response(account);
-        let client = LedgerClient::new(runtime.inter_canister_call_runtime(), LEDGER_ID);
-
-        assert_eq!(client.minting_account().await, Ok(account));
-
-        let calls = runtime.sent_update_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].canister_id, LEDGER_ID);
-        assert_eq!(calls[0].method, "icrc1_minting_account");
-        calls[0].args::<()>();
-    }
-}
-
-#[tokio::test]
-async fn should_propagate_minting_account_call_error() {
-    let runtime = TestCanisterRuntime::new().add_stub_error(IcError::CallPerformFailed);
-    let client = LedgerClient::new(runtime.inter_canister_call_runtime(), LEDGER_ID);
-
-    assert_eq!(
-        client.minting_account().await,
-        Err(IcError::CallPerformFailed)
-    );
-    assert_eq!(runtime.sent_update_calls().len(), 1);
 }

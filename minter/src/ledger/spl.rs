@@ -24,16 +24,15 @@ pub enum BurnError {
     TransferFrom(TransferFromError),
 }
 
-/// Burns ckSPL on the registered token ledger using its minting account.
+/// Burns ckSPL on its registered ledger, whose minting account is this minter's
+/// default account, as on the ckSOL ledger.
 ///
-/// The caller must resolve and persist the minting account and all burn arguments
-/// before the first attempt, and reuse them unchanged on retries. In particular,
+/// Any retry must reuse the original burn arguments. In particular,
 /// a call error can leave the burn outcome unknown. A later `TooOld` response does
 /// not prove that an earlier attempt failed; it requires reconciliation.
 pub async fn burn<R: CanisterRuntime>(
     runtime: &R,
     ledger_id: Principal,
-    minting_account: Account,
     from: Account,
     burn_amount: u64,
     burn_memo: BurnMemo,
@@ -43,7 +42,7 @@ pub async fn burn<R: CanisterRuntime>(
         .transfer_from(TransferFromArgs {
             spender_subaccount: None,
             from,
-            to: minting_account,
+            to: runtime.canister_self().into(),
             fee: None,
             created_at_time: Some(created_at_time),
             memo: Some(Memo::from(burn_memo).into()),

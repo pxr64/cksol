@@ -38,6 +38,7 @@ const _: () = assert!(MAX_CONCURRENT_SIGNATURES <= MAX_CONCURRENT_RPC_CALLS);
 
 pub mod nonce;
 mod reserved_account_keys;
+pub mod spl;
 #[cfg(test)]
 mod tests;
 
@@ -104,21 +105,37 @@ pub async fn withdraw<R: CanisterRuntime>(
     Ok(WithdrawSolOk { block_index })
 }
 
-fn validate_destination(destination: &Address) -> Result<(), WithdrawSolError> {
+enum DestinationError {
+    InvalidDestination(String),
+    TemporarilyUnavailable(String),
+}
+
+impl From<DestinationError> for WithdrawSolError {
+    fn from(error: DestinationError) -> Self {
+        match error {
+            DestinationError::InvalidDestination(message) => Self::InvalidDestination(message),
+            DestinationError::TemporarilyUnavailable(message) => {
+                Self::TemporarilyUnavailable(message)
+            }
+        }
+    }
+}
+
+fn validate_destination(destination: &Address) -> Result<(), DestinationError> {
     if reserved_account_keys::is_reserved_account_key(destination) {
-        return Err(WithdrawSolError::InvalidDestination(format!(
+        return Err(DestinationError::InvalidDestination(format!(
             "{destination} is an account key reserved by the Solana runtime"
         )));
     }
     if read_state(|s| s.nonce_pool().contains(destination)) {
-        return Err(WithdrawSolError::InvalidDestination(format!(
+        return Err(DestinationError::InvalidDestination(format!(
             "{destination} is a durable nonce account of the ckSOL minter"
         )));
     }
     let master_key =
-        minter_public_key().map_err(|e| WithdrawSolError::TemporarilyUnavailable(e.to_string()))?;
+        minter_public_key().map_err(|e| DestinationError::TemporarilyUnavailable(e.to_string()))?;
     if destination == &minter_address(&master_key) {
-        return Err(WithdrawSolError::InvalidDestination(format!(
+        return Err(DestinationError::InvalidDestination(format!(
             "{destination} is the ckSOL minter's main address"
         )));
     }
