@@ -906,6 +906,7 @@ mod state_from_init_args {
                 fee_burned_spl_withdrawal_requests: BTreeMap::new(),
                 pending_spl_withdrawal_requests: BTreeMap::new(),
                 spl_withdrawal_token_burns: BTreeSet::new(),
+                pending_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
             }
         );
     }

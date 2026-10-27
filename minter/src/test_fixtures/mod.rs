@@ -1992,6 +1992,17 @@ pub mod arb {
                     )
                 },
             ),
+            (arb_ledger_burn_index(), any::<u64>(), arb_account()).prop_map(
+                |(cksol_burn_block_index, reimbursed_amount, to)| {
+                    EventType::FailedSplWithdrawalRequest(
+                        crate::state::event::SplWithdrawalFeeReimbursementRequest {
+                            cksol_burn_block_index,
+                            reimbursed_amount,
+                            to,
+                        },
+                    )
+                },
+            ),
         ]
     }
 

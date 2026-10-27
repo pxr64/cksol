@@ -268,6 +268,15 @@ pub enum EventType {
         /// The amount burn index on the ckSPL ledger.
         ckspl_burn_block_index: u64,
     },
+    /// The token burn definitively failed; reimburse the already burned ckSOL fee.
+    FailedSplWithdrawalRequest {
+        /// The ckSOL fee burn index, also the withdrawal identifier.
+        cksol_burn_block_index: u64,
+        /// The ckSOL amount to mint back, in lamports.
+        reimbursed_amount: Lamport,
+        /// The account from which the ckSOL fee was burned.
+        to: Account,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

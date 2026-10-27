@@ -865,6 +865,12 @@ type EventType = variant {
         cksol_burn_block_index : nat64;
         ckspl_burn_block_index : nat64;
     };
+    // The token burn definitively failed; reimburse the already burned ckSOL fee.
+    FailedSplWithdrawalRequest : record {
+        cksol_burn_block_index : nat64;
+        reimbursed_amount : Lamport;
+        to : Account;
+    };
 };
 
 // A minter event.

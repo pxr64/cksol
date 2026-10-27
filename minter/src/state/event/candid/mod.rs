@@ -7,8 +7,9 @@ use crate::{
     state::{
         DepositBalance, SupportedSplToken, TokenProgram,
         event::{
-            CreditedDeposit, CreditedSplDeposit, Event, EventType, Signer, SplWithdrawalRequest,
-            SplWithdrawalRequestTerms, TransactionPurpose, VersionedMessage, WithdrawalRequest,
+            CreditedDeposit, CreditedSplDeposit, Event, EventType, Signer,
+            SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest, SplWithdrawalRequestTerms,
+            TransactionPurpose, VersionedMessage, WithdrawalRequest,
         },
     },
 };
@@ -208,6 +209,13 @@ impl From<EventType> for CandidEventType {
                     create_destination_account: request.create_destination_account,
                     cksol_burn_block_index: *request.cksol_burn_block_index.get(),
                     ckspl_burn_block_index: *request.ckspl_burn_block_index.get(),
+                }
+            }
+            EventType::FailedSplWithdrawalRequest(request) => {
+                CandidEventType::FailedSplWithdrawalRequest {
+                    cksol_burn_block_index: *request.cksol_burn_block_index.get(),
+                    reimbursed_amount: request.reimbursed_amount,
+                    to: request.to,
                 }
             }
         }
@@ -492,6 +500,15 @@ impl TryFrom<CandidEventType> for EventType {
                 create_destination_account,
                 cksol_burn_block_index: LedgerBurnIndex::new(cksol_burn_block_index),
                 ckspl_burn_block_index: LedgerBurnIndex::new(ckspl_burn_block_index),
+            }),
+            CandidEventType::FailedSplWithdrawalRequest {
+                cksol_burn_block_index,
+                reimbursed_amount,
+                to,
+            } => EventType::FailedSplWithdrawalRequest(SplWithdrawalFeeReimbursementRequest {
+                cksol_burn_block_index: LedgerBurnIndex::new(cksol_burn_block_index),
+                reimbursed_amount,
+                to,
             }),
         })
     }

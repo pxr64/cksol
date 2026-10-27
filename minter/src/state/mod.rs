@@ -9,8 +9,8 @@ use crate::{
         build_batch_withdrawal_message,
     },
     state::event::{
-        CreditedDeposit, Signer, SplWithdrawalRequest, SplWithdrawalRequestTerms,
-        TransactionPurpose, VersionedMessage, WithdrawalRequest,
+        CreditedDeposit, Signer, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
+        SplWithdrawalRequestTerms, TransactionPurpose, VersionedMessage, WithdrawalRequest,
     },
     utils::insertion_ordered_map::InsertionOrderedMap,
 };
@@ -154,6 +154,8 @@ pub struct State {
     fee_burned_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, FeeBurnedSplWithdrawalRequest>,
     pending_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest>,
     spl_withdrawal_token_burns: BTreeSet<(Principal, LedgerBurnIndex)>,
+    pending_spl_withdrawal_fee_reimbursements:
+        BTreeMap<LedgerBurnIndex, PendingSplWithdrawalFeeReimbursement>,
 }
 
 impl State {
@@ -785,6 +787,12 @@ impl State {
         &self.pending_spl_withdrawal_requests
     }
 
+    pub fn pending_spl_withdrawal_fee_reimbursements(
+        &self,
+    ) -> &BTreeMap<LedgerBurnIndex, PendingSplWithdrawalFeeReimbursement> {
+        &self.pending_spl_withdrawal_fee_reimbursements
+    }
+
     fn process_burned_cksol_withdrawal_fee(
         &mut self,
         cksol_burn_block_index: LedgerBurnIndex,
@@ -807,6 +815,9 @@ impl State {
                 .contains_key(&cksol_burn_block_index)
                 && !self
                     .pending_spl_withdrawal_requests
+                    .contains_key(&cksol_burn_block_index)
+                && !self
+                    .pending_spl_withdrawal_fee_reimbursements
                     .contains_key(&cksol_burn_block_index),
             "SPL withdrawal {cksol_burn_block_index} already has a fee burn"
         );
@@ -849,6 +860,48 @@ impl State {
         self.pending_spl_withdrawal_requests.insert(
             cksol_burn_block_index,
             PendingSplWithdrawalRequest {
+                request: request.clone(),
+                fee_burned_at: fee_burn.created_at,
+                created_at,
+            },
+        );
+    }
+
+    fn process_failed_spl_withdrawal(
+        &mut self,
+        request: &SplWithdrawalFeeReimbursementRequest,
+        created_at: u64,
+    ) {
+        let burn_index = request.cksol_burn_block_index;
+        assert!(
+            !self
+                .pending_spl_withdrawal_fee_reimbursements
+                .contains_key(&burn_index),
+            "SPL withdrawal {burn_index} already has a fee reimbursement"
+        );
+        let fee_burn = self
+            .fee_burned_spl_withdrawal_requests
+            .get(&burn_index)
+            .expect("Reimbursing an SPL withdrawal requires a recorded fee burn");
+        assert_eq!(
+            request.to, fee_burn.request.account,
+            "The SPL withdrawal fee must be reimbursed to the original account"
+        );
+        assert!(
+            request.reimbursed_amount > 0,
+            "SPL withdrawal fee reimbursement must be positive"
+        );
+        assert!(
+            request.reimbursed_amount <= fee_burn.request.fee,
+            "The SPL withdrawal reimbursement must not exceed the burned fee"
+        );
+        let fee_burn = self
+            .fee_burned_spl_withdrawal_requests
+            .remove(&burn_index)
+            .expect("BUG: the checked fee burn must exist");
+        self.pending_spl_withdrawal_fee_reimbursements.insert(
+            burn_index,
+            PendingSplWithdrawalFeeReimbursement {
                 request: request.clone(),
                 fee_burned_at: fee_burn.created_at,
                 created_at,
@@ -1294,6 +1347,7 @@ impl TryFrom<InitArgs> for State {
             fee_burned_spl_withdrawal_requests: BTreeMap::new(),
             pending_spl_withdrawal_requests: BTreeMap::new(),
             spl_withdrawal_token_burns: BTreeSet::new(),
+            pending_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
         };
         state.validate()?;
         Ok(state)
@@ -1311,6 +1365,14 @@ pub struct FeeBurnedSplWithdrawalRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingSplWithdrawalRequest {
     pub request: SplWithdrawalRequest,
+    pub fee_burned_at: u64,
+    pub created_at: u64,
+}
+
+/// A failed token burn awaiting reimbursement of its ckSOL fee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSplWithdrawalFeeReimbursement {
+    pub request: SplWithdrawalFeeReimbursementRequest,
     pub fee_burned_at: u64,
     pub created_at: u64,
 }

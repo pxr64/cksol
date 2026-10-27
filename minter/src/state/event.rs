@@ -327,6 +327,23 @@ pub enum EventType {
     /// The token burn succeeded and the withdrawal was accepted for processing.
     #[n(26)]
     AcceptedSplWithdrawalRequest(#[n(0)] SplWithdrawalRequest),
+    /// The token burn definitively failed; reimburse the already burned ckSOL fee.
+    #[n(27)]
+    FailedSplWithdrawalRequest(#[n(0)] SplWithdrawalFeeReimbursementRequest),
+}
+
+/// A ckSOL fee reimbursement for an SPL withdrawal whose token burn failed.
+#[derive(Clone, Debug, PartialEq, Eq, Decode, Encode)]
+pub struct SplWithdrawalFeeReimbursementRequest {
+    /// The ckSOL fee burn index, also the withdrawal identifier.
+    #[cbor(n(0), with = "cbor::id")]
+    pub cksol_burn_block_index: LedgerBurnIndex,
+    /// The ckSOL amount to mint back, in lamports.
+    #[n(1)]
+    pub reimbursed_amount: Lamport,
+    /// The account from which the ckSOL fee was burned.
+    #[n(2)]
+    pub to: Account,
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

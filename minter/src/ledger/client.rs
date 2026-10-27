@@ -42,6 +42,12 @@ impl<R: Runtime> LedgerClient<R> {
 }
 
 impl<R: Runtime> LedgerClient<R> {
+    pub async fn minting_account(&self) -> Result<Option<Account>, IcError> {
+        self.runtime
+            .update_call(self.ledger_canister_id, "icrc1_minting_account", (), 0)
+            .await
+    }
+
     pub async fn balance_of(&self, account: Account) -> Result<Nat, IcError> {
         self.runtime
             .update_call(self.ledger_canister_id, "icrc1_balance_of", (account,), 0)

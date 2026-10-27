@@ -15,6 +15,7 @@ use solana_address::Address;
 use thiserror::Error;
 
 pub mod client;
+pub mod spl;
 
 pub async fn burn<R: CanisterRuntime>(
     runtime: &R,

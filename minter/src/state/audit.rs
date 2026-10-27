@@ -154,6 +154,9 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
         EventType::AcceptedSplWithdrawalRequest(request) => {
             state.process_accepted_spl_withdrawal(request, timestamp);
         }
+        EventType::FailedSplWithdrawalRequest(request) => {
+            state.process_failed_spl_withdrawal(request, timestamp);
+        }
     }
 }
 
