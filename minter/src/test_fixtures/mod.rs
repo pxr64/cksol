@@ -1942,10 +1942,67 @@ pub mod arb {
         ]
     }
 
+    fn arb_spl_withdrawal_event_type() -> impl Strategy<Value = EventType> {
+        let request = (
+            arb_account(),
+            arb_address(),
+            arb_principal(),
+            arb_address(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(account, mint, ledger_id, address, amount, fee, create_destination_account)| {
+                    crate::state::event::SplWithdrawalRequestTerms {
+                        account,
+                        mint,
+                        ledger_id,
+                        address,
+                        amount,
+                        fee,
+                        create_destination_account,
+                    }
+                },
+            )
+            .boxed();
+        prop_oneof![
+            (arb_ledger_burn_index(), request.clone()).prop_map(
+                |(cksol_burn_block_index, request)| {
+                    EventType::BurnedCkSolWithdrawalFee {
+                        cksol_burn_block_index,
+                        request,
+                    }
+                }
+            ),
+            (arb_ledger_burn_index(), arb_ledger_burn_index(), request).prop_map(
+                |(cksol_burn_block_index, ckspl_burn_block_index, terms)| {
+                    EventType::AcceptedSplWithdrawalRequest(
+                        crate::state::event::SplWithdrawalRequest {
+                            account: terms.account,
+                            mint: terms.mint,
+                            ledger_id: terms.ledger_id,
+                            address: terms.address,
+                            amount: terms.amount,
+                            fee: terms.fee,
+                            create_destination_account: terms.create_destination_account,
+                            cksol_burn_block_index,
+                            ckspl_burn_block_index,
+                        },
+                    )
+                },
+            ),
+        ]
+    }
+
     pub fn arb_event() -> impl Strategy<Value = Event> {
         (
             any::<u64>(),
-            prop_oneof![arb_event_type(), arb_spl_event_type()],
+            prop_oneof![
+                arb_event_type(),
+                arb_spl_event_type(),
+                arb_spl_withdrawal_event_type()
+            ],
         )
             .prop_map(|(timestamp, payload)| Event { timestamp, payload })
     }

@@ -7,14 +7,15 @@ use crate::{
     state::{
         DepositBalance, SupportedSplToken, TokenProgram,
         event::{
-            CreditedDeposit, CreditedSplDeposit, Event, EventType, Signer, TransactionPurpose,
-            VersionedMessage, WithdrawalRequest,
+            CreditedDeposit, CreditedSplDeposit, Event, EventType, Signer, SplWithdrawalRequest,
+            SplWithdrawalRequestTerms, TransactionPurpose, VersionedMessage, WithdrawalRequest,
         },
     },
 };
 use cksol_types_internal::event::{
     CreditedDeposit as CandidCreditedDeposit, CreditedSplDeposit as CandidCreditedSplDeposit,
     Event as CandidEvent, EventType as CandidEventType, Signer as CandidSigner,
+    SplWithdrawalRequestTerms as CandidSplWithdrawalRequestTerms,
     TransactionPurpose as CandidTransactionPurpose, VersionedTransactionMessage,
 };
 use ic_ed25519::PublicKey;
@@ -189,6 +190,26 @@ impl From<EventType> for CandidEventType {
                 burn_block_index: *burn_block_index.get(),
                 amount,
             },
+            EventType::BurnedCkSolWithdrawalFee {
+                cksol_burn_block_index,
+                request,
+            } => CandidEventType::BurnedCkSolWithdrawalFee {
+                cksol_burn_block_index: *cksol_burn_block_index.get(),
+                request: request.into(),
+            },
+            EventType::AcceptedSplWithdrawalRequest(request) => {
+                CandidEventType::AcceptedSplWithdrawalRequest {
+                    account: request.account,
+                    mint: request.mint.into(),
+                    ledger_id: request.ledger_id,
+                    address: request.address.into(),
+                    amount: request.amount,
+                    fee: request.fee,
+                    create_destination_account: request.create_destination_account,
+                    cksol_burn_block_index: *request.cksol_burn_block_index.get(),
+                    ckspl_burn_block_index: *request.ckspl_burn_block_index.get(),
+                }
+            }
         }
     }
 }
@@ -444,7 +465,63 @@ impl TryFrom<CandidEventType> for EventType {
                 burn_block_index: LedgerBurnIndex::new(burn_block_index),
                 amount,
             },
+            CandidEventType::BurnedCkSolWithdrawalFee {
+                cksol_burn_block_index,
+                request,
+            } => EventType::BurnedCkSolWithdrawalFee {
+                cksol_burn_block_index: LedgerBurnIndex::new(cksol_burn_block_index),
+                request: request.into(),
+            },
+            CandidEventType::AcceptedSplWithdrawalRequest {
+                account,
+                mint,
+                ledger_id,
+                address,
+                amount,
+                fee,
+                create_destination_account,
+                cksol_burn_block_index,
+                ckspl_burn_block_index,
+            } => EventType::AcceptedSplWithdrawalRequest(SplWithdrawalRequest {
+                account,
+                mint: mint.into(),
+                ledger_id,
+                address: address.into(),
+                amount,
+                fee,
+                create_destination_account,
+                cksol_burn_block_index: LedgerBurnIndex::new(cksol_burn_block_index),
+                ckspl_burn_block_index: LedgerBurnIndex::new(ckspl_burn_block_index),
+            }),
         })
+    }
+}
+
+impl From<SplWithdrawalRequestTerms> for CandidSplWithdrawalRequestTerms {
+    fn from(request: SplWithdrawalRequestTerms) -> Self {
+        Self {
+            account: request.account,
+            mint: request.mint.into(),
+            ledger_id: request.ledger_id,
+            address: request.address.into(),
+            amount: request.amount,
+            fee: request.fee,
+            create_destination_account: request.create_destination_account,
+        }
+    }
+}
+
+impl From<CandidSplWithdrawalRequestTerms> for SplWithdrawalRequestTerms {
+    fn from(request: CandidSplWithdrawalRequestTerms) -> Self {
+        Self {
+            account: request.account,
+            mint: request.mint.into(),
+            ledger_id: request.ledger_id,
+            address: request.address.into(),
+            amount: request.amount,
+            fee: request.fee,
+            create_destination_account: request.create_destination_account,
+        }
     }
 }
 

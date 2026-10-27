@@ -1,3 +1,5 @@
+mod spl_withdrawals;
+
 use super::{event::*, *};
 use crate::{
     constants::{FEE_PER_SIGNATURE, GET_BALANCE_CYCLES, RENT_EXEMPTION_THRESHOLD},
@@ -901,6 +903,9 @@ mod state_from_init_args {
                 balance: 0,
                 spl_sweep_reservations: BTreeMap::new(),
                 operating_balance: 0,
+                fee_burned_spl_withdrawal_requests: BTreeMap::new(),
+                pending_spl_withdrawal_requests: BTreeMap::new(),
+                spl_withdrawal_token_burns: BTreeSet::new(),
             }
         );
     }

@@ -9,7 +9,8 @@ use crate::{
         build_batch_withdrawal_message,
     },
     state::event::{
-        CreditedDeposit, Signer, TransactionPurpose, VersionedMessage, WithdrawalRequest,
+        CreditedDeposit, Signer, SplWithdrawalRequest, SplWithdrawalRequestTerms,
+        TransactionPurpose, VersionedMessage, WithdrawalRequest,
     },
     utils::insertion_ordered_map::InsertionOrderedMap,
 };
@@ -150,6 +151,9 @@ pub struct State {
     balance: Lamport,
     spl_sweep_reservations: BTreeMap<Signature, Lamport>,
     operating_balance: Lamport,
+    fee_burned_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, FeeBurnedSplWithdrawalRequest>,
+    pending_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest>,
+    spl_withdrawal_token_burns: BTreeSet<(Principal, LedgerBurnIndex)>,
 }
 
 impl State {
@@ -769,6 +773,89 @@ impl State {
         pending.chain(created).chain(sent).min()
     }
 
+    pub fn fee_burned_spl_withdrawal_requests(
+        &self,
+    ) -> &BTreeMap<LedgerBurnIndex, FeeBurnedSplWithdrawalRequest> {
+        &self.fee_burned_spl_withdrawal_requests
+    }
+
+    pub fn pending_spl_withdrawal_requests(
+        &self,
+    ) -> &BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest> {
+        &self.pending_spl_withdrawal_requests
+    }
+
+    fn process_burned_cksol_withdrawal_fee(
+        &mut self,
+        cksol_burn_block_index: LedgerBurnIndex,
+        request: &SplWithdrawalRequestTerms,
+        created_at: u64,
+    ) {
+        let token = self
+            .supported_spl_tokens
+            .get(&request.mint)
+            .expect("An SPL withdrawal must reference a registered mint");
+        assert_eq!(
+            token.ledger_id, request.ledger_id,
+            "An SPL withdrawal must reference the mint's registered ledger"
+        );
+        assert!(request.amount > 0, "SPL withdrawal amount must be positive");
+        assert!(request.fee > 0, "SPL withdrawal fee burn must be positive");
+        assert!(
+            !self
+                .fee_burned_spl_withdrawal_requests
+                .contains_key(&cksol_burn_block_index)
+                && !self
+                    .pending_spl_withdrawal_requests
+                    .contains_key(&cksol_burn_block_index),
+            "SPL withdrawal {cksol_burn_block_index} already has a fee burn"
+        );
+        self.fee_burned_spl_withdrawal_requests.insert(
+            cksol_burn_block_index,
+            FeeBurnedSplWithdrawalRequest {
+                request: request.clone(),
+                created_at,
+            },
+        );
+    }
+
+    fn process_accepted_spl_withdrawal(&mut self, request: &SplWithdrawalRequest, created_at: u64) {
+        let cksol_burn_block_index = request.cksol_burn_block_index;
+        assert!(
+            !self
+                .pending_spl_withdrawal_requests
+                .contains_key(&cksol_burn_block_index),
+            "SPL withdrawal {cksol_burn_block_index} is already accepted"
+        );
+        let fee_burn = self
+            .fee_burned_spl_withdrawal_requests
+            .get(&cksol_burn_block_index)
+            .expect("Accepting an SPL withdrawal requires a recorded fee burn");
+        assert_eq!(
+            fee_burn.request,
+            SplWithdrawalRequestTerms::from(request),
+            "The accepted SPL withdrawal must match its recorded fee-burn terms"
+        );
+        let token_burn = (request.ledger_id, request.ckspl_burn_block_index);
+        assert!(
+            !self.spl_withdrawal_token_burns.contains(&token_burn),
+            "SPL token burn {token_burn:?} already belongs to a withdrawal"
+        );
+        let fee_burn = self
+            .fee_burned_spl_withdrawal_requests
+            .remove(&cksol_burn_block_index)
+            .expect("BUG: the checked fee burn must exist");
+        self.spl_withdrawal_token_burns.insert(token_burn);
+        self.pending_spl_withdrawal_requests.insert(
+            cksol_burn_block_index,
+            PendingSplWithdrawalRequest {
+                request: request.clone(),
+                fee_burned_at: fee_burn.created_at,
+                created_at,
+            },
+        );
+    }
+
     fn process_accepted_withdrawal(&mut self, request: &WithdrawalRequest, created_at: u64) {
         assert_eq!(
             self.pending_withdrawal_requests.insert(
@@ -1204,10 +1291,28 @@ impl TryFrom<InitArgs> for State {
             balance: 0,
             spl_sweep_reservations: BTreeMap::new(),
             operating_balance: 0,
+            fee_burned_spl_withdrawal_requests: BTreeMap::new(),
+            pending_spl_withdrawal_requests: BTreeMap::new(),
+            spl_withdrawal_token_burns: BTreeSet::new(),
         };
         state.validate()?;
         Ok(state)
     }
+}
+
+/// A withdrawal whose ckSOL fee burn is recorded but whose token burn is unresolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeeBurnedSplWithdrawalRequest {
+    pub request: SplWithdrawalRequestTerms,
+    pub created_at: u64,
+}
+
+/// An accepted SPL withdrawal with both burns recorded, waiting for processing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSplWithdrawalRequest {
+    pub request: SplWithdrawalRequest,
+    pub fee_burned_at: u64,
+    pub created_at: u64,
 }
 
 /// A pending withdrawal request.

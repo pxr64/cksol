@@ -551,6 +551,41 @@ pub enum WithdrawSolStatus {
     TxFinalized(TxFinalizedStatus),
 }
 
+/// Arguments for an SPL withdrawal request.
+///
+/// This type prepares the withdrawal flow; no `withdraw_spl` endpoint is exposed yet.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
+pub struct WithdrawSplArgs {
+    /// The Solana mint identifying the registered SPL token and its ckSPL ledger.
+    pub mint: Address,
+    /// The subaccount of the caller to burn ckSPL from.
+    pub from_subaccount: Option<Subaccount>,
+    /// The requested burn amount in the token's smallest units, not lamports.
+    pub amount: u64,
+    /// The destination wallet address on Solana, not a token account address.
+    pub address: String,
+    /// Whether the withdrawal may create the destination associated token account.
+    /// Its rent must be covered by the ckSOL fee before creation is allowed.
+    pub create_destination_account: bool,
+}
+
+/// The block index of an SPL withdrawal's fee burn on the ckSOL ledger.
+///
+/// Using the common fee ledger makes the identifier unique across all supported mints.
+pub type WithdrawSplId = LedgerBurnIndex;
+
+/// The acceptance receipt of an SPL withdrawal request.
+///
+/// Acceptance records the burn and queues the withdrawal; it does not mean that the
+/// Solana transfer has been submitted or finalized.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
+pub struct WithdrawSplOk {
+    /// The ckSOL fee burn block index, also used to track the withdrawal.
+    pub cksol_burn_block_index: WithdrawSplId,
+    /// The amount burn block index on the ckSPL ledger selected by the request's mint.
+    pub ckspl_burn_block_index: u64,
+}
+
 /// Information about the ckSOL minter canister.
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Deserialize, Serialize)]
 pub struct MinterInfo {

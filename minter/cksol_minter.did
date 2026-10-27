@@ -641,6 +641,17 @@ type TransactionPurpose = variant {
     };
 };
 
+// Withdrawal terms retained after the ckSOL fee burn.
+type SplWithdrawalRequestTerms = record {
+    account : Account;
+    mint : text;
+    ledger_id : principal;
+    address : text;
+    amount : nat64;
+    fee : Lamport;
+    create_destination_account : bool;
+};
+
 // A minter event payload.
 //
 // *WARNING*: This type is used exclusively by the debug `get_events` endpoint.
@@ -836,6 +847,23 @@ type EventType = variant {
         nonce_account: Address;
         // The nonce value the transaction carries in place of a recent blockhash.
         nonce_value: Hash;
+    };
+    // The ckSOL fee burn succeeded; the token burn has not yet been recorded.
+    BurnedCkSolWithdrawalFee : record {
+        cksol_burn_block_index : nat64;
+        request : SplWithdrawalRequestTerms;
+    };
+    // The token burn succeeded and the withdrawal was accepted for processing.
+    AcceptedSplWithdrawalRequest : record {
+        account : Account;
+        mint : text;
+        ledger_id : principal;
+        address : text;
+        amount : nat64;
+        fee : Lamport;
+        create_destination_account : bool;
+        cksol_burn_block_index : nat64;
+        ckspl_burn_block_index : nat64;
     };
 };
 

@@ -15,6 +15,25 @@ pub struct Event {
     pub payload: EventType,
 }
 
+/// The SPL withdrawal terms saved once its ckSOL fee burn is known.
+#[derive(Clone, Debug, PartialEq, CandidType, Deserialize)]
+pub struct SplWithdrawalRequestTerms {
+    /// The IC account from which both burns are requested.
+    pub account: Account,
+    /// The registered Solana mint.
+    pub mint: Address,
+    /// The token ledger used for the amount burn.
+    pub ledger_id: Principal,
+    /// The destination wallet, from which its token account is derived.
+    pub address: Address,
+    /// The token amount to burn and transfer, in the mint's smallest units.
+    pub amount: u64,
+    /// The ckSOL fee already burned, in lamports.
+    pub fee: Lamport,
+    /// Whether the withdrawal may create the destination associated token account.
+    pub create_destination_account: bool,
+}
+
 /// The type of a minter event.
 #[derive(Clone, Debug, PartialEq, CandidType, Deserialize)]
 pub enum EventType {
@@ -220,6 +239,34 @@ pub enum EventType {
         nonce_account: Address,
         /// The nonce value the transaction carries in place of a recent blockhash.
         nonce_value: Hash,
+    },
+    /// The ckSOL fee burn succeeded; the token burn has not yet been recorded.
+    BurnedCkSolWithdrawalFee {
+        /// The fee burn block index on the ckSOL ledger, also the withdrawal ID.
+        cksol_burn_block_index: u64,
+        /// The withdrawal terms saved before attempting the token burn.
+        request: SplWithdrawalRequestTerms,
+    },
+    /// The token burn succeeded and the withdrawal was accepted for processing.
+    AcceptedSplWithdrawalRequest {
+        /// The IC account from which the burns were requested.
+        account: Account,
+        /// The registered Solana mint.
+        mint: Address,
+        /// The token ledger used for the amount burn.
+        ledger_id: Principal,
+        /// The destination Solana wallet.
+        address: Address,
+        /// The amount burned and to transfer, in token units.
+        amount: u64,
+        /// The ckSOL fee burned, in lamports.
+        fee: Lamport,
+        /// Whether destination ATA creation is allowed.
+        create_destination_account: bool,
+        /// The fee burn index on the ckSOL ledger, also the withdrawal ID.
+        cksol_burn_block_index: u64,
+        /// The amount burn index on the ckSPL ledger.
+        ckspl_burn_block_index: u64,
     },
 }
 
