@@ -1,17 +1,23 @@
 use crate::{
     address::{associated_token_address, minter_address, minter_public_key},
     guard::GuardError,
-    ledger::{self, BurnError},
+    ledger::{self, BurnError, spl::SplBurnError},
     numeric::LedgerBurnIndex,
     runtime::CanisterRuntime,
     state::{
         SupportedSplToken, TokenProgram,
         audit::process_event,
-        event::{EventType, SplWithdrawalRequestTerms},
+        event::{
+            EventType, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
+            SplWithdrawalRequestTerms,
+        },
         mutate_state, read_state,
     },
 };
-use cksol_types::Memo;
+use canlog::log;
+use cksol_types::{Memo, WithdrawSplOk};
+use cksol_types_internal::log::Priority;
+use icrc_ledger_types::icrc2::transfer_from::TransferFromError;
 use sol_rpc_types::Lamport;
 use solana_address::Address;
 use std::str::FromStr;
@@ -145,4 +151,105 @@ pub async fn burn_withdrawal_fee<R: CanisterRuntime>(
         );
     });
     Ok(cksol_burn_block_index)
+}
+
+/// Burns the token amount from its fee checkpoint, then accepts the withdrawal.
+/// The caller holds the account withdrawal guard across both burns, and an error
+/// leaves the checkpoint intact.
+pub async fn burn_withdrawal_amount<R: CanisterRuntime>(
+    runtime: &R,
+    cksol_burn_block_index: LedgerBurnIndex,
+) -> Result<WithdrawSplOk, SplBurnError> {
+    let fee_burn = read_state(|state| {
+        state
+            .fee_burned_spl_withdrawal_request(&cksol_burn_block_index)
+            .clone()
+    });
+    let request = fee_burn.request;
+    let ckspl_burn_block_index = ledger::spl::burn(
+        runtime,
+        request.ledger_id,
+        request.account,
+        request.amount,
+        Memo::spl_convert(*cksol_burn_block_index.get(), request.address),
+        // Keep all ledger arguments stable if the token burn is retried.
+        fee_burn.created_at,
+    )
+    .await?;
+    let accepted = SplWithdrawalRequest {
+        terms: request,
+        cksol_burn_block_index,
+        ckspl_burn_block_index: LedgerBurnIndex::new(ckspl_burn_block_index),
+    };
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::AcceptedSplWithdrawalRequest(accepted.clone()),
+            runtime,
+        );
+    });
+    log!(
+        Priority::Info,
+        "Accepted SPL withdrawal request from {:?}: burned {} units of mint {}, queued withdrawal to {} (ckSOL burn block index {cksol_burn_block_index}, ckSPL burn block index {ckspl_burn_block_index})",
+        accepted.terms.account,
+        accepted.terms.amount,
+        accepted.terms.mint,
+        accepted.terms.address,
+    );
+    Ok(WithdrawSplOk {
+        cksol_burn_block_index: *cksol_burn_block_index.get(),
+        ckspl_burn_block_index,
+    })
+}
+
+/// Queues a positive ckSOL refund after a definitive token-burn failure.
+/// The caller holds the withdrawal guard and first reconciles any earlier attempt
+/// whose outcome is unknown.
+pub fn schedule_withdrawal_fee_reimbursement<R: CanisterRuntime>(
+    runtime: &R,
+    cksol_burn_block_index: LedgerBurnIndex,
+    error: &SplBurnError,
+    cksol_ledger_fee: Lamport,
+) {
+    let request = read_state(|state| {
+        state
+            .fee_burned_spl_withdrawal_request(&cksol_burn_block_index)
+            .request
+            .clone()
+    });
+    let reimbursed_amount = match error {
+        SplBurnError::TransferFrom(TransferFromError::TemporarilyUnavailable) => request.fee,
+        SplBurnError::TransferFrom(
+            TransferFromError::InsufficientFunds { .. }
+            | TransferFromError::InsufficientAllowance { .. }
+            | TransferFromError::BadBurn { .. },
+        ) => request.fee.saturating_sub(cksol_ledger_fee),
+        SplBurnError::Call(_)
+        | SplBurnError::TransferFrom(
+            TransferFromError::BadFee { .. }
+            | TransferFromError::TooOld
+            | TransferFromError::CreatedInFuture { .. }
+            | TransferFromError::Duplicate { .. }
+            | TransferFromError::GenericError { .. },
+        ) => return,
+    };
+    if reimbursed_amount == 0 {
+        return;
+    }
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::FailedSplWithdrawalRequest(SplWithdrawalFeeReimbursementRequest {
+                cksol_burn_block_index,
+                reimbursed_amount,
+                to: request.account,
+            }),
+            runtime,
+        );
+    });
+    log!(
+        Priority::Info,
+        "Scheduled reimbursement of {reimbursed_amount} lamports of ckSOL to {:?} for SPL withdrawal {cksol_burn_block_index} after its token burn failed: {error}",
+        request.account,
+    );
 }

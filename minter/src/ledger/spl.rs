@@ -17,7 +17,7 @@ mod tests;
 
 /// Keeps ledger replies separate from call failures for withdrawal recovery.
 #[derive(Debug, PartialEq, Error)]
-pub enum BurnError {
+pub enum SplBurnError {
     #[error("Failed to call ckSPL ledger: {0}")]
     Call(IcError),
     #[error("Failed to burn ckSPL: {0}")]
@@ -37,7 +37,7 @@ pub async fn burn<R: CanisterRuntime>(
     burn_amount: u64,
     burn_memo: Memo,
     created_at_time: u64,
-) -> Result<u64, BurnError> {
+) -> Result<u64, SplBurnError> {
     let result = LedgerClient::new(runtime.inter_canister_call_runtime(), ledger_id)
         .transfer_from(TransferFromArgs {
             spender_subaccount: None,
@@ -55,8 +55,8 @@ pub async fn burn<R: CanisterRuntime>(
         | Ok(Err(TransferFromError::Duplicate {
             duplicate_of: block_index,
         })) => block_index,
-        Ok(Err(error)) => return Err(BurnError::TransferFrom(error)),
-        Err(error) => return Err(BurnError::Call(error)),
+        Ok(Err(error)) => return Err(SplBurnError::TransferFrom(error)),
+        Err(error) => return Err(SplBurnError::Call(error)),
     };
 
     let block_index = block_index

@@ -249,20 +249,8 @@ pub enum EventType {
     },
     /// The token burn succeeded and the withdrawal was accepted for processing.
     AcceptedSplWithdrawalRequest {
-        /// The IC account from which the burns were requested.
-        account: Account,
-        /// The registered Solana mint.
-        mint: Address,
-        /// The token ledger used for the amount burn.
-        ledger_id: Principal,
-        /// The destination Solana wallet.
-        address: Address,
-        /// The amount burned and to transfer, in token units.
-        amount: u64,
-        /// The ckSOL fee burned, in lamports.
-        fee: Lamport,
-        /// Whether destination ATA creation is allowed.
-        create_destination_account: bool,
+        /// The terms confirmed by both ledger burns.
+        terms: SplWithdrawalRequestTerms,
         /// The fee burn index on the ckSOL ledger, also the withdrawal ID.
         cksol_burn_block_index: u64,
         /// The amount burn index on the ckSPL ledger.

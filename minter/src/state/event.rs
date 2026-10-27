@@ -391,43 +391,15 @@ pub struct SplWithdrawalRequestTerms {
 /// Payload of the `AcceptedSplWithdrawalRequest` event.
 #[derive(Clone, Debug, PartialEq, Eq, Decode, Encode)]
 pub struct SplWithdrawalRequest {
+    /// The terms recorded with the ckSOL fee burn.
     #[n(0)]
-    pub account: Account,
-    #[cbor(n(1), with = "cbor::address")]
-    pub mint: Address,
-    #[cbor(n(2), with = "icrc_cbor::principal")]
-    pub ledger_id: Principal,
-    /// The destination wallet; its associated token account is derived later.
-    #[cbor(n(3), with = "cbor::address")]
-    pub address: Address,
-    /// The token amount to burn and transfer, in the mint's smallest units.
-    #[n(4)]
-    pub amount: u64,
-    /// The ckSOL fee already burned, in lamports.
-    #[n(5)]
-    pub fee: Lamport,
-    #[n(6)]
-    pub create_destination_account: bool,
+    pub terms: SplWithdrawalRequestTerms,
     /// The ckSOL fee burn index, also the withdrawal identifier.
-    #[cbor(n(7), with = "cbor::id")]
+    #[cbor(n(1), with = "cbor::id")]
     pub cksol_burn_block_index: LedgerBurnIndex,
     /// The amount burn index on the token ledger.
-    #[cbor(n(8), with = "cbor::id")]
+    #[cbor(n(2), with = "cbor::id")]
     pub ckspl_burn_block_index: LedgerBurnIndex,
-}
-
-impl From<&SplWithdrawalRequest> for SplWithdrawalRequestTerms {
-    fn from(request: &SplWithdrawalRequest) -> Self {
-        Self {
-            account: request.account,
-            mint: request.mint,
-            ledger_id: request.ledger_id,
-            address: request.address,
-            amount: request.amount,
-            fee: request.fee,
-            create_destination_account: request.create_destination_account,
-        }
-    }
 }
 
 /// Payload of the `AcceptedWithdrawalRequest` event.

@@ -17,7 +17,7 @@ fn burn_memo() -> Memo {
     Memo::spl_convert(u64::MAX, solana_address::Address::from([0xFF; 32]))
 }
 
-async fn burn_tokens(runtime: &TestCanisterRuntime) -> Result<u64, BurnError> {
+async fn burn_tokens(runtime: &TestCanisterRuntime) -> Result<u64, SplBurnError> {
     burn(
         runtime,
         LEDGER_ID,
@@ -69,7 +69,7 @@ async fn should_recover_original_burn_after_unknown_call_outcome() {
             duplicate_of: 42_u64.into(),
         }));
 
-    assert_eq!(burn_tokens(&runtime).await, Err(BurnError::Call(error)));
+    assert_eq!(burn_tokens(&runtime).await, Err(SplBurnError::Call(error)));
     assert_eq!(burn_tokens(&runtime).await, Ok(42));
 
     let calls = runtime.sent_update_calls();
@@ -109,7 +109,7 @@ async fn should_preserve_ledger_errors_for_recovery() {
 
         assert_eq!(
             burn_tokens(&runtime).await,
-            Err(BurnError::TransferFrom(error))
+            Err(SplBurnError::TransferFrom(error))
         );
         assert_eq!(runtime.sent_update_calls().len(), 1);
     }
@@ -125,11 +125,11 @@ async fn should_keep_too_old_after_unknown_outcome_as_an_error() {
 
     assert!(matches!(
         burn_tokens(&runtime).await,
-        Err(BurnError::Call(_))
+        Err(SplBurnError::Call(_))
     ));
     assert_eq!(
         burn_tokens(&runtime).await,
-        Err(BurnError::TransferFrom(TransferFromError::TooOld))
+        Err(SplBurnError::TransferFrom(TransferFromError::TooOld))
     );
     let calls = runtime.sent_update_calls();
     assert_eq!(

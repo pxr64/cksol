@@ -781,6 +781,17 @@ impl State {
         &self.fee_burned_spl_withdrawal_requests
     }
 
+    pub fn fee_burned_spl_withdrawal_request(
+        &self,
+        cksol_burn_block_index: &LedgerBurnIndex,
+    ) -> &FeeBurnedSplWithdrawalRequest {
+        self.fee_burned_spl_withdrawal_requests
+            .get(cksol_burn_block_index)
+            .unwrap_or_else(|| {
+                panic!("BUG: SPL withdrawal {cksol_burn_block_index} has no recorded fee burn")
+            })
+    }
+
     pub fn pending_spl_withdrawal_requests(
         &self,
     ) -> &BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest> {
@@ -802,13 +813,19 @@ impl State {
         let token = self
             .supported_spl_tokens
             .get(&request.mint)
-            .expect("An SPL withdrawal must reference a registered mint");
+            .expect("Attempted to record an SPL withdrawal fee burn for an unsupported mint");
         assert_eq!(
             token.ledger_id, request.ledger_id,
-            "An SPL withdrawal must reference the mint's registered ledger"
+            "Attempted to record an SPL withdrawal fee burn with a ledger different from the mint's registered ledger"
         );
-        assert!(request.amount > 0, "SPL withdrawal amount must be positive");
-        assert!(request.fee > 0, "SPL withdrawal fee burn must be positive");
+        assert!(
+            request.amount > 0,
+            "Attempted to record an SPL withdrawal fee burn for a zero token amount"
+        );
+        assert!(
+            request.fee > 0,
+            "Attempted to record a zero SPL withdrawal fee burn"
+        );
         assert!(
             !self
                 .fee_burned_spl_withdrawal_requests
@@ -819,7 +836,7 @@ impl State {
                 && !self
                     .pending_spl_withdrawal_fee_reimbursements
                     .contains_key(&cksol_burn_block_index),
-            "SPL withdrawal {cksol_burn_block_index} already has a fee burn"
+            "Attempted to record an already recorded SPL withdrawal fee burn: {cksol_burn_block_index}"
         );
         self.fee_burned_spl_withdrawal_requests.insert(
             cksol_burn_block_index,
@@ -836,26 +853,21 @@ impl State {
             !self
                 .pending_spl_withdrawal_requests
                 .contains_key(&cksol_burn_block_index),
-            "SPL withdrawal {cksol_burn_block_index} is already accepted"
-        );
-        let fee_burn = self
-            .fee_burned_spl_withdrawal_requests
-            .get(&cksol_burn_block_index)
-            .expect("Accepting an SPL withdrawal requires a recorded fee burn");
-        assert_eq!(
-            fee_burn.request,
-            SplWithdrawalRequestTerms::from(request),
-            "The accepted SPL withdrawal must match its recorded fee-burn terms"
-        );
-        let token_burn = (request.ledger_id, request.ckspl_burn_block_index);
-        assert!(
-            !self.spl_withdrawal_token_burns.contains(&token_burn),
-            "SPL token burn {token_burn:?} already belongs to a withdrawal"
+            "Attempted to accept an already accepted SPL withdrawal request: {cksol_burn_block_index}"
         );
         let fee_burn = self
             .fee_burned_spl_withdrawal_requests
             .remove(&cksol_burn_block_index)
-            .expect("BUG: the checked fee burn must exist");
+            .expect("Attempted to accept an SPL withdrawal without a recorded fee burn");
+        assert_eq!(
+            fee_burn.request, request.terms,
+            "Attempted to accept an SPL withdrawal with terms different from its fee burn"
+        );
+        let token_burn = (request.terms.ledger_id, request.ckspl_burn_block_index);
+        assert!(
+            !self.spl_withdrawal_token_burns.contains(&token_burn),
+            "Attempted to reuse a token burn that already belongs to a withdrawal: {token_burn:?}"
+        );
         self.spl_withdrawal_token_burns.insert(token_burn);
         self.pending_spl_withdrawal_requests.insert(
             cksol_burn_block_index,
@@ -877,28 +889,24 @@ impl State {
             !self
                 .pending_spl_withdrawal_fee_reimbursements
                 .contains_key(&burn_index),
-            "SPL withdrawal {burn_index} already has a fee reimbursement"
-        );
-        let fee_burn = self
-            .fee_burned_spl_withdrawal_requests
-            .get(&burn_index)
-            .expect("Reimbursing an SPL withdrawal requires a recorded fee burn");
-        assert_eq!(
-            request.to, fee_burn.request.account,
-            "The SPL withdrawal fee must be reimbursed to the original account"
-        );
-        assert!(
-            request.reimbursed_amount > 0,
-            "SPL withdrawal fee reimbursement must be positive"
-        );
-        assert!(
-            request.reimbursed_amount <= fee_burn.request.fee,
-            "The SPL withdrawal reimbursement must not exceed the burned fee"
+            "Attempted to schedule an already scheduled SPL withdrawal fee reimbursement: {burn_index}"
         );
         let fee_burn = self
             .fee_burned_spl_withdrawal_requests
             .remove(&burn_index)
-            .expect("BUG: the checked fee burn must exist");
+            .expect("Attempted to reimburse an SPL withdrawal without a recorded fee burn");
+        assert_eq!(
+            request.to, fee_burn.request.account,
+            "Attempted to reimburse an SPL withdrawal to a different account than its fee-paying account"
+        );
+        assert!(
+            request.reimbursed_amount > 0,
+            "Attempted to reimburse an SPL withdrawal with a zero amount"
+        );
+        assert!(
+            request.reimbursed_amount <= fee_burn.request.fee,
+            "Attempted to reimburse an SPL withdrawal for more than its burned fee"
+        );
         self.pending_spl_withdrawal_fee_reimbursements.insert(
             burn_index,
             PendingSplWithdrawalFeeReimbursement {

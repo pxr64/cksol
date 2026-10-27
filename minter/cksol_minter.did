@@ -644,9 +644,9 @@ type TransactionPurpose = variant {
 // Withdrawal terms retained after the ckSOL fee burn.
 type SplWithdrawalRequestTerms = record {
     account : Account;
-    mint : text;
+    mint : Address;
     ledger_id : principal;
-    address : text;
+    address : Address;
     amount : nat64;
     fee : Lamport;
     create_destination_account : bool;
@@ -855,13 +855,7 @@ type EventType = variant {
     };
     // The token burn succeeded and the withdrawal was accepted for processing.
     AcceptedSplWithdrawalRequest : record {
-        account : Account;
-        mint : text;
-        ledger_id : principal;
-        address : text;
-        amount : nat64;
-        fee : Lamport;
-        create_destination_account : bool;
+        terms : SplWithdrawalRequestTerms;
         cksol_burn_block_index : nat64;
         ckspl_burn_block_index : nat64;
     };

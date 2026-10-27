@@ -9,26 +9,30 @@ mod tests;
 
 /// Maximum size in bytes of a [`Memo`] when serialized into an [ICRC-1 memo].
 ///
-/// The largest memos are [`MintMemo::Sweep`] and [`MintMemo::SweepFee`], which
-/// encode to 81 bytes:
+/// The largest memo is a [`MintMemo::Sweep`], which encodes to 81 bytes:
 ///
 /// | Bytes | Content |
 /// | --- | --- |
 /// | 2 | the [`Memo`] enum, as an array holding the index of [`Memo::Mint`] |
 /// | 1 | the array holding the single field of [`Memo::Mint`] |
-/// | 2 | the [`MintMemo`] enum and its variant index |
-/// | 1 | the array holding the two sweep memo fields |
-/// | 66 | the sweep signature, including its byte string header |
+/// | 2 | the [`MintMemo`] enum, as an array holding the index of [`MintMemo::Sweep`] |
+/// | 1 | the array holding the two fields of [`MintMemo::Sweep`] |
+/// | 2 | the byte string header of the signature, whose length needs a byte of its own |
+/// | 64 | the sweep signature |
 /// | 9 | the deposit id, as an unsigned integer |
+///
+/// Only the deposit id varies, since CBOR encodes an integer in as few bytes as
+/// possible: it takes nine bytes above [`u32::MAX`] and at most five below, which
+/// keeps the memo within 80 bytes for every deposit id reachable in practice.
+///
+/// A ledger whose `max_memo_length` is below this value rejects the mints whose memo
+/// exceeds its limit, and one below the size of the smallest memo, such as the ICRC-1
+/// default of 32 bytes, rejects all of them.
 ///
 /// SPL withdrawal memos use top-level variants without the nested [`BurnMemo`]
 /// wrapper. [`Memo::SplWithdrawalFee`] is at most 80 bytes, and
 /// [`Memo::SplConvert`] is at most 46 bytes, including a full [`u64::MAX`] token
 /// amount or fee-burn index. Existing mint and SOL burn encodings are unchanged.
-///
-/// A ledger whose `max_memo_length` is below this value rejects transactions whose
-/// memo exceeds its limit. Shorter memos may still fit, but the ICRC-1 default of
-/// 32 bytes cannot hold a memo containing a full Solana address.
 ///
 /// # Example
 ///
@@ -54,7 +58,7 @@ pub enum Memo {
     /// The minter minted some ckSOL tokens.
     #[n(0)]
     Mint(#[n(0)] MintMemo),
-    /// The minter burned ckSOL tokens.
+    /// The minter burned some ckSOL tokens.
     #[n(1)]
     Burn(#[n(0)] BurnMemo),
     /// The minter burned ckSOL to pay for an SPL withdrawal.
@@ -107,7 +111,7 @@ pub enum MintMemo {
     },
 }
 
-/// The minter burned ckSOL tokens.
+/// The minter burned some ckSOL tokens.
 #[derive(Clone, Eq, PartialEq, Debug, Decode, Encode)]
 pub enum BurnMemo {
     /// The minter burned ckSOL to initiate the withdrawal.

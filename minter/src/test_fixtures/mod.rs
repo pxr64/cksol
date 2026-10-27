@@ -1979,13 +1979,7 @@ pub mod arb {
                 |(cksol_burn_block_index, ckspl_burn_block_index, terms)| {
                     EventType::AcceptedSplWithdrawalRequest(
                         crate::state::event::SplWithdrawalRequest {
-                            account: terms.account,
-                            mint: terms.mint,
-                            ledger_id: terms.ledger_id,
-                            address: terms.address,
-                            amount: terms.amount,
-                            fee: terms.fee,
-                            create_destination_account: terms.create_destination_account,
+                            terms,
                             cksol_burn_block_index,
                             ckspl_burn_block_index,
                         },
