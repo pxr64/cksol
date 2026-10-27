@@ -4,6 +4,8 @@
 >
 > **Scope:** SPL deposits. The deposit fee uses XRC prices. The conversion of the collected fees into SOL is follow-up work.
 
+**Ledger model:** Each registered ckSPL ledger belongs to the ckSOL minter and uses its default account as the minting account. Deposits and fees mint with `icrc1_transfer`; the Ethereum ckUSDC/ckUSDT ledgers remain separate.
+
 ## 1. Goal
 
 SPL deposits use the balance-based sweep flow:
@@ -40,7 +42,7 @@ The configured ledger suite orchestrator registers each token with `add_spl_toke
 |---|---|
 | `mint`, `token_program`, `decimals` | The minter checks them against the finalized mint account. The program must be the classic SPL Token program or Token-2022 |
 | `xrc_symbol` | The symbol in which XRC must quote SOL. The minter checks it with XRC at registration |
-| `ledger_id` | The ledger on which the minter mints ckSPL. Each ledger serves one mint |
+| `ledger_id` | The ledger on which the minter mints ckSPL. Each ledger serves one mint and must use the ckSOL minter's default account as its minting account |
 | `minimum_deposit_amount` | The minimum amount that the user receives after the fee, in the smallest units of the mint. It must not be zero |
 | `paused` | Rejects new deposits. A deposit in flight continues |
 

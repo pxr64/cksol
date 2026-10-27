@@ -158,3 +158,47 @@ fn should_be_temporarily_unavailable_without_the_minter_public_key() {
     ));
     EventsAssert::assert_no_events_recorded();
 }
+
+#[test]
+fn should_quote_only_the_configured_fee_when_creation_is_not_allowed() {
+    for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+        for fee in [12_345, 1_000_000, u64::MAX] {
+            assert_eq!(quote_withdrawal_fee(fee, token_program, false), Ok(fee));
+        }
+    }
+}
+
+#[test]
+fn should_include_the_token_programs_ata_rent_when_creation_is_allowed() {
+    assert_eq!(
+        quote_withdrawal_fee(1_000_000, TokenProgram::Classic, true),
+        Ok(3_039_280)
+    );
+    assert_eq!(
+        quote_withdrawal_fee(1_000_000, TokenProgram::Token2022, true),
+        Ok(3_074_080)
+    );
+    assert_eq!(
+        quote_withdrawal_fee(2_000_000, TokenProgram::Classic, true),
+        Ok(4_039_280)
+    );
+}
+
+#[test]
+fn should_accept_the_largest_fee_that_can_include_rent() {
+    for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+        let fee = u64::MAX - token_program.account_rent_exemption();
+        assert_eq!(quote_withdrawal_fee(fee, token_program, true), Ok(u64::MAX));
+    }
+}
+
+#[test]
+fn should_reject_a_fee_that_overflows_when_rent_is_added() {
+    for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+        let fee = u64::MAX - token_program.account_rent_exemption() + 1;
+        assert!(matches!(
+            quote_withdrawal_fee(fee, token_program, true),
+            Err(WithdrawSplError::TemporarilyUnavailable(_))
+        ));
+    }
+}

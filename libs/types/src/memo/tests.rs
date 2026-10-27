@@ -6,7 +6,7 @@ use icrc_ledger_types::icrc1::transfer::Memo as Icrc1Memo;
 use proptest::{
     array::uniform,
     prelude::{Just, Strategy, any},
-    prop_assert, prop_oneof, proptest,
+    prop_assert, prop_assert_eq, prop_oneof, proptest,
 };
 
 /// The `max_memo_length` that ICRC-1 ledgers are typically deployed with.
@@ -19,11 +19,100 @@ const TYPICAL_LEDGER_MAX_MEMO_BYTES: usize = 80;
 const LARGEST_DEPOSIT_ID_WITHIN_TYPICAL_LEDGER_MEMO: DepositSolId = u32::MAX as DepositSolId;
 
 #[test]
-fn should_reach_the_maximum_size_with_the_largest_sweep_memo() {
+fn should_preserve_the_largest_sweep_memo_size() {
+    assert_eq!(encoded_len(sweep_memo(DepositSolId::MAX)), 81);
+    assert_eq!(MAX_SERIALIZED_MEMO_BYTES, 81);
+}
+
+#[test]
+fn should_fit_the_maximum_token_amount_in_an_80_byte_fee_memo() {
+    let memo = CkSolMinterMemo::spl_withdrawal_fee([0xAB; 32].into(), u64::MAX, [0xCD; 32].into());
+    let encoded = Icrc1Memo::from(memo.clone());
+    assert_eq!(encoded.0.len(), TYPICAL_LEDGER_MAX_MEMO_BYTES);
     assert_eq!(
-        encoded_len(sweep_memo(DepositSolId::MAX)),
-        MAX_SERIALIZED_MEMO_BYTES as usize
+        minicbor::decode::<CkSolMinterMemo>(&encoded.0).unwrap(),
+        memo
     );
+}
+
+#[test]
+fn should_fit_the_maximum_fee_burn_index_in_a_46_byte_token_memo() {
+    let memo = CkSolMinterMemo::spl_convert(u64::MAX, [0xFF; 32].into());
+    let encoded = Icrc1Memo::from(memo.clone());
+    assert_eq!(encoded.0.len(), 46);
+    assert!(encoded.0.len() <= TYPICAL_LEDGER_MAX_MEMO_BYTES);
+    assert_eq!(
+        minicbor::decode::<CkSolMinterMemo>(&encoded.0).unwrap(),
+        memo
+    );
+}
+
+#[test]
+fn should_preserve_existing_burn_memo_encodings() {
+    let top_up = Icrc1Memo::from(CkSolMinterMemo::from(BurnMemo::TopUp));
+    assert_eq!(top_up.0.as_ref(), &[0x82, 1, 0x81, 0x82, 1, 0x80]);
+
+    let mut bytes = vec![0x82, 1, 0x81, 0x82, 0, 0x81, 0x58, 0x20];
+    bytes.extend_from_slice(&[0x11; 32]);
+    let memo = CkSolMinterMemo::from(BurnMemo::convert([0x11; 32].into()));
+    assert_eq!(Icrc1Memo::from(memo.clone()).0.as_ref(), bytes.as_slice());
+    assert_eq!(minicbor::decode::<CkSolMinterMemo>(&bytes).unwrap(), memo);
+}
+
+#[test]
+fn should_encode_spl_burn_memos_with_new_tags_and_link_the_fee_index() {
+    let mut fee_bytes = vec![0x82, 2, 0x83, 0x58, 0x20];
+    fee_bytes.extend_from_slice(&[0x11; 32]);
+    fee_bytes.extend_from_slice(&[0x18, 42, 0x58, 0x20]);
+    fee_bytes.extend_from_slice(&[0x22; 32]);
+    let fee = CkSolMinterMemo::spl_withdrawal_fee([0x11; 32].into(), 42, [0x22; 32].into());
+    assert_eq!(
+        Icrc1Memo::from(fee.clone()).0.as_ref(),
+        fee_bytes.as_slice()
+    );
+    assert_eq!(
+        minicbor::decode::<CkSolMinterMemo>(&fee_bytes).unwrap(),
+        fee
+    );
+
+    let mut token_bytes = vec![0x82, 3, 0x82, 0x18, 42, 0x58, 0x20];
+    token_bytes.extend_from_slice(&[0x22; 32]);
+    let token = CkSolMinterMemo::spl_convert(42, [0x22; 32].into());
+    assert_eq!(
+        Icrc1Memo::from(token.clone()).0.as_ref(),
+        token_bytes.as_slice()
+    );
+    assert_eq!(
+        minicbor::decode::<CkSolMinterMemo>(&token_bytes).unwrap(),
+        token
+    );
+}
+
+#[test]
+fn should_fit_fee_memos_at_each_integer_encoding_boundary() {
+    let fee = |amount| CkSolMinterMemo::spl_withdrawal_fee([1; 32].into(), amount, [2; 32].into());
+    for amount in [
+        0,
+        23,
+        24,
+        u8::MAX as u64,
+        u8::MAX as u64 + 1,
+        u16::MAX as u64,
+        u16::MAX as u64 + 1,
+        u32::MAX as u64,
+        u32::MAX as u64 + 1,
+        u64::MAX,
+    ] {
+        let memo = fee(amount);
+        let encoded = Icrc1Memo::from(memo.clone());
+        assert!(encoded.0.len() <= TYPICAL_LEDGER_MAX_MEMO_BYTES);
+        assert_eq!(
+            minicbor::decode::<CkSolMinterMemo>(&encoded.0).unwrap(),
+            memo
+        );
+    }
+    assert_eq!(encoded_len(fee(u32::MAX as u64)), 76);
+    assert_eq!(encoded_len(fee(u32::MAX as u64 + 1)), 80);
 }
 
 #[test]
@@ -38,6 +127,19 @@ fn should_outgrow_a_typical_ledger_memo_one_deposit_id_past_the_largest_u32() {
 }
 
 proptest! {
+    #[test]
+    fn should_fit_every_spl_withdrawal_memo_in_an_80_byte_ledger(memo in arb_spl_burn_memo()) {
+        let encoded = Icrc1Memo::from(memo);
+        prop_assert!(encoded.0.len() <= TYPICAL_LEDGER_MAX_MEMO_BYTES);
+    }
+
+    #[test]
+    fn should_round_trip_every_memo(memo in arb_memo()) {
+        let encoded = Icrc1Memo::from(memo.clone());
+        let decoded = minicbor::decode::<CkSolMinterMemo>(&encoded.0).unwrap();
+        prop_assert_eq!(decoded, memo);
+    }
+
     #[test]
     fn should_never_exceed_maximum_size(memo in arb_memo()) {
         let encoded = Icrc1Memo::from(memo);
@@ -80,7 +182,8 @@ fn encoded_len(memo: CkSolMinterMemo) -> usize {
 fn arb_memo() -> impl Strategy<Value = CkSolMinterMemo> {
     prop_oneof![
         arb_mint_memo().prop_map(CkSolMinterMemo::Mint),
-        arb_burn_memo().prop_map(CkSolMinterMemo::Burn)
+        arb_burn_memo().prop_map(CkSolMinterMemo::Burn),
+        arb_spl_burn_memo(),
     ]
 }
 
@@ -109,5 +212,23 @@ fn arb_burn_memo() -> impl Strategy<Value = BurnMemo> {
     prop_oneof![
         any::<[u8; 32]>().prop_map(|to_address| BurnMemo::Convert { to_address }),
         Just(BurnMemo::TopUp),
+    ]
+}
+
+fn arb_spl_burn_memo() -> impl Strategy<Value = CkSolMinterMemo> {
+    prop_oneof![
+        (any::<[u8; 32]>(), any::<u64>(), any::<[u8; 32]>()).prop_map(
+            |(mint, withdrawal_amount, to_address)| CkSolMinterMemo::SplWithdrawalFee {
+                mint,
+                withdrawal_amount,
+                to_address,
+            }
+        ),
+        (any::<u64>(), any::<[u8; 32]>()).prop_map(|(cksol_burn_block_index, to_address)| {
+            CkSolMinterMemo::SplConvert {
+                cksol_burn_block_index,
+                to_address,
+            }
+        }),
     ]
 }

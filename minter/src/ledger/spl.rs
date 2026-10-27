@@ -2,7 +2,7 @@ use super::client::LedgerClient;
 use crate::runtime::CanisterRuntime;
 use candid::Principal;
 use canlog::log;
-use cksol_types::{BurnMemo, Memo};
+use cksol_types::Memo;
 use cksol_types_internal::log::Priority;
 use ic_canister_runtime::IcError;
 use icrc_ledger_types::{
@@ -35,7 +35,7 @@ pub async fn burn<R: CanisterRuntime>(
     ledger_id: Principal,
     from: Account,
     burn_amount: u64,
-    burn_memo: BurnMemo,
+    burn_memo: Memo,
     created_at_time: u64,
 ) -> Result<u64, BurnError> {
     let result = LedgerClient::new(runtime.inter_canister_call_runtime(), ledger_id)
@@ -45,7 +45,7 @@ pub async fn burn<R: CanisterRuntime>(
             to: runtime.canister_self().into(),
             fee: None,
             created_at_time: Some(created_at_time),
-            memo: Some(Memo::from(burn_memo).into()),
+            memo: Some(burn_memo.into()),
             amount: NumTokens::from(burn_amount),
         })
         .await;

@@ -1,4 +1,4 @@
-use crate::{DepositSolId, DepositSplId};
+use crate::{DepositSolId, DepositSplId, WithdrawSplId};
 use derive_more::From;
 use minicbor::{Decode, Encode, Encoder};
 use solana_address::Address;
@@ -9,25 +9,26 @@ mod tests;
 
 /// Maximum size in bytes of a [`Memo`] when serialized into an [ICRC-1 memo].
 ///
-/// The largest memo is a [`MintMemo::Sweep`], which encodes to 81 bytes:
+/// The largest memos are [`MintMemo::Sweep`] and [`MintMemo::SweepFee`], which
+/// encode to 81 bytes:
 ///
 /// | Bytes | Content |
 /// | --- | --- |
 /// | 2 | the [`Memo`] enum, as an array holding the index of [`Memo::Mint`] |
 /// | 1 | the array holding the single field of [`Memo::Mint`] |
-/// | 2 | the [`MintMemo`] enum, as an array holding the index of [`MintMemo::Sweep`] |
-/// | 1 | the array holding the two fields of [`MintMemo::Sweep`] |
-/// | 2 | the byte string header of the signature, whose length needs a byte of its own |
-/// | 64 | the sweep signature |
+/// | 2 | the [`MintMemo`] enum and its variant index |
+/// | 1 | the array holding the two sweep memo fields |
+/// | 66 | the sweep signature, including its byte string header |
 /// | 9 | the deposit id, as an unsigned integer |
 ///
-/// Only the deposit id varies, since CBOR encodes an integer in as few bytes as
-/// possible: it takes nine bytes above [`u32::MAX`] and at most five below, which
-/// keeps the memo within 80 bytes for every deposit id reachable in practice.
+/// SPL withdrawal memos use top-level variants without the nested [`BurnMemo`]
+/// wrapper. [`Memo::SplWithdrawalFee`] is at most 80 bytes, and
+/// [`Memo::SplConvert`] is at most 46 bytes, including a full [`u64::MAX`] token
+/// amount or fee-burn index. Existing mint and SOL burn encodings are unchanged.
 ///
-/// A ledger whose `max_memo_length` is below this value rejects the mints whose memo
-/// exceeds its limit, and one below the size of the smallest memo, such as the ICRC-1
-/// default of 32 bytes, rejects all of them.
+/// A ledger whose `max_memo_length` is below this value rejects transactions whose
+/// memo exceeds its limit. Shorter memos may still fit, but the ICRC-1 default of
+/// 32 bytes cannot hold a memo containing a full Solana address.
 ///
 /// # Example
 ///
@@ -53,9 +54,32 @@ pub enum Memo {
     /// The minter minted some ckSOL tokens.
     #[n(0)]
     Mint(#[n(0)] MintMemo),
-    /// The minter burned some ckSOL tokens.
+    /// The minter burned ckSOL tokens.
     #[n(1)]
     Burn(#[n(0)] BurnMemo),
+    /// The minter burned ckSOL to pay for an SPL withdrawal.
+    #[n(2)]
+    SplWithdrawalFee {
+        /// The Solana mint of the token being withdrawn.
+        #[cbor(n(0), with = "minicbor::bytes")]
+        mint: [u8; 32],
+        /// The token amount to withdraw, in its smallest units.
+        #[n(1)]
+        withdrawal_amount: u64,
+        /// The destination Solana wallet.
+        #[cbor(n(2), with = "minicbor::bytes")]
+        to_address: [u8; 32],
+    },
+    /// The minter burned ckSPL after burning its ckSOL withdrawal fee.
+    #[n(3)]
+    SplConvert {
+        /// The ckSOL fee burn index, also the SPL withdrawal identifier.
+        #[n(0)]
+        cksol_burn_block_index: WithdrawSplId,
+        /// The destination Solana wallet.
+        #[cbor(n(1), with = "minicbor::bytes")]
+        to_address: [u8; 32],
+    },
 }
 
 /// The minter minted some ckSOL tokens.
@@ -83,7 +107,7 @@ pub enum MintMemo {
     },
 }
 
-/// The minter burned some ckSOL tokens.
+/// The minter burned ckSOL tokens.
 #[derive(Clone, Eq, PartialEq, Debug, Decode, Encode)]
 pub enum BurnMemo {
     /// The minter burned ckSOL to initiate the withdrawal.
@@ -131,6 +155,25 @@ impl BurnMemo {
     /// [`Address`]: to_address::Address
     pub fn convert(to_address: Address) -> Self {
         Self::Convert {
+            to_address: to_address.to_bytes(),
+        }
+    }
+}
+
+impl Memo {
+    /// Creates the ckSOL fee-burn memo for an SPL withdrawal.
+    pub fn spl_withdrawal_fee(mint: Address, withdrawal_amount: u64, to_address: Address) -> Self {
+        Self::SplWithdrawalFee {
+            mint: mint.to_bytes(),
+            withdrawal_amount,
+            to_address: to_address.to_bytes(),
+        }
+    }
+
+    /// Creates the ckSPL burn memo, linked to its ckSOL fee burn.
+    pub fn spl_convert(cksol_burn_block_index: WithdrawSplId, to_address: Address) -> Self {
+        Self::SplConvert {
+            cksol_burn_block_index,
             to_address: to_address.to_bytes(),
         }
     }

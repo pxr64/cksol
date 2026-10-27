@@ -1,8 +1,9 @@
 use crate::{
     address::{associated_token_address, minter_address, minter_public_key},
     guard::GuardError,
-    state::{SupportedSplToken, read_state},
+    state::{SupportedSplToken, TokenProgram, read_state},
 };
+use sol_rpc_types::Lamport;
 use solana_address::Address;
 use std::str::FromStr;
 
@@ -87,4 +88,23 @@ pub fn validate_destination(
         )));
     }
     Ok(destination)
+}
+
+/// Quotes the ckSOL fee in lamports using the configured withdrawal fee.
+/// Allowing destination ATA creation includes its rent even if it already exists.
+pub fn quote_withdrawal_fee(
+    withdrawal_fee: Lamport,
+    token_program: TokenProgram,
+    create_destination_account: bool,
+) -> Result<Lamport, WithdrawSplError> {
+    let rent = if create_destination_account {
+        token_program.account_rent_exemption()
+    } else {
+        0
+    };
+    withdrawal_fee.checked_add(rent).ok_or_else(|| {
+        WithdrawSplError::TemporarilyUnavailable(
+            "SPL withdrawal fee exceeds the maximum lamport amount".to_string(),
+        )
+    })
 }

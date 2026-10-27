@@ -4,7 +4,7 @@ use candid::Nat;
 
 const LEDGER_ID: Principal = Principal::from_slice(&[1; 10]);
 const CREATED_AT_TIME: u64 = 123_456;
-const AMOUNT: u64 = 1_000_000;
+const AMOUNT: u64 = u64::MAX;
 
 fn from_account() -> Account {
     Account {
@@ -13,8 +13,8 @@ fn from_account() -> Account {
     }
 }
 
-fn burn_memo() -> BurnMemo {
-    BurnMemo::convert(solana_address::Address::from([6; 32]))
+fn burn_memo() -> Memo {
+    Memo::spl_convert(u64::MAX, solana_address::Address::from([0xFF; 32]))
 }
 
 async fn burn_tokens(runtime: &TestCanisterRuntime) -> Result<u64, BurnError> {
@@ -48,10 +48,14 @@ async fn should_burn_on_token_ledger_with_fixed_arguments() {
             to: runtime.canister_self().into(),
             amount: AMOUNT.into(),
             fee: None,
-            memo: Some(Memo::from(burn_memo()).into()),
+            memo: Some(burn_memo().into()),
             created_at_time: Some(CREATED_AT_TIME),
         }
     );
+    let args = calls[0].single_arg::<TransferFromArgs>();
+    let memo = args.memo.unwrap();
+    assert_eq!(memo.0.len(), 46);
+    assert_eq!(minicbor::decode::<Memo>(&memo.0).unwrap(), burn_memo());
 }
 
 #[tokio::test]
