@@ -19,6 +19,26 @@ const TYPICAL_LEDGER_MAX_MEMO_BYTES: usize = 80;
 const LARGEST_DEPOSIT_ID_WITHIN_TYPICAL_LEDGER_MEMO: DepositSolId = u32::MAX as DepositSolId;
 
 #[test]
+fn should_encode_the_fee_reimbursement_memo_with_its_burn_index() {
+    let memo = CkSolMinterMemo::Mint(MintMemo::spl_withdrawal_fee_reimbursement(42));
+    let encoded = Icrc1Memo::from(memo.clone());
+    assert_eq!(
+        encoded.0.as_ref(),
+        &[0x82, 0, 0x81, 0x82, 3, 0x81, 0x18, 42]
+    );
+    assert_eq!(
+        minicbor::decode::<CkSolMinterMemo>(&encoded.0).unwrap(),
+        memo
+    );
+    assert_eq!(
+        encoded_len(CkSolMinterMemo::Mint(
+            MintMemo::spl_withdrawal_fee_reimbursement(u64::MAX)
+        )),
+        15
+    );
+}
+
+#[test]
 fn should_preserve_the_largest_sweep_memo_size() {
     assert_eq!(encoded_len(sweep_memo(DepositSolId::MAX)), 81);
     assert_eq!(MAX_SERIALIZED_MEMO_BYTES, 81);
@@ -190,6 +210,7 @@ fn arb_memo() -> impl Strategy<Value = CkSolMinterMemo> {
 fn arb_mint_memo() -> impl Strategy<Value = MintMemo> {
     prop_oneof![
         arb_sweep_mint_memo(any::<DepositSolId>()),
+        any::<u64>().prop_map(MintMemo::spl_withdrawal_fee_reimbursement),
         (arb_signature(), any::<u64>())
             .prop_map(|(signature, deposit_id)| MintMemo::sweep_fee(signature, deposit_id)),
     ]

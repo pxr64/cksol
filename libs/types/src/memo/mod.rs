@@ -109,6 +109,13 @@ pub enum MintMemo {
         #[n(1)]
         deposit_id: DepositSplId,
     },
+    /// The minter reimbursed the ckSOL fee of a failed SPL withdrawal.
+    #[n(3)]
+    SplWithdrawalFeeReimbursement {
+        /// The original fee burn index on the ckSOL ledger.
+        #[n(0)]
+        cksol_burn_block_index: WithdrawSplId,
+    },
 }
 
 /// The minter burned some ckSOL tokens.
@@ -149,6 +156,13 @@ impl MintMemo {
         Self::SweepFee {
             signature: <[u8; SIGNATURE_BYTES]>::from(signature.into()),
             deposit_id,
+        }
+    }
+
+    /// Creates the fee reimbursement memo, linked to the ckSOL fee burn it reimburses.
+    pub fn spl_withdrawal_fee_reimbursement(cksol_burn_block_index: WithdrawSplId) -> Self {
+        Self::SplWithdrawalFeeReimbursement {
+            cksol_burn_block_index,
         }
     }
 }
