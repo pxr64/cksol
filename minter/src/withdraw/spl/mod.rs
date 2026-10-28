@@ -17,9 +17,9 @@ use crate::{
         mutate_state, read_state,
     },
 };
-use candid::Nat;
 use canlog::log;
 use cksol_types::{Memo, MintMemo, WithdrawSplOk};
+pub use cksol_types::{WithdrawSplError, WithdrawSplLedgerError as LedgerError};
 use cksol_types_internal::log::Priority;
 use icrc_ledger_types::{
     icrc1::{account::Account, transfer::TransferArg},
@@ -31,40 +31,6 @@ use std::{str::FromStr, time::Duration};
 
 #[cfg(test)]
 mod tests;
-
-/// Errors returned while preparing or accepting an SPL withdrawal.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WithdrawSplError {
-    TokenNotSupported {
-        mint: Address,
-    },
-    ValueTooSmall {
-        minimum_withdrawal_amount: u64,
-        withdrawal_amount: u64,
-    },
-    AlreadyProcessing,
-    MalformedAddress(String),
-    InvalidDestination(String),
-    TemporarilyUnavailable(String),
-    /// Burning the ckSOL withdrawal fee failed.
-    CkSolLedgerError {
-        error: LedgerError,
-    },
-    /// Burning ckSPL failed after the ckSOL fee was burned.
-    CkSplLedgerError {
-        cksol_burn_block_index: LedgerBurnIndex,
-        error: LedgerError,
-    },
-}
-
-/// A withdrawal burn failure on either the ckSOL or ckSPL ledger.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LedgerError {
-    InsufficientFunds { balance: Nat },
-    InsufficientAllowance { allowance: Nat },
-    AmountTooLow { minimum_burn_amount: Nat },
-    TemporarilyUnavailable(String),
-}
 
 impl From<BurnError> for WithdrawSplError {
     fn from(error: BurnError) -> Self {
@@ -142,7 +108,7 @@ pub fn validate_token(mint: Address, amount: u64) -> Result<SupportedSplToken, W
         });
     }
     read_state(|state| state.supported_spl_token(&mint).cloned())
-        .ok_or(WithdrawSplError::TokenNotSupported { mint })
+        .ok_or(WithdrawSplError::TokenNotSupported { mint: mint.into() })
 }
 
 /// Validates a destination wallet locally, before either ledger burn.
@@ -228,7 +194,7 @@ pub async fn withdraw<R: CanisterRuntime>(
                 CKSOL_LEDGER_TRANSACTION_FEE,
             );
             Err(WithdrawSplError::CkSplLedgerError {
-                cksol_burn_block_index,
+                cksol_burn_block_index: *cksol_burn_block_index.get(),
                 error: error.into(),
             })
         }
@@ -283,8 +249,6 @@ pub async fn burn_withdrawal_amount<R: CanisterRuntime>(
         request.account,
         request.amount,
         Memo::spl_convert(*cksol_burn_block_index.get(), request.address),
-        // Keep all ledger arguments stable if the token burn is retried.
-        fee_burn.created_at,
     )
     .await?;
     let accepted = SplWithdrawalRequest {
@@ -313,9 +277,9 @@ pub async fn burn_withdrawal_amount<R: CanisterRuntime>(
     })
 }
 
-/// Queues a positive ckSOL refund after a definitive token-burn failure.
-/// The caller holds the withdrawal guard and first reconciles any earlier attempt
-/// whose outcome is unknown.
+/// Queues a ckSOL fee refund after a returned token-burn error, as in ckERC20.
+/// The caller holds the withdrawal guard. Call errors and temporary or generic
+/// ledger errors receive a full refund; user errors deduct the ledger fee.
 pub fn schedule_withdrawal_fee_reimbursement<R: CanisterRuntime>(
     runtime: &R,
     cksol_burn_block_index: LedgerBurnIndex,
@@ -329,19 +293,20 @@ pub fn schedule_withdrawal_fee_reimbursement<R: CanisterRuntime>(
             .clone()
     });
     let reimbursed_amount = match error {
-        SplBurnError::TransferFrom(TransferFromError::TemporarilyUnavailable) => request.fee,
+        SplBurnError::Call(_)
+        | SplBurnError::TransferFrom(
+            TransferFromError::TemporarilyUnavailable | TransferFromError::GenericError { .. },
+        ) => request.fee,
         SplBurnError::TransferFrom(
             TransferFromError::InsufficientFunds { .. }
             | TransferFromError::InsufficientAllowance { .. }
             | TransferFromError::BadBurn { .. },
         ) => request.fee.saturating_sub(cksol_ledger_fee),
-        SplBurnError::Call(_)
-        | SplBurnError::TransferFrom(
+        SplBurnError::TransferFrom(
             TransferFromError::BadFee { .. }
             | TransferFromError::TooOld
             | TransferFromError::CreatedInFuture { .. }
-            | TransferFromError::Duplicate { .. }
-            | TransferFromError::GenericError { .. },
+            | TransferFromError::Duplicate { .. },
         ) => return,
     };
     if reimbursed_amount == 0 {
@@ -360,7 +325,7 @@ pub fn schedule_withdrawal_fee_reimbursement<R: CanisterRuntime>(
     });
     log!(
         Priority::Info,
-        "Scheduled reimbursement of {reimbursed_amount} lamports of ckSOL to {:?} for SPL withdrawal {cksol_burn_block_index} after its token burn failed: {error}",
+        "Scheduled reimbursement of {reimbursed_amount} lamports of ckSOL to {:?} for SPL withdrawal {cksol_burn_block_index} after its token burn returned an error: {error}",
         request.account,
     );
 }

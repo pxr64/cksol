@@ -3,7 +3,6 @@ use crate::test_fixtures::runtime::TestCanisterRuntime;
 use candid::Nat;
 
 const LEDGER_ID: Principal = Principal::from_slice(&[1; 10]);
-const CREATED_AT_TIME: u64 = 123_456;
 const AMOUNT: u64 = u64::MAX;
 
 fn from_account() -> Account {
@@ -18,19 +17,11 @@ fn burn_memo() -> Memo {
 }
 
 async fn burn_tokens(runtime: &TestCanisterRuntime) -> Result<u64, SplBurnError> {
-    burn(
-        runtime,
-        LEDGER_ID,
-        from_account(),
-        AMOUNT,
-        burn_memo(),
-        CREATED_AT_TIME,
-    )
-    .await
+    burn(runtime, LEDGER_ID, from_account(), AMOUNT, burn_memo()).await
 }
 
 #[tokio::test]
-async fn should_burn_on_token_ledger_with_fixed_arguments() {
+async fn should_burn_on_token_ledger_without_deduplication() {
     let runtime = TestCanisterRuntime::new()
         .add_stub_response(Ok::<Nat, TransferFromError>(Nat::from(42_u64)));
 
@@ -49,7 +40,7 @@ async fn should_burn_on_token_ledger_with_fixed_arguments() {
             amount: AMOUNT.into(),
             fee: None,
             memo: Some(burn_memo().into()),
-            created_at_time: Some(CREATED_AT_TIME),
+            created_at_time: None,
         }
     );
     let args = calls[0].single_arg::<TransferFromArgs>();
@@ -59,31 +50,17 @@ async fn should_burn_on_token_ledger_with_fixed_arguments() {
 }
 
 #[tokio::test]
-async fn should_recover_original_burn_after_unknown_call_outcome() {
+async fn should_return_a_call_error_without_retrying() {
     let error = IcError::CandidDecodeFailed {
         message: "invalid ledger reply".to_string(),
     };
-    let runtime = TestCanisterRuntime::new()
-        .add_stub_error(error.clone())
-        .add_stub_response(Err::<Nat, _>(TransferFromError::Duplicate {
-            duplicate_of: 42_u64.into(),
-        }));
-
+    let runtime = TestCanisterRuntime::new().add_stub_error(error.clone());
     assert_eq!(burn_tokens(&runtime).await, Err(SplBurnError::Call(error)));
-    assert_eq!(burn_tokens(&runtime).await, Ok(42));
-
-    let calls = runtime.sent_update_calls();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].canister_id, calls[1].canister_id);
-    assert_eq!(calls[0].method, calls[1].method);
-    assert_eq!(
-        calls[0].single_arg::<TransferFromArgs>(),
-        calls[1].single_arg::<TransferFromArgs>()
-    );
+    assert_eq!(runtime.sent_update_calls().len(), 1);
 }
 
 #[tokio::test]
-async fn should_preserve_ledger_errors_for_recovery() {
+async fn should_return_expected_ledger_errors() {
     for error in [
         TransferFromError::InsufficientFunds {
             balance: 10_u64.into(),
@@ -91,14 +68,9 @@ async fn should_preserve_ledger_errors_for_recovery() {
         TransferFromError::InsufficientAllowance {
             allowance: 20_u64.into(),
         },
-        TransferFromError::BadFee {
-            expected_fee: 30_u64.into(),
-        },
         TransferFromError::BadBurn {
             min_burn_amount: 40_u64.into(),
         },
-        TransferFromError::TooOld,
-        TransferFromError::CreatedInFuture { ledger_time: 50 },
         TransferFromError::TemporarilyUnavailable,
         TransferFromError::GenericError {
             error_code: 60_u64.into(),
@@ -116,24 +88,26 @@ async fn should_preserve_ledger_errors_for_recovery() {
 }
 
 #[tokio::test]
-async fn should_keep_too_old_after_unknown_outcome_as_an_error() {
-    let runtime = TestCanisterRuntime::new()
-        .add_stub_error(IcError::CandidDecodeFailed {
-            message: "invalid ledger reply".to_string(),
-        })
-        .add_stub_response(Err::<Nat, _>(TransferFromError::TooOld));
-
-    assert!(matches!(
-        burn_tokens(&runtime).await,
-        Err(SplBurnError::Call(_))
-    ));
-    assert_eq!(
-        burn_tokens(&runtime).await,
-        Err(SplBurnError::TransferFrom(TransferFromError::TooOld))
-    );
-    let calls = runtime.sent_update_calls();
-    assert_eq!(
-        calls[0].single_arg::<TransferFromArgs>(),
-        calls[1].single_arg::<TransferFromArgs>()
-    );
+async fn should_trap_on_unexpected_ledger_errors_like_ckerc20() {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+    for error in [
+        TransferFromError::BadFee {
+            expected_fee: 30_u64.into(),
+        },
+        TransferFromError::TooOld,
+        TransferFromError::CreatedInFuture { ledger_time: 50 },
+        TransferFromError::Duplicate {
+            duplicate_of: 42_u64.into(),
+        },
+    ] {
+        let runtime = TestCanisterRuntime::new().add_stub_response(Err::<Nat, _>(error));
+        assert!(
+            AssertUnwindSafe(burn_tokens(&runtime))
+                .catch_unwind()
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.sent_update_calls().len(), 1);
+    }
 }

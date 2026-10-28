@@ -82,7 +82,7 @@ fn should_reject_an_unregistered_mint() {
 
     assert_eq!(
         validate_token(mint, 1),
-        Err(WithdrawSplError::TokenNotSupported { mint })
+        Err(WithdrawSplError::TokenNotSupported { mint: mint.into() })
     );
     EventsAssert::assert_no_events_recorded();
 }
@@ -423,7 +423,7 @@ async fn should_burn_both_ledgers_then_accept_the_spl_withdrawal() {
             amount: request.amount.into(),
             fee: None,
             memo: Some(Memo::spl_convert(42, request.address).into()),
-            created_at_time: Some(123),
+            created_at_time: None,
         }
     );
     let accepted = SplWithdrawalRequest {
@@ -455,43 +455,18 @@ async fn should_burn_both_ledgers_then_accept_the_spl_withdrawal() {
 }
 
 #[tokio::test]
-async fn should_accept_the_original_token_burn_after_a_duplicate_reply() {
+#[should_panic(expected = "BUG: unexpected ckSPL burn error")]
+async fn should_reject_an_unexpected_duplicate_token_burn_reply() {
     init_state();
     let token = register_token(TokenProgram::Classic);
     let request = withdrawal_terms(&token);
     let _guard = withdrawal_guard(request.account).unwrap();
     record_fee_checkpoint(&request, 42.into());
-    let runtime = TestCanisterRuntime::new()
-        .add_stub_response(Err::<Nat, _>(TransferFromError::Duplicate {
+    let runtime =
+        TestCanisterRuntime::new().add_stub_response(Err::<Nat, _>(TransferFromError::Duplicate {
             duplicate_of: 7_u64.into(),
-        }))
-        .with_time(999);
-
-    assert_eq!(
-        burn_withdrawal_amount(&runtime, 42.into()).await,
-        Ok(WithdrawSplOk {
-            cksol_burn_block_index: 42,
-            ckspl_burn_block_index: 7,
-        })
-    );
-
-    let calls = runtime.sent_update_calls();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].canister_id, token.ledger_id);
-    let args = calls[0].single_arg::<TransferFromArgs>();
-    assert_eq!(args.created_at_time, Some(123));
-    assert_eq!(
-        args.memo,
-        Some(Memo::spl_convert(42, request.address).into())
-    );
-    read_state(|state| {
-        assert!(state.fee_burned_spl_withdrawal_requests().is_empty());
-        let pending = &state.pending_spl_withdrawal_requests()[&42.into()];
-        assert_eq!(pending.request.ckspl_burn_block_index, 7.into());
-        assert_eq!(pending.fee_burned_at, 123);
-        assert_eq!(pending.created_at, 999);
-        assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
-    });
+        }));
+    let _ = burn_withdrawal_amount(&runtime, 42.into()).await;
 }
 
 #[tokio::test]
@@ -509,7 +484,6 @@ async fn should_preserve_the_fee_checkpoint_when_the_token_burn_is_rejected() {
             allowance: 20_u64.into(),
         },
         TransferFromError::TemporarilyUnavailable,
-        TransferFromError::TooOld,
     ] {
         let runtime = TestCanisterRuntime::new().add_stub_response(Err::<Nat, _>(error.clone()));
 
@@ -523,7 +497,7 @@ async fn should_preserve_the_fee_checkpoint_when_the_token_burn_is_rejected() {
         assert_eq!(calls[0].canister_id, token.ledger_id);
         assert_eq!(
             calls[0].single_arg::<TransferFromArgs>().created_at_time,
-            Some(123)
+            None
         );
         assert_only_fee_checkpoint(token.clone(), request.clone());
     }
@@ -559,7 +533,7 @@ async fn should_require_a_fee_checkpoint_before_calling_the_token_ledger() {
 }
 
 #[tokio::test]
-async fn should_queue_the_appropriate_fee_refund_after_a_definitive_token_burn_failure() {
+async fn should_queue_the_appropriate_fee_refund_after_a_returned_token_burn_error() {
     init_state();
     let token = register_token(TokenProgram::Classic);
     let mut request = withdrawal_terms(&token);
@@ -586,6 +560,13 @@ async fn should_queue_the_appropriate_fee_refund_after_a_definitive_token_burn_f
             request.fee - ledger_fee,
         ),
         (TransferFromError::TemporarilyUnavailable, request.fee),
+        (
+            TransferFromError::GenericError {
+                error_code: 1_u64.into(),
+                message: "ledger error".to_string(),
+            },
+            request.fee,
+        ),
     ];
     let mut expected_refunds = Vec::new();
     for (index, (error, reimbursed_amount)) in cases.into_iter().enumerate() {
@@ -640,7 +621,7 @@ async fn should_queue_the_appropriate_fee_refund_after_a_definitive_token_burn_f
 }
 
 #[test]
-fn should_keep_uncertain_or_unclassified_failures_out_of_the_refund_queue() {
+fn should_keep_unexpected_ledger_errors_out_of_the_refund_queue() {
     init_state();
     let token = register_token(TokenProgram::Classic);
     let request = withdrawal_terms(&token);
@@ -648,20 +629,12 @@ fn should_keep_uncertain_or_unclassified_failures_out_of_the_refund_queue() {
     record_fee_checkpoint(&request, 42.into());
     let runtime = TestCanisterRuntime::new();
     for error in [
-        ledger::spl::SplBurnError::Call(IcError::CandidDecodeFailed {
-            message: "unknown outcome".to_string(),
-        }),
-        ledger::spl::SplBurnError::Call(IcError::CallPerformFailed),
         ledger::spl::SplBurnError::TransferFrom(TransferFromError::TooOld),
         ledger::spl::SplBurnError::TransferFrom(TransferFromError::CreatedInFuture {
             ledger_time: 0,
         }),
         ledger::spl::SplBurnError::TransferFrom(TransferFromError::BadFee {
             expected_fee: 1_u64.into(),
-        }),
-        ledger::spl::SplBurnError::TransferFrom(TransferFromError::GenericError {
-            error_code: 1_u64.into(),
-            message: "unknown error".to_string(),
         }),
         ledger::spl::SplBurnError::TransferFrom(TransferFromError::Duplicate {
             duplicate_of: 7_u64.into(),
@@ -1061,8 +1034,15 @@ async fn should_accept_a_withdrawal_with_both_burns_under_one_guard() {
 }
 
 #[tokio::test]
-async fn should_refund_a_rejected_token_burn_but_preserve_an_unknown_outcome() {
-    for unknown in [false, true] {
+async fn should_refund_token_burn_errors_like_ckerc20() {
+    for call_error in [
+        None,
+        Some(IcError::CallPerformFailed),
+        Some(IcError::CandidDecodeFailed {
+            message: "invalid reply".to_string(),
+        }),
+    ] {
+        let full_refund = call_error.is_some();
         reset_state();
         reset_events();
         init_state();
@@ -1072,33 +1052,28 @@ async fn should_refund_a_rejected_token_burn_but_preserve_an_unknown_outcome() {
         let runtime = TestCanisterRuntime::new()
             .with_increasing_time_from(123)
             .add_stub_response(Ok::<Nat, TransferFromError>(42_u64.into()));
-        let runtime = if unknown {
-            runtime.add_stub_error(IcError::CallPerformFailed)
+        let runtime = if let Some(error) = call_error {
+            runtime.add_stub_error(error)
         } else {
             runtime.add_stub_response(Err::<Nat, _>(TransferFromError::InsufficientFunds {
                 balance: 0_u64.into(),
             }))
         };
         assert!(matches!(withdraw_request(&runtime, &request).await,
-            Err(WithdrawSplError::CkSplLedgerError { cksol_burn_block_index, .. }) if cksol_burn_block_index == 42.into()));
+            Err(WithdrawSplError::CkSplLedgerError { cksol_burn_block_index, .. }) if cksol_burn_block_index == 42));
         read_state(|state| {
             assert!(state.pending_spl_withdrawal_requests().is_empty());
+            assert!(state.fee_burned_spl_withdrawal_requests().is_empty());
             assert_eq!(
-                state
-                    .fee_burned_spl_withdrawal_requests()
-                    .contains_key(&42.into()),
-                unknown
-            );
-            if !unknown {
-                assert_eq!(
-                    state.pending_spl_withdrawal_fee_reimbursements()[&42.into()]
-                        .request
-                        .reimbursed_amount,
+                state.pending_spl_withdrawal_fee_reimbursements()[&42.into()]
+                    .request
+                    .reimbursed_amount,
+                if full_refund {
+                    request.fee
+                } else {
                     request.fee - CKSOL_LEDGER_TRANSACTION_FEE
-                );
-            } else {
-                assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
-            }
+                },
+            );
         });
         assert!(withdrawal_guard(request.account).is_ok());
     }
@@ -1134,4 +1109,24 @@ async fn should_stop_before_token_burn_if_the_guard_or_fee_burn_fails() {
     assert_eq!(runtime.sent_update_calls().len(), 1);
     assert!(withdrawal_guard(request.account).is_ok());
     assert_eq!(EventsAssert::from_recorded(), events_before);
+}
+
+#[test]
+fn should_preserve_large_ledger_values_in_the_public_withdrawal_error() {
+    let balance = Nat::from(u128::MAX);
+    let error = WithdrawSplError::CkSplLedgerError {
+        cksol_burn_block_index: u64::MAX,
+        error: LedgerError::InsufficientFunds {
+            balance: balance.clone(),
+        },
+    };
+    let encoded = candid::encode_one(&error).unwrap();
+    let decoded: cksol_types::WithdrawSplError = candid::decode_one(&encoded).unwrap();
+    assert_eq!(
+        decoded,
+        cksol_types::WithdrawSplError::CkSplLedgerError {
+            cksol_burn_block_index: u64::MAX,
+            error: LedgerError::InsufficientFunds { balance },
+        }
+    );
 }

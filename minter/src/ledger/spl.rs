@@ -15,7 +15,7 @@ use thiserror::Error;
 #[cfg(test)]
 mod tests;
 
-/// Keeps ledger replies separate from call failures for withdrawal recovery.
+/// Keeps ledger replies separate from call failures for withdrawal error handling.
 #[derive(Debug, PartialEq, Error)]
 pub enum SplBurnError {
     #[error("Failed to call ckSPL ledger: {0}")]
@@ -27,16 +27,14 @@ pub enum SplBurnError {
 /// Burns ckSPL on its registered ledger, whose minting account is this minter's
 /// default account, as on the ckSOL ledger.
 ///
-/// Any retry must reuse the original burn arguments. In particular,
-/// a call error can leave the burn outcome unknown. A later `TooOld` response does
-/// not prove that an earlier attempt failed; it requires reconciliation.
+/// Like ckERC20, this disables ledger deduplication. The caller must hold the
+/// withdrawal guard across the fee and token burns.
 pub async fn burn<R: CanisterRuntime>(
     runtime: &R,
     ledger_id: Principal,
     from: Account,
     burn_amount: u64,
     burn_memo: Memo,
-    created_at_time: u64,
 ) -> Result<u64, SplBurnError> {
     let result = LedgerClient::new(runtime.inter_canister_call_runtime(), ledger_id)
         .transfer_from(TransferFromArgs {
@@ -44,17 +42,22 @@ pub async fn burn<R: CanisterRuntime>(
             from,
             to: runtime.canister_self().into(),
             fee: None,
-            created_at_time: Some(created_at_time),
+            created_at_time: None,
             memo: Some(burn_memo.into()),
             amount: NumTokens::from(burn_amount),
         })
         .await;
 
     let block_index = match result {
-        Ok(Ok(block_index))
-        | Ok(Err(TransferFromError::Duplicate {
-            duplicate_of: block_index,
-        })) => block_index,
+        Ok(Ok(block_index)) => block_index,
+        Ok(Err(
+            error @ (TransferFromError::BadFee { .. }
+            | TransferFromError::TooOld
+            | TransferFromError::CreatedInFuture { .. }
+            | TransferFromError::Duplicate { .. }),
+        )) => {
+            panic!("BUG: unexpected ckSPL burn error: {error:?}")
+        }
         Ok(Err(error)) => return Err(SplBurnError::TransferFrom(error)),
         Err(error) => return Err(SplBurnError::Call(error)),
     };

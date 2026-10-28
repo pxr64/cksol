@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 #![forbid(missing_docs)]
 
-use candid::{CandidType, Principal};
+use candid::{CandidType, Nat, Principal};
 use icrc_ledger_types::icrc1::account::{Account, Subaccount};
 pub use memo::{BurnMemo, MAX_SERIALIZED_MEMO_BYTES, Memo, MintMemo};
 use serde::{Deserialize, Serialize};
@@ -584,6 +584,65 @@ pub struct WithdrawSplOk {
     pub cksol_burn_block_index: WithdrawSplId,
     /// The amount burn block index on the ckSPL ledger selected by the request's mint.
     pub ckspl_burn_block_index: u64,
+}
+
+/// The error result of an SPL withdrawal request.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
+pub enum WithdrawSplError {
+    /// The mint is not registered with the minter.
+    TokenNotSupported {
+        /// The requested Solana mint.
+        mint: Address,
+    },
+    /// The token amount is below the withdrawal minimum.
+    ValueTooSmall {
+        /// The minimum amount in the token's smallest units.
+        minimum_withdrawal_amount: u64,
+        /// The requested amount in the token's smallest units.
+        withdrawal_amount: u64,
+    },
+    /// Another withdrawal is being processed for this account.
+    AlreadyProcessing,
+    /// The destination cannot be parsed as a Solana address.
+    MalformedAddress(String),
+    /// The destination is not an allowed withdrawal address.
+    InvalidDestination(String),
+    /// The minter cannot currently accept the request.
+    TemporarilyUnavailable(String),
+    /// Burning the ckSOL withdrawal fee failed.
+    CkSolLedgerError {
+        /// The error from the ckSOL ledger.
+        error: WithdrawSplLedgerError,
+    },
+    /// Burning ckSPL failed after the ckSOL fee was burned.
+    CkSplLedgerError {
+        /// The successful ckSOL fee burn index, also the withdrawal ID.
+        cksol_burn_block_index: WithdrawSplId,
+        /// The error from the ckSPL ledger.
+        error: WithdrawSplLedgerError,
+    },
+}
+
+/// A withdrawal burn error from either the ckSOL or ckSPL ledger.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
+pub enum WithdrawSplLedgerError {
+    /// The account cannot cover the burn amount.
+    InsufficientFunds {
+        /// The ledger balance in the token's smallest units.
+        balance: Nat,
+    },
+    /// The minter is not approved to burn the requested amount.
+    InsufficientAllowance {
+        /// The ledger allowance in the token's smallest units.
+        allowance: Nat,
+    },
+    /// The requested amount is below the ledger's minimum burn amount.
+    AmountTooLow {
+        /// The minimum burn amount in the token's smallest units.
+        minimum_burn_amount: Nat,
+    },
+    /// The ledger call failed or returned another error; the outcome may be unresolved.
+    TemporarilyUnavailable(String),
 }
 
 /// Information about the ckSOL minter canister.

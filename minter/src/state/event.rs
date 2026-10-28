@@ -329,7 +329,7 @@ pub enum EventType {
     /// The token burn succeeded and the withdrawal was accepted for processing.
     #[n(26)]
     AcceptedSplWithdrawalRequest(#[n(0)] SplWithdrawalRequest),
-    /// The token burn definitively failed; reimburse the already burned ckSOL fee.
+    /// The token burn returned an error; reimburse the already burned ckSOL fee.
     #[n(27)]
     FailedSplWithdrawalRequest(#[n(0)] SplWithdrawalFeeReimbursementRequest),
     /// The ckSOL fee of a failed SPL withdrawal was minted back.
