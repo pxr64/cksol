@@ -356,6 +356,7 @@ pub fn spl_token(mint: Address, token_program: TokenProgram) -> SupportedSplToke
         minimum_deposit_amount: 1,
         paused: false,
         xrc_symbol: "USDC".to_string(),
+        token_symbol: Some("solUSDC".to_string()),
     }
 }
 
@@ -1871,6 +1872,7 @@ pub mod arb {
                         minimum_deposit_amount,
                         paused,
                         xrc_symbol,
+                        token_symbol: Some("solUSDC".to_string()),
                     }
                 },
             )

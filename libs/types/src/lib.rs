@@ -280,6 +280,9 @@ pub struct AddSplTokenArgs {
     /// The symbol of the underlying asset on the exchange rate canister, such as `USDC`.
     /// Registration fails when the canister has no SOL rate in that symbol.
     pub xrc_symbol: String,
+    /// The ckSPL ledger symbol, distinct from the underlying XRC asset symbol.
+    /// Required for withdrawals; omission preserves compatibility with deposit-only registrations.
+    pub token_symbol: Option<String>,
 }
 
 /// An error while registering a supported SPL token.
@@ -630,16 +633,34 @@ pub enum WithdrawSplLedgerError {
     InsufficientFunds {
         /// The ledger balance in the token's smallest units.
         balance: Nat,
+        /// The amount the minter attempted to burn.
+        failed_burn_amount: Nat,
+        /// The ledger's configured token symbol.
+        token_symbol: String,
+        /// The ledger that rejected the burn.
+        ledger_id: Principal,
     },
     /// The minter is not approved to burn the requested amount.
     InsufficientAllowance {
         /// The ledger allowance in the token's smallest units.
         allowance: Nat,
+        /// The amount the minter attempted to burn.
+        failed_burn_amount: Nat,
+        /// The ledger's configured token symbol.
+        token_symbol: String,
+        /// The ledger that rejected the burn.
+        ledger_id: Principal,
     },
     /// The requested amount is below the ledger's minimum burn amount.
     AmountTooLow {
         /// The minimum burn amount in the token's smallest units.
         minimum_burn_amount: Nat,
+        /// The amount the minter attempted to burn.
+        failed_burn_amount: Nat,
+        /// The ledger's configured token symbol.
+        token_symbol: String,
+        /// The ledger that rejected the burn.
+        ledger_id: Principal,
     },
     /// The ledger call failed or returned another error; the outcome may be unresolved.
     TemporarilyUnavailable(String),

@@ -228,6 +228,8 @@ pub enum EventType {
         paused: bool,
         /// The underlying asset symbol used for XRC requests.
         xrc_symbol: String,
+        /// The configured ckSPL ledger symbol, absent in legacy registrations.
+        token_symbol: Option<String>,
     },
     /// The minter bound a durable nonce account and its nonce value to the
     /// withdrawal requests of the given burn indices, before requesting the

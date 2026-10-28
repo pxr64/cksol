@@ -57,6 +57,7 @@ async fn should_sweep_and_mint_a_classic_spl_deposit_on_the_validator() {
             minimum_deposit_amount: 1_000_000,
             paused: false,
             xrc_symbol: "SPL".to_string(),
+            token_symbol: Some("ckSPL".to_string()),
         })
         .await
         .expect("add_spl_token should validate the mint on the validator");

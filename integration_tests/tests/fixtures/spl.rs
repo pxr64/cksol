@@ -148,6 +148,7 @@ pub fn add_spl_token_args(ledger_id: Principal, token_program: Address) -> AddSp
         minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
         paused: false,
         xrc_symbol: "SPL".to_string(),
+        token_symbol: Some("ckSPL".to_string()),
     }
 }
 
@@ -339,6 +340,7 @@ pub async fn queue_deposit_for_caller(token_program: Address, extensions: &[Exte
                         minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
                         paused: false,
                         xrc_symbol: "SPL".to_string(),
+                        token_symbol: Some("ckSPL".to_string()),
                     },
                     EventType::QueuedSplDeposit {
                         deposit_id,

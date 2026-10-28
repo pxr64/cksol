@@ -15,6 +15,8 @@ use token_2022::{TOKEN_2022_ACCOUNT_TYPE_MINT, split_token_2022_account, token_2
 
 pub mod token_2022;
 
+const MAX_CK_TOKEN_SYMBOL_NUM_BYTES: usize = 20;
+
 #[cfg(test)]
 mod tests;
 
@@ -68,6 +70,15 @@ fn validate_config(
     if token.minimum_deposit_amount == 0 {
         return Err(AddSplTokenError::InvalidToken(
             "Minimum deposit amount must be greater than zero".to_string(),
+        ));
+    }
+    if token.token_symbol.as_ref().is_some_and(|symbol| {
+        symbol.trim().is_empty()
+            || symbol.len() > MAX_CK_TOKEN_SYMBOL_NUM_BYTES
+            || !symbol.is_ascii()
+    }) {
+        return Err(AddSplTokenError::InvalidToken(
+            "The ledger token symbol must be non-empty ASCII and at most 20 bytes".to_string(),
         ));
     }
     if token.xrc_symbol.trim().is_empty() {

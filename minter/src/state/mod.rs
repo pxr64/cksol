@@ -176,7 +176,14 @@ impl State {
         &self,
         token: &SupportedSplToken,
     ) -> Result<(), AddSplTokenError> {
-        if self.supported_spl_tokens.contains_key(&token.mint) {
+        if let Some(existing) = self.supported_spl_tokens.get(&token.mint) {
+            if existing.token_symbol.is_none() && token.token_symbol.is_some() {
+                let mut updated = existing.clone();
+                updated.token_symbol = token.token_symbol.clone();
+                if updated == *token {
+                    return Ok(());
+                }
+            }
             return Err(AddSplTokenError::AlreadySupported {
                 mint: token.mint.into(),
             });

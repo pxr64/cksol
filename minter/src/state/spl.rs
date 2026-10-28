@@ -67,6 +67,9 @@ pub struct SupportedSplToken {
     /// The underlying asset symbol used for XRC requests.
     #[n(6)]
     pub xrc_symbol: String,
+    /// The ckSPL ledger symbol; absent in legacy deposit-only registrations.
+    #[n(7)]
+    pub token_symbol: Option<String>,
 }
 
 impl TryFrom<AddSplTokenArgs> for SupportedSplToken {
@@ -81,6 +84,7 @@ impl TryFrom<AddSplTokenArgs> for SupportedSplToken {
             minimum_deposit_amount: args.minimum_deposit_amount,
             paused: args.paused,
             xrc_symbol: args.xrc_symbol,
+            token_symbol: args.token_symbol,
         })
     }
 }

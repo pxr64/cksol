@@ -978,6 +978,9 @@ fn should_preserve_ledger_amounts_larger_than_u64_in_spl_burn_errors() {
             },
             LedgerError::InsufficientFunds {
                 balance: amount.clone(),
+                failed_burn_amount: u64::MAX.into(),
+                token_symbol: "solUSDC".to_string(),
+                ledger_id: ledger_canister_id(),
             },
         ),
         (
@@ -986,6 +989,9 @@ fn should_preserve_ledger_amounts_larger_than_u64_in_spl_burn_errors() {
             },
             LedgerError::InsufficientAllowance {
                 allowance: amount.clone(),
+                failed_burn_amount: u64::MAX.into(),
+                token_symbol: "solUSDC".to_string(),
+                ledger_id: ledger_canister_id(),
             },
         ),
         (
@@ -994,11 +1000,21 @@ fn should_preserve_ledger_amounts_larger_than_u64_in_spl_burn_errors() {
             },
             LedgerError::AmountTooLow {
                 minimum_burn_amount: amount.clone(),
+                failed_burn_amount: u64::MAX.into(),
+                token_symbol: "solUSDC".to_string(),
+                ledger_id: ledger_canister_id(),
             },
         ),
     ] {
         assert_eq!(
-            LedgerError::from(SplBurnError::TransferFrom(error)),
+            ckspl_burn_error(
+                SplBurnError::TransferFrom(error),
+                u64::MAX,
+                &CkLedger {
+                    token_symbol: "solUSDC".to_string(),
+                    id: ledger_canister_id()
+                }
+            ),
             expected
         );
     }
@@ -1059,8 +1075,28 @@ async fn should_refund_token_burn_errors_like_ckerc20() {
                 balance: 0_u64.into(),
             }))
         };
-        assert!(matches!(withdraw_request(&runtime, &request).await,
-            Err(WithdrawSplError::CkSplLedgerError { cksol_burn_block_index, .. }) if cksol_burn_block_index == 42));
+        let error = withdraw_request(&runtime, &request).await.unwrap_err();
+        assert!(matches!(&error,
+            WithdrawSplError::CkSplLedgerError { cksol_burn_block_index, .. } if *cksol_burn_block_index == 42));
+        if full_refund {
+            assert!(matches!(&error, WithdrawSplError::CkSplLedgerError {
+                error: LedgerError::TemporarilyUnavailable(message), ..
+            } if message.contains(token.token_symbol.as_ref().unwrap())));
+        }
+        if !full_refund {
+            assert_eq!(
+                error,
+                WithdrawSplError::CkSplLedgerError {
+                    cksol_burn_block_index: 42,
+                    error: LedgerError::InsufficientFunds {
+                        balance: 0_u64.into(),
+                        failed_burn_amount: request.amount.into(),
+                        token_symbol: token.token_symbol.clone().unwrap(),
+                        ledger_id: token.ledger_id,
+                    },
+                }
+            );
+        }
         read_state(|state| {
             assert!(state.pending_spl_withdrawal_requests().is_empty());
             assert!(state.fee_burned_spl_withdrawal_requests().is_empty());
@@ -1102,7 +1138,10 @@ async fn should_stop_before_token_burn_if_the_guard_or_fee_burn_fails() {
         withdraw_request(&runtime, &request).await,
         Err(WithdrawSplError::CkSolLedgerError {
             error: LedgerError::InsufficientAllowance {
-                allowance: 0_u64.into()
+                allowance: 0_u64.into(),
+                failed_burn_amount: request.fee.into(),
+                token_symbol: "ckSOL".to_string(),
+                ledger_id: ledger_canister_id(),
             }
         })
     );
@@ -1118,6 +1157,9 @@ fn should_preserve_large_ledger_values_in_the_public_withdrawal_error() {
         cksol_burn_block_index: u64::MAX,
         error: LedgerError::InsufficientFunds {
             balance: balance.clone(),
+            failed_burn_amount: u64::MAX.into(),
+            token_symbol: "solUSDC".to_string(),
+            ledger_id: ledger_canister_id(),
         },
     };
     let encoded = candid::encode_one(&error).unwrap();
@@ -1126,7 +1168,53 @@ fn should_preserve_large_ledger_values_in_the_public_withdrawal_error() {
         decoded,
         cksol_types::WithdrawSplError::CkSplLedgerError {
             cksol_burn_block_index: u64::MAX,
-            error: LedgerError::InsufficientFunds { balance },
+            error: LedgerError::InsufficientFunds {
+                balance,
+                failed_burn_amount: u64::MAX.into(),
+                token_symbol: "solUSDC".to_string(),
+                ledger_id: ledger_canister_id(),
+            },
         }
     );
+}
+
+#[tokio::test]
+async fn should_not_burn_before_a_legacy_ledger_symbol_is_configured() {
+    init_state();
+    init_schnorr_master_key();
+    let mut token = spl_token([3; 32].into(), TokenProgram::Classic);
+    token.token_symbol = None;
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::AddedSplToken(token.clone()),
+            &TestCanisterRuntime::new().with_time(1),
+        )
+    });
+    let request = withdrawal_terms(&token);
+    let runtime = TestCanisterRuntime::new();
+    assert!(matches!(withdraw_request(&runtime, &request).await,
+        Err(WithdrawSplError::TemporarilyUnavailable(message)) if message.contains("symbol")));
+    assert!(runtime.sent_update_calls().is_empty());
+}
+
+#[test]
+fn should_identify_the_native_ledger_from_the_configured_network() {
+    for (network, symbol) in [
+        (SolanaNetwork::Mainnet, "ckSOL"),
+        (SolanaNetwork::Devnet, "ckDevnetSOL"),
+        (SolanaNetwork::Testnet, "ckTestnetSOL"),
+    ] {
+        reset_state();
+        let mut args = crate::test_fixtures::valid_init_args();
+        args.solana_network = network;
+        crate::test_fixtures::init_state_with_args(args);
+        assert_eq!(
+            cksol_ledger(),
+            CkLedger {
+                token_symbol: symbol.to_string(),
+                id: ledger_canister_id()
+            }
+        );
+    }
 }

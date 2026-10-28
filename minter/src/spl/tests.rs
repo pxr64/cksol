@@ -32,6 +32,7 @@ fn args() -> AddSplTokenArgs {
         minimum_deposit_amount: 1_000_000,
         paused: false,
         xrc_symbol: "USDC".to_string(),
+        token_symbol: Some("solUSDC".to_string()),
     }
 }
 
@@ -348,6 +349,7 @@ async fn should_reject_an_empty_xrc_symbol_before_any_call() {
     let runtime = init();
     let args = AddSplTokenArgs {
         xrc_symbol: " ".to_string(),
+
         ..args()
     };
 
@@ -415,4 +417,59 @@ async fn should_reject_invalid_token_2022_mint_accounts() {
         assert_matches!(result, Err(AddSplTokenError::InvalidToken(_)));
         assert_not_registered(&token_2022_args().mint);
     }
+}
+
+#[test]
+fn should_decode_a_legacy_token_without_a_ledger_symbol() {
+    let mut token = expected_token(args());
+    token.token_symbol = None;
+    let encoded = minicbor::to_vec(&token).unwrap();
+    assert_eq!(encoded[0], 0x87); // The absent trailing field preserves the legacy seven-field encoding.
+    assert_eq!(
+        minicbor::decode::<SupportedSplToken>(&encoded).unwrap(),
+        token
+    );
+}
+
+#[tokio::test]
+async fn should_fill_a_legacy_ledger_symbol_without_changing_token_configuration() {
+    let runtime = registration_runtime();
+    let config = args();
+    let mut legacy = expected_token(config.clone());
+    legacy.token_symbol = None;
+    mutate_state(|state| process_event(state, EventType::AddedSplToken(legacy.clone()), &runtime));
+    let mut changed = expected_token(config.clone());
+    changed.decimals += 1;
+    assert!(matches!(
+        read_state(|state| state.validate_spl_token_registration(&changed)),
+        Err(AddSplTokenError::AlreadySupported { .. })
+    ));
+    assert_eq!(add_spl_token(&runtime, config.clone()).await, Ok(()));
+    let replayed = with_event_iter(|events| replay_events(events));
+    assert_eq!(
+        replayed.supported_spl_token(&legacy.mint).unwrap(),
+        &expected_token(config)
+    );
+    read_state(|state| assert_eq!(state, &replayed));
+}
+
+#[tokio::test]
+async fn should_reject_invalid_ledger_symbols_before_any_call() {
+    let runtime = init();
+    for token_symbol in [
+        "".to_string(),
+        " ".to_string(),
+        "x".repeat(21),
+        "solÉ".to_string(),
+    ] {
+        let config = AddSplTokenArgs {
+            token_symbol: Some(token_symbol),
+            ..args()
+        };
+        assert!(matches!(
+            add_spl_token(&runtime, config).await,
+            Err(AddSplTokenError::InvalidToken(_))
+        ));
+    }
+    assert!(runtime.sent_update_calls().is_empty());
 }

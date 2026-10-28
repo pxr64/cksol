@@ -3,7 +3,7 @@ use crate::{
     constants::CKSOL_LEDGER_TRANSACTION_FEE,
     deposit::mint::{MintQueue, mint_pending, process_pending_mints_round},
     guard::{GuardError, withdrawal_guard},
-    ledger::{self, BurnError, spl::SplBurnError},
+    ledger::{self, BurnError, client::CkLedger, spl::SplBurnError},
     numeric::LedgerBurnIndex,
     queue_cursor::QueueCursors,
     runtime::CanisterRuntime,
@@ -20,7 +20,7 @@ use crate::{
 use canlog::log;
 use cksol_types::{Memo, MintMemo, WithdrawSplOk};
 pub use cksol_types::{WithdrawSplError, WithdrawSplLedgerError as LedgerError};
-use cksol_types_internal::log::Priority;
+use cksol_types_internal::{SolanaNetwork, log::Priority};
 use icrc_ledger_types::{
     icrc1::{account::Account, transfer::TransferArg},
     icrc2::transfer_from::TransferFromError,
@@ -32,43 +32,71 @@ use std::{str::FromStr, time::Duration};
 #[cfg(test)]
 mod tests;
 
-impl From<BurnError> for WithdrawSplError {
-    fn from(error: BurnError) -> Self {
-        Self::CkSolLedgerError {
-            error: error.into(),
+fn cksol_ledger() -> CkLedger {
+    read_state(|state| CkLedger {
+        id: state.ledger_canister_id(),
+        token_symbol: match state.solana_network() {
+            SolanaNetwork::Mainnet => "ckSOL",
+            SolanaNetwork::Devnet => "ckDevnetSOL",
+            SolanaNetwork::Testnet => "ckTestnetSOL",
         }
+        .to_string(),
+    })
+}
+
+fn cksol_burn_error(error: BurnError, failed_burn_amount: u64, ledger: &CkLedger) -> LedgerError {
+    match error {
+        BurnError::TemporarilyUnavailable(message) => LedgerError::TemporarilyUnavailable(format!(
+            "{} ledger: {message}",
+            ledger.token_symbol
+        )),
+        BurnError::InsufficientFunds { balance } => LedgerError::InsufficientFunds {
+            balance: balance.into(),
+            failed_burn_amount: failed_burn_amount.into(),
+            token_symbol: ledger.token_symbol.clone(),
+            ledger_id: ledger.id,
+        },
+        BurnError::InsufficientAllowance { allowance } => LedgerError::InsufficientAllowance {
+            allowance: allowance.into(),
+            failed_burn_amount: failed_burn_amount.into(),
+            token_symbol: ledger.token_symbol.clone(),
+            ledger_id: ledger.id,
+        },
     }
 }
 
-impl From<BurnError> for LedgerError {
-    fn from(error: BurnError) -> Self {
-        match error {
-            BurnError::TemporarilyUnavailable(message) => Self::TemporarilyUnavailable(message),
-            BurnError::InsufficientFunds { balance } => Self::InsufficientFunds {
-                balance: balance.into(),
-            },
-            BurnError::InsufficientAllowance { allowance } => Self::InsufficientAllowance {
-                allowance: allowance.into(),
-            },
+fn ckspl_burn_error(
+    error: SplBurnError,
+    failed_burn_amount: u64,
+    ledger: &CkLedger,
+) -> LedgerError {
+    match error {
+        SplBurnError::TransferFrom(TransferFromError::InsufficientFunds { balance }) => {
+            LedgerError::InsufficientFunds {
+                balance,
+                failed_burn_amount: failed_burn_amount.into(),
+                token_symbol: ledger.token_symbol.clone(),
+                ledger_id: ledger.id,
+            }
         }
-    }
-}
-
-impl From<SplBurnError> for LedgerError {
-    fn from(error: SplBurnError) -> Self {
-        match error {
-            SplBurnError::TransferFrom(TransferFromError::InsufficientFunds { balance }) => {
-                Self::InsufficientFunds { balance }
+        SplBurnError::TransferFrom(TransferFromError::InsufficientAllowance { allowance }) => {
+            LedgerError::InsufficientAllowance {
+                allowance,
+                failed_burn_amount: failed_burn_amount.into(),
+                token_symbol: ledger.token_symbol.clone(),
+                ledger_id: ledger.id,
             }
-            SplBurnError::TransferFrom(TransferFromError::InsufficientAllowance { allowance }) => {
-                Self::InsufficientAllowance { allowance }
+        }
+        SplBurnError::TransferFrom(TransferFromError::BadBurn { min_burn_amount }) => {
+            LedgerError::AmountTooLow {
+                minimum_burn_amount: min_burn_amount,
+                failed_burn_amount: failed_burn_amount.into(),
+                token_symbol: ledger.token_symbol.clone(),
+                ledger_id: ledger.id,
             }
-            SplBurnError::TransferFrom(TransferFromError::BadBurn { min_burn_amount }) => {
-                Self::AmountTooLow {
-                    minimum_burn_amount: min_burn_amount,
-                }
-            }
-            error => Self::TemporarilyUnavailable(error.to_string()),
+        }
+        error => {
+            LedgerError::TemporarilyUnavailable(format!("{} ledger: {error}", ledger.token_symbol))
         }
     }
 }
@@ -174,6 +202,15 @@ pub async fn withdraw<R: CanisterRuntime>(
         token.token_program,
         create_destination_account,
     )?;
+    let token_ledger = CkLedger {
+        id: token.ledger_id,
+        token_symbol: token.token_symbol.clone().ok_or_else(|| {
+            WithdrawSplError::TemporarilyUnavailable(
+                "The registered ckSPL ledger symbol is not configured".to_string(),
+            )
+        })?,
+    };
+    let fee_ledger = cksol_ledger();
     let request = SplWithdrawalRequestTerms {
         account,
         mint: token.mint,
@@ -183,7 +220,11 @@ pub async fn withdraw<R: CanisterRuntime>(
         fee,
         create_destination_account,
     };
-    let cksol_burn_block_index = burn_withdrawal_fee(runtime, &request).await?;
+    let cksol_burn_block_index = burn_withdrawal_fee(runtime, &request)
+        .await
+        .map_err(|error| WithdrawSplError::CkSolLedgerError {
+            error: cksol_burn_error(error, request.fee, &fee_ledger),
+        })?;
     match burn_withdrawal_amount(runtime, cksol_burn_block_index).await {
         Ok(receipt) => Ok(receipt),
         Err(error) => {
@@ -195,7 +236,7 @@ pub async fn withdraw<R: CanisterRuntime>(
             );
             Err(WithdrawSplError::CkSplLedgerError {
                 cksol_burn_block_index: *cksol_burn_block_index.get(),
-                error: error.into(),
+                error: ckspl_burn_error(error, request.amount, &token_ledger),
             })
         }
     }
