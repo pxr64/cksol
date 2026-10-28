@@ -1,6 +1,6 @@
 pub mod automatic;
 mod finalize;
-mod mint;
+pub mod mint;
 pub mod spl;
 pub mod sweep;
 

@@ -1,5 +1,5 @@
 use crate::{
-    deposit::mint::{MintQueue, mint_pending_deposit, process_pending_mints_round},
+    deposit::mint::{CURSORS, MintQueue, mint_pending, process_pending_mints_round},
     runtime::CanisterRuntime,
     state::{PendingMint, event::EventType, read_state},
 };
@@ -14,6 +14,7 @@ pub async fn process_pending_mints<R: CanisterRuntime>(runtime: R) {
     let run_again = process_pending_mints_round(
         &runtime,
         MintQueue::Sol,
+        &CURSORS,
         |state| state.deposits().pending_mints(),
         process_pending_mint,
     )
@@ -29,7 +30,7 @@ async fn process_pending_mint<R: CanisterRuntime>(
     pending: PendingMint,
 ) {
     let client = read_state(|state| state.ledger_client(runtime.inter_canister_call_runtime()));
-    mint_pending_deposit(
+    mint_pending(
         runtime,
         MintQueue::Sol,
         client,

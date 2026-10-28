@@ -1539,6 +1539,7 @@ pub enum TaskType {
     MintSpl,
     FinalizeTransactions,
     WithdrawalProcessing,
+    ReimburseSplWithdrawalFees,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

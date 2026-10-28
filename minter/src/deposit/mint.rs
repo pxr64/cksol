@@ -13,7 +13,7 @@ use cksol_types_internal::log::Priority;
 use ic_canister_runtime::Runtime;
 use icrc_ledger_types::icrc1::transfer::{TransferArg, TransferError};
 use scopeguard::ScopeGuard;
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, thread::LocalKey, time::Duration};
 
 /// The queues that mint on a timer, each with its own rotation cursor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -21,6 +21,7 @@ pub enum MintQueue {
     Sol,
     Spl,
     SplFee,
+    SplFeeReimbursement,
 }
 
 impl MintQueue {
@@ -28,6 +29,7 @@ impl MintQueue {
         match self {
             Self::Sol => TaskType::Mint,
             Self::Spl | Self::SplFee => TaskType::MintSpl,
+            Self::SplFeeReimbursement => TaskType::ReimburseSplWithdrawalFees,
         }
     }
 
@@ -35,15 +37,15 @@ impl MintQueue {
     fn record_failed_mint(self, reason: FailedMintReason) {
         match self {
             Self::Sol => record_failed_mint_attempt(reason),
-            Self::Spl | Self::SplFee => {}
+            Self::Spl | Self::SplFee | Self::SplFeeReimbursement => {}
         }
     }
 }
 
 thread_local! {
-    /// Where the previous round of each queue stopped. The cursors reset on upgrade; the
-    /// mint arguments live in the event log.
-    static CURSORS: QueueCursors<MintQueue, u64> = const { QueueCursors::new() };
+    /// Where the previous round of each deposit queue stopped. The cursors reset on
+    /// upgrade; the mint arguments live in the event log.
+    pub static CURSORS: QueueCursors<MintQueue, u64> = const { QueueCursors::new() };
 }
 
 pub fn reset_cursors() {
@@ -52,11 +54,12 @@ pub fn reset_cursors() {
 
 /// Runs one bounded round, continuing after the previous attempt and wrapping at the end.
 /// Returns whether the round made progress with more pending mints than one round holds.
-pub async fn process_pending_mints_round<R: CanisterRuntime, Pending: Clone>(
+pub async fn process_pending_mints_round<R: CanisterRuntime, K: Copy + Ord, Pending: Clone>(
     runtime: &R,
     queue: MintQueue,
-    pending_mints: impl Fn(&State) -> &BTreeMap<u64, Pending>,
-    mint: impl AsyncFn(&R, u64, Pending),
+    cursors: &'static LocalKey<QueueCursors<MintQueue, K>>,
+    pending_mints: impl Fn(&State) -> &BTreeMap<K, Pending>,
+    mint: impl AsyncFn(&R, K, Pending),
 ) -> bool {
     let _guard = match TimerGuard::new(queue.task()) {
         Ok(guard) => guard,
@@ -66,37 +69,35 @@ pub async fn process_pending_mints_round<R: CanisterRuntime, Pending: Clone>(
         let pending = pending_mints(state);
         (
             pending.len() > MAX_PENDING_MINTS_PER_ROUND,
-            CURSORS
+            cursors
                 .with(|cursors| cursors.round(queue, pending, MAX_PENDING_MINTS_PER_ROUND))
                 .into_iter()
-                .map(|(deposit_id, pending)| (*deposit_id, pending.clone()))
+                .map(|(key, pending)| (*key, pending.clone()))
                 .collect::<Vec<_>>(),
         )
     });
     if round.is_empty() {
-        CURSORS.with(|cursors| cursors.clear(queue));
+        cursors.with(|cursors| cursors.clear(queue));
         return false;
     }
-    let selected_deposit_ids: Vec<u64> = round.iter().map(|(deposit_id, _)| *deposit_id).collect();
-    for (deposit_id, pending) in round {
+    let selected_keys: Vec<K> = round.iter().map(|(key, _)| *key).collect();
+    for (key, pending) in round {
         // Advance before awaiting the ledger, including when its reply fails or traps.
-        CURSORS.with(|cursors| cursors.advance(queue, deposit_id));
-        mint(runtime, deposit_id, pending).await;
+        cursors.with(|cursors| cursors.advance(queue, key));
+        mint(runtime, key, pending).await;
     }
     let round_made_progress = read_state(|state| {
         let pending = pending_mints(state);
         if pending.is_empty() {
-            CURSORS.with(|cursors| cursors.clear(queue));
+            cursors.with(|cursors| cursors.clear(queue));
         }
-        selected_deposit_ids
-            .iter()
-            .any(|deposit_id| !pending.contains_key(deposit_id))
+        selected_keys.iter().any(|key| !pending.contains_key(key))
     });
     round_made_progress && more_pending_mints_than_one_round
 }
 
 /// Mints with fixed transfer arguments, retrying transient errors and quarantining unsafe retries.
-pub async fn mint_pending_deposit<R: CanisterRuntime, C: Runtime>(
+pub async fn mint_pending<R: CanisterRuntime, C: Runtime>(
     runtime: &R,
     queue: MintQueue,
     client: LedgerClient<C>,

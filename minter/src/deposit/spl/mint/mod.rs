@@ -1,6 +1,6 @@
 use crate::{
     constants::SPL_FEE_SUBACCOUNT,
-    deposit::mint::{MintQueue, mint_pending_deposit, process_pending_mints_round},
+    deposit::mint::{CURSORS, MintQueue, mint_pending, process_pending_mints_round},
     ledger::client::LedgerClient,
     runtime::CanisterRuntime,
     state::{PendingSplFeeMint, PendingSplMint, event::EventType, read_state},
@@ -21,6 +21,7 @@ pub async fn process_pending_spl_mints<R: CanisterRuntime>(runtime: R) {
     let run_again = process_pending_mints_round(
         &runtime,
         MintQueue::Spl,
+        &CURSORS,
         |state| state.spl_deposits().pending_mints(),
         process_pending_spl_mint,
     )
@@ -28,6 +29,7 @@ pub async fn process_pending_spl_mints<R: CanisterRuntime>(runtime: R) {
     let fee_run_again = process_pending_mints_round(
         &runtime,
         MintQueue::SplFee,
+        &CURSORS,
         |state| state.spl_deposits().pending_fee_mints(),
         process_pending_spl_fee_mint,
     )
@@ -42,7 +44,7 @@ async fn process_pending_spl_mint<R: CanisterRuntime>(
     deposit_id: DepositSplId,
     pending: PendingSplMint,
 ) {
-    mint_pending_deposit(
+    mint_pending(
         runtime,
         MintQueue::Spl,
         spl_ledger_client(runtime, &pending.deposit.deposit.mint),
@@ -67,7 +69,7 @@ async fn process_pending_spl_fee_mint<R: CanisterRuntime>(
     deposit_id: DepositSplId,
     pending: PendingSplFeeMint,
 ) {
-    mint_pending_deposit(
+    mint_pending(
         runtime,
         MintQueue::SplFee,
         spl_ledger_client(runtime, &pending.mint),
