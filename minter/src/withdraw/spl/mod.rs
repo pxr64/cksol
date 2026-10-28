@@ -1,7 +1,8 @@
 use crate::{
     address::{associated_token_address, minter_address, minter_public_key},
+    constants::CKSOL_LEDGER_TRANSACTION_FEE,
     deposit::mint::{MintQueue, mint_pending, process_pending_mints_round},
-    guard::GuardError,
+    guard::{GuardError, withdrawal_guard},
     ledger::{self, BurnError, spl::SplBurnError},
     numeric::LedgerBurnIndex,
     queue_cursor::QueueCursors,
@@ -16,10 +17,14 @@ use crate::{
         mutate_state, read_state,
     },
 };
+use candid::Nat;
 use canlog::log;
 use cksol_types::{Memo, MintMemo, WithdrawSplOk};
 use cksol_types_internal::log::Priority;
-use icrc_ledger_types::{icrc1::transfer::TransferArg, icrc2::transfer_from::TransferFromError};
+use icrc_ledger_types::{
+    icrc1::{account::Account, transfer::TransferArg},
+    icrc2::transfer_from::TransferFromError,
+};
 use sol_rpc_types::Lamport;
 use solana_address::Address;
 use std::{str::FromStr, time::Duration};
@@ -27,7 +32,7 @@ use std::{str::FromStr, time::Duration};
 #[cfg(test)]
 mod tests;
 
-/// Errors checked locally before attempting an SPL withdrawal burn.
+/// Errors returned while preparing or accepting an SPL withdrawal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WithdrawSplError {
     TokenNotSupported {
@@ -41,6 +46,65 @@ pub enum WithdrawSplError {
     MalformedAddress(String),
     InvalidDestination(String),
     TemporarilyUnavailable(String),
+    /// Burning the ckSOL withdrawal fee failed.
+    CkSolLedgerError {
+        error: LedgerError,
+    },
+    /// Burning ckSPL failed after the ckSOL fee was burned.
+    CkSplLedgerError {
+        cksol_burn_block_index: LedgerBurnIndex,
+        error: LedgerError,
+    },
+}
+
+/// A withdrawal burn failure on either the ckSOL or ckSPL ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LedgerError {
+    InsufficientFunds { balance: Nat },
+    InsufficientAllowance { allowance: Nat },
+    AmountTooLow { minimum_burn_amount: Nat },
+    TemporarilyUnavailable(String),
+}
+
+impl From<BurnError> for WithdrawSplError {
+    fn from(error: BurnError) -> Self {
+        Self::CkSolLedgerError {
+            error: error.into(),
+        }
+    }
+}
+
+impl From<BurnError> for LedgerError {
+    fn from(error: BurnError) -> Self {
+        match error {
+            BurnError::TemporarilyUnavailable(message) => Self::TemporarilyUnavailable(message),
+            BurnError::InsufficientFunds { balance } => Self::InsufficientFunds {
+                balance: balance.into(),
+            },
+            BurnError::InsufficientAllowance { allowance } => Self::InsufficientAllowance {
+                allowance: allowance.into(),
+            },
+        }
+    }
+}
+
+impl From<SplBurnError> for LedgerError {
+    fn from(error: SplBurnError) -> Self {
+        match error {
+            SplBurnError::TransferFrom(TransferFromError::InsufficientFunds { balance }) => {
+                Self::InsufficientFunds { balance }
+            }
+            SplBurnError::TransferFrom(TransferFromError::InsufficientAllowance { allowance }) => {
+                Self::InsufficientAllowance { allowance }
+            }
+            SplBurnError::TransferFrom(TransferFromError::BadBurn { min_burn_amount }) => {
+                Self::AmountTooLow {
+                    minimum_burn_amount: min_burn_amount,
+                }
+            }
+            error => Self::TemporarilyUnavailable(error.to_string()),
+        }
+    }
 }
 
 impl From<super::DestinationError> for WithdrawSplError {
@@ -124,6 +188,51 @@ pub fn quote_withdrawal_fee(
             "SPL withdrawal fee exceeds the maximum lamport amount".to_string(),
         )
     })
+}
+
+/// Validates a withdrawal, burns its fee and tokens, then records acceptance.
+/// The account guard is held across both ledger calls.
+pub async fn withdraw<R: CanisterRuntime>(
+    runtime: &R,
+    account: Account,
+    mint: Address,
+    amount: u64,
+    address: &str,
+    create_destination_account: bool,
+) -> Result<WithdrawSplOk, WithdrawSplError> {
+    let _guard = withdrawal_guard(account)?;
+    let token = validate_token(mint, amount)?;
+    let address = validate_destination(&token, address)?;
+    let fee = quote_withdrawal_fee(
+        read_state(|state| state.withdrawal_fee()),
+        token.token_program,
+        create_destination_account,
+    )?;
+    let request = SplWithdrawalRequestTerms {
+        account,
+        mint: token.mint,
+        ledger_id: token.ledger_id,
+        address,
+        amount,
+        fee,
+        create_destination_account,
+    };
+    let cksol_burn_block_index = burn_withdrawal_fee(runtime, &request).await?;
+    match burn_withdrawal_amount(runtime, cksol_burn_block_index).await {
+        Ok(receipt) => Ok(receipt),
+        Err(error) => {
+            schedule_withdrawal_fee_reimbursement(
+                runtime,
+                cksol_burn_block_index,
+                &error,
+                CKSOL_LEDGER_TRANSACTION_FEE,
+            );
+            Err(WithdrawSplError::CkSplLedgerError {
+                cksol_burn_block_index,
+                error: error.into(),
+            })
+        }
+    }
 }
 
 /// Burns the ckSOL fee and saves the terms before the token burn is attempted.

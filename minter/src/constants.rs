@@ -1,5 +1,9 @@
 use std::{num::NonZeroUsize, time::Duration};
 
+/// The ckSOL ledger transfer fee in lamports, matching its ledger install proposal.
+/// Deducted from fee reimbursements after user-caused token burn failures.
+pub const CKSOL_LEDGER_TRANSACTION_FEE: u64 = 500;
+
 /// The minter-owned ledger subaccount collecting SPL deposit fees. It is the fee collector
 /// subaccount of the ledgers, `0x0fee`.
 pub const SPL_FEE_SUBACCOUNT: [u8; 32] = {

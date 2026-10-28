@@ -943,3 +943,195 @@ fn assert_quarantined(pending: PendingSplWithdrawalFeeReimbursement) {
         },
     );
 }
+
+#[tokio::test]
+async fn should_reject_invalid_withdrawals_before_either_burn() {
+    init_state();
+    init_schnorr_master_key();
+    let token = register_token(TokenProgram::Classic);
+    let request = withdrawal_terms(&token);
+    let before = read_state(Clone::clone);
+    let runtime = TestCanisterRuntime::new();
+    assert!(matches!(
+        withdraw(
+            &runtime,
+            request.account,
+            token.mint,
+            0,
+            &request.address.to_string(),
+            true
+        )
+        .await,
+        Err(WithdrawSplError::ValueTooSmall { .. })
+    ));
+    assert!(matches!(
+        withdraw(
+            &runtime,
+            request.account,
+            token.mint,
+            1,
+            "not an address",
+            true
+        )
+        .await,
+        Err(WithdrawSplError::MalformedAddress(_))
+    ));
+    assert!(runtime.sent_update_calls().is_empty());
+    read_state(|state| assert_eq!(state, &before));
+}
+
+async fn withdraw_request(
+    runtime: &TestCanisterRuntime,
+    request: &SplWithdrawalRequestTerms,
+) -> Result<WithdrawSplOk, WithdrawSplError> {
+    withdraw(
+        runtime,
+        request.account,
+        request.mint,
+        request.amount,
+        &request.address.to_string(),
+        request.create_destination_account,
+    )
+    .await
+}
+
+#[test]
+fn should_preserve_ledger_amounts_larger_than_u64_in_spl_burn_errors() {
+    let amount = Nat::from(u128::MAX);
+    for (error, expected) in [
+        (
+            TransferFromError::InsufficientFunds {
+                balance: amount.clone(),
+            },
+            LedgerError::InsufficientFunds {
+                balance: amount.clone(),
+            },
+        ),
+        (
+            TransferFromError::InsufficientAllowance {
+                allowance: amount.clone(),
+            },
+            LedgerError::InsufficientAllowance {
+                allowance: amount.clone(),
+            },
+        ),
+        (
+            TransferFromError::BadBurn {
+                min_burn_amount: amount.clone(),
+            },
+            LedgerError::AmountTooLow {
+                minimum_burn_amount: amount.clone(),
+            },
+        ),
+    ] {
+        assert_eq!(
+            LedgerError::from(SplBurnError::TransferFrom(error)),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_accept_a_withdrawal_with_both_burns_under_one_guard() {
+    init_state();
+    init_schnorr_master_key();
+    let token = register_token(TokenProgram::Classic);
+    let request = withdrawal_terms(&token);
+    let runtime = TestCanisterRuntime::new()
+        .with_increasing_time_from(123)
+        .add_stub_response(Ok::<Nat, TransferFromError>(42_u64.into()))
+        .add_stub_response(Ok::<Nat, TransferFromError>(7_u64.into()));
+    assert_eq!(
+        withdraw_request(&runtime, &request).await,
+        Ok(WithdrawSplOk {
+            cksol_burn_block_index: 42,
+            ckspl_burn_block_index: 7
+        })
+    );
+    assert_eq!(runtime.sent_update_calls().len(), 2);
+    read_state(|state| {
+        assert_eq!(
+            state.pending_spl_withdrawal_requests()[&42.into()]
+                .request
+                .terms,
+            request
+        )
+    });
+    assert!(withdrawal_guard(request.account).is_ok());
+}
+
+#[tokio::test]
+async fn should_refund_a_rejected_token_burn_but_preserve_an_unknown_outcome() {
+    for unknown in [false, true] {
+        reset_state();
+        reset_events();
+        init_state();
+        init_schnorr_master_key();
+        let token = register_token(TokenProgram::Classic);
+        let request = withdrawal_terms(&token);
+        let runtime = TestCanisterRuntime::new()
+            .with_increasing_time_from(123)
+            .add_stub_response(Ok::<Nat, TransferFromError>(42_u64.into()));
+        let runtime = if unknown {
+            runtime.add_stub_error(IcError::CallPerformFailed)
+        } else {
+            runtime.add_stub_response(Err::<Nat, _>(TransferFromError::InsufficientFunds {
+                balance: 0_u64.into(),
+            }))
+        };
+        assert!(matches!(withdraw_request(&runtime, &request).await,
+            Err(WithdrawSplError::CkSplLedgerError { cksol_burn_block_index, .. }) if cksol_burn_block_index == 42.into()));
+        read_state(|state| {
+            assert!(state.pending_spl_withdrawal_requests().is_empty());
+            assert_eq!(
+                state
+                    .fee_burned_spl_withdrawal_requests()
+                    .contains_key(&42.into()),
+                unknown
+            );
+            if !unknown {
+                assert_eq!(
+                    state.pending_spl_withdrawal_fee_reimbursements()[&42.into()]
+                        .request
+                        .reimbursed_amount,
+                    request.fee - CKSOL_LEDGER_TRANSACTION_FEE
+                );
+            } else {
+                assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
+            }
+        });
+        assert!(withdrawal_guard(request.account).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn should_stop_before_token_burn_if_the_guard_or_fee_burn_fails() {
+    init_state();
+    init_schnorr_master_key();
+    let token = register_token(TokenProgram::Classic);
+    let request = withdrawal_terms(&token);
+    let runtime = TestCanisterRuntime::new().add_stub_response(Err::<Nat, _>(
+        TransferFromError::InsufficientAllowance {
+            allowance: 0_u64.into(),
+        },
+    ));
+    let events_before = EventsAssert::from_recorded();
+    let guard = withdrawal_guard(request.account).unwrap();
+    assert_eq!(
+        withdraw_request(&runtime, &request).await,
+        Err(WithdrawSplError::AlreadyProcessing)
+    );
+    assert!(runtime.sent_update_calls().is_empty());
+    drop(guard);
+    assert_eq!(
+        withdraw_request(&runtime, &request).await,
+        Err(WithdrawSplError::CkSolLedgerError {
+            error: LedgerError::InsufficientAllowance {
+                allowance: 0_u64.into()
+            }
+        })
+    );
+    assert_eq!(runtime.sent_update_calls().len(), 1);
+    assert!(withdrawal_guard(request.account).is_ok());
+    assert_eq!(EventsAssert::from_recorded(), events_before);
+}
