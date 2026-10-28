@@ -319,8 +319,10 @@ pub enum EventType {
     /// The ckSOL fee burn succeeded; the token burn has not yet been recorded.
     #[n(25)]
     BurnedCkSolWithdrawalFee {
+        /// The fee burn block index on the ckSOL ledger, also the withdrawal ID.
         #[cbor(n(0), with = "cbor::id")]
         cksol_burn_block_index: LedgerBurnIndex,
+        /// The withdrawal terms saved before attempting the token burn.
         #[n(1)]
         request: SplWithdrawalRequestTerms,
     },
@@ -330,6 +332,23 @@ pub enum EventType {
     /// The token burn definitively failed; reimburse the already burned ckSOL fee.
     #[n(27)]
     FailedSplWithdrawalRequest(#[n(0)] SplWithdrawalFeeReimbursementRequest),
+    /// The ckSOL fee of a failed SPL withdrawal was minted back.
+    #[n(28)]
+    ReimbursedSplWithdrawalFee {
+        /// The fee burn index on the ckSOL ledger, also the withdrawal ID.
+        #[cbor(n(0), with = "cbor::id")]
+        cksol_burn_block_index: LedgerBurnIndex,
+        /// The reimbursement mint index on the ckSOL ledger.
+        #[cbor(n(1), with = "cbor::id")]
+        mint_block_index: LedgerMintIndex,
+    },
+    /// A fee reimbursement cannot be safely retried and requires manual resolution.
+    #[n(29)]
+    QuarantinedSplWithdrawalFeeReimbursement {
+        /// The fee burn index on the ckSOL ledger, also the withdrawal ID.
+        #[cbor(n(0), with = "cbor::id")]
+        cksol_burn_block_index: LedgerBurnIndex,
+    },
 }
 
 /// A ckSOL fee reimbursement for an SPL withdrawal whose token burn failed.

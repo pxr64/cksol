@@ -265,6 +265,18 @@ pub enum EventType {
         /// The account from which the ckSOL fee was burned.
         to: Account,
     },
+    /// The ckSOL fee of a failed SPL withdrawal was minted back.
+    ReimbursedSplWithdrawalFee {
+        /// The fee burn index on the ckSOL ledger.
+        cksol_burn_block_index: u64,
+        /// The reimbursement mint index on the ckSOL ledger.
+        mint_block_index: u64,
+    },
+    /// A fee reimbursement cannot be safely retried and requires manual resolution.
+    QuarantinedSplWithdrawalFeeReimbursement {
+        /// The fee burn index on the ckSOL ledger, also the withdrawal ID.
+        cksol_burn_block_index: u64,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

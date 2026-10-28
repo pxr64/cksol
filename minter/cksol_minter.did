@@ -865,6 +865,15 @@ type EventType = variant {
         reimbursed_amount : Lamport;
         to : Account;
     };
+    // The ckSOL fee of a failed SPL withdrawal was minted back.
+    ReimbursedSplWithdrawalFee : record {
+        cksol_burn_block_index : nat64;
+        mint_block_index : nat64;
+    };
+    // A fee reimbursement cannot be safely retried and requires manual resolution.
+    QuarantinedSplWithdrawalFeeReimbursement : record {
+        cksol_burn_block_index : nat64;
+    };
 };
 
 // A minter event.

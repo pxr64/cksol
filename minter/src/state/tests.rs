@@ -905,6 +905,8 @@ mod state_from_init_args {
                 pending_spl_withdrawal_requests: BTreeMap::new(),
                 spl_withdrawal_token_burns: BTreeSet::new(),
                 pending_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
+                completed_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
+                quarantined_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
             }
         );
     }
@@ -1780,8 +1782,8 @@ mod spl_withdrawals {
         lifecycle,
         numeric::LedgerBurnIndex,
         state::{
-            FeeBurnedSplWithdrawalRequest, PendingSplWithdrawalFeeReimbursement,
-            PendingSplWithdrawalRequest, State, TokenProgram,
+            CompletedSplWithdrawalFeeReimbursement, FeeBurnedSplWithdrawalRequest,
+            PendingSplWithdrawalFeeReimbursement, PendingSplWithdrawalRequest, State, TokenProgram,
             audit::{process_event, replay_events},
             event::{
                 Event, EventType, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
@@ -1794,7 +1796,10 @@ mod spl_withdrawals {
     };
     use candid::Principal;
     use ic_stable_structures::Storable;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::{
+        collections::BTreeMap,
+        panic::{AssertUnwindSafe, catch_unwind},
+    };
 
     fn request(mint_byte: u8) -> SplWithdrawalRequestTerms {
         let token = spl_token([mint_byte; 32].into(), TokenProgram::Classic);
@@ -1828,6 +1833,157 @@ mod spl_withdrawals {
             2,
         );
         request
+    }
+
+    #[test]
+    fn should_replay_a_completed_fee_reimbursement_and_preserve_other_pending_refunds() {
+        let request = setup();
+        for id in [100_u64, 101] {
+            record_fee_burn(id, &request);
+            reimburse_fee(id, request.fee, request.account);
+        }
+        let completed = EventType::ReimbursedSplWithdrawalFee {
+            cksol_burn_block_index: 100.into(),
+            mint_block_index: 200.into(),
+        };
+        record(completed.clone(), 40);
+        assert!(catch_unwind(AssertUnwindSafe(|| record(completed, 50))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| record_fee_burn(100, &request))).is_err());
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| reimburse_fee(
+                100,
+                request.fee,
+                request.account
+            )))
+            .is_err()
+        );
+        assert!(catch_unwind(AssertUnwindSafe(|| accept(100, 7, &request))).is_err());
+        let replayed = assert_replay_matches();
+        assert_eq!(
+            replayed.completed_spl_withdrawal_fee_reimbursements(),
+            &BTreeMap::from([(
+                100.into(),
+                CompletedSplWithdrawalFeeReimbursement {
+                    request: SplWithdrawalFeeReimbursementRequest {
+                        cksol_burn_block_index: 100.into(),
+                        reimbursed_amount: request.fee,
+                        to: request.account,
+                    },
+                    mint_block_index: 200.into(),
+                    fee_burned_at: 10,
+                    created_at: 30,
+                    reimbursed_at: 40,
+                }
+            )])
+        );
+        assert_eq!(
+            replayed
+                .pending_spl_withdrawal_fee_reimbursements()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![101.into()]
+        );
+    }
+
+    #[test]
+    fn should_reject_fee_reimbursement_completion_without_a_pending_refund() {
+        let request = setup();
+        record_fee_burn(100, &request);
+        for id in [100_u64, 101] {
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| record(
+                    EventType::ReimbursedSplWithdrawalFee {
+                        cksol_burn_block_index: id.into(),
+                        mint_block_index: 200.into(),
+                    },
+                    40
+                )))
+                .is_err()
+            );
+        }
+        let replayed = assert_replay_matches();
+        assert!(
+            replayed
+                .completed_spl_withdrawal_fee_reimbursements()
+                .is_empty()
+        );
+        assert!(
+            replayed
+                .fee_burned_spl_withdrawal_requests()
+                .contains_key(&100.into())
+        );
+    }
+
+    #[test]
+    fn should_replay_quarantine_and_keep_the_original_refund_out_of_the_pending_queue() {
+        let request = setup();
+        for id in [100_u64, 101] {
+            record_fee_burn(id, &request);
+            reimburse_fee(id, request.fee, request.account);
+        }
+        let original = read_state(|state| {
+            state.pending_spl_withdrawal_fee_reimbursements()[&100.into()].clone()
+        });
+        let quarantined = EventType::QuarantinedSplWithdrawalFeeReimbursement {
+            cksol_burn_block_index: 100.into(),
+        };
+        record(quarantined.clone(), 40);
+        assert!(catch_unwind(AssertUnwindSafe(|| record(quarantined, 50))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| record_fee_burn(100, &request))).is_err());
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| reimburse_fee(
+                100,
+                request.fee,
+                request.account
+            )))
+            .is_err()
+        );
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                EventType::ReimbursedSplWithdrawalFee {
+                    cksol_burn_block_index: 100.into(),
+                    mint_block_index: 200.into(),
+                },
+                50
+            )))
+            .is_err()
+        );
+        let replayed = assert_replay_matches();
+        assert_eq!(
+            replayed.quarantined_spl_withdrawal_fee_reimbursements(),
+            &BTreeMap::from([(100.into(), original)])
+        );
+        assert_eq!(
+            replayed
+                .pending_spl_withdrawal_fee_reimbursements()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![101.into()]
+        );
+    }
+
+    #[test]
+    fn should_reject_quarantine_without_a_pending_refund() {
+        let request = setup();
+        record_fee_burn(100, &request);
+        for id in [100_u64, 101] {
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| record(
+                    EventType::QuarantinedSplWithdrawalFeeReimbursement {
+                        cksol_burn_block_index: id.into(),
+                    },
+                    40
+                )))
+                .is_err()
+            );
+        }
+        assert!(
+            assert_replay_matches()
+                .quarantined_spl_withdrawal_fee_reimbursements()
+                .is_empty()
+        );
     }
 
     fn record_fee_burn(id: u64, request: &SplWithdrawalRequestTerms) {

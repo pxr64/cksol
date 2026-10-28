@@ -205,6 +205,18 @@ impl From<EventType> for CandidEventType {
                     ckspl_burn_block_index: *request.ckspl_burn_block_index.get(),
                 }
             }
+            EventType::QuarantinedSplWithdrawalFeeReimbursement {
+                cksol_burn_block_index,
+            } => CandidEventType::QuarantinedSplWithdrawalFeeReimbursement {
+                cksol_burn_block_index: *cksol_burn_block_index.get(),
+            },
+            EventType::ReimbursedSplWithdrawalFee {
+                cksol_burn_block_index,
+                mint_block_index,
+            } => CandidEventType::ReimbursedSplWithdrawalFee {
+                cksol_burn_block_index: *cksol_burn_block_index.get(),
+                mint_block_index: *mint_block_index.get(),
+            },
             EventType::FailedSplWithdrawalRequest(request) => {
                 CandidEventType::FailedSplWithdrawalRequest {
                     cksol_burn_block_index: *request.cksol_burn_block_index.get(),
@@ -483,6 +495,18 @@ impl TryFrom<CandidEventType> for EventType {
                 cksol_burn_block_index: LedgerBurnIndex::new(cksol_burn_block_index),
                 ckspl_burn_block_index: LedgerBurnIndex::new(ckspl_burn_block_index),
             }),
+            CandidEventType::QuarantinedSplWithdrawalFeeReimbursement {
+                cksol_burn_block_index,
+            } => EventType::QuarantinedSplWithdrawalFeeReimbursement {
+                cksol_burn_block_index: LedgerBurnIndex::new(cksol_burn_block_index),
+            },
+            CandidEventType::ReimbursedSplWithdrawalFee {
+                cksol_burn_block_index,
+                mint_block_index,
+            } => EventType::ReimbursedSplWithdrawalFee {
+                cksol_burn_block_index: LedgerBurnIndex::new(cksol_burn_block_index),
+                mint_block_index: LedgerMintIndex::new(mint_block_index),
+            },
             CandidEventType::FailedSplWithdrawalRequest {
                 cksol_burn_block_index,
                 reimbursed_amount,

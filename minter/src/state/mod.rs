@@ -156,6 +156,10 @@ pub struct State {
     spl_withdrawal_token_burns: BTreeSet<(Principal, LedgerBurnIndex)>,
     pending_spl_withdrawal_fee_reimbursements:
         BTreeMap<LedgerBurnIndex, PendingSplWithdrawalFeeReimbursement>,
+    completed_spl_withdrawal_fee_reimbursements:
+        BTreeMap<LedgerBurnIndex, CompletedSplWithdrawalFeeReimbursement>,
+    quarantined_spl_withdrawal_fee_reimbursements:
+        BTreeMap<LedgerBurnIndex, PendingSplWithdrawalFeeReimbursement>,
 }
 
 impl State {
@@ -804,6 +808,56 @@ impl State {
         &self.pending_spl_withdrawal_fee_reimbursements
     }
 
+    pub fn completed_spl_withdrawal_fee_reimbursements(
+        &self,
+    ) -> &BTreeMap<LedgerBurnIndex, CompletedSplWithdrawalFeeReimbursement> {
+        &self.completed_spl_withdrawal_fee_reimbursements
+    }
+
+    pub fn quarantined_spl_withdrawal_fee_reimbursements(
+        &self,
+    ) -> &BTreeMap<LedgerBurnIndex, PendingSplWithdrawalFeeReimbursement> {
+        &self.quarantined_spl_withdrawal_fee_reimbursements
+    }
+
+    fn process_quarantined_spl_withdrawal_fee_reimbursement(
+        &mut self,
+        burn_index: LedgerBurnIndex,
+    ) {
+        let pending = self
+            .pending_spl_withdrawal_fee_reimbursements
+            .remove(&burn_index)
+            .unwrap_or_else(|| {
+                panic!("Attempted to quarantine the fee reimbursement of SPL withdrawal {burn_index} that has no pending request")
+            });
+        self.quarantined_spl_withdrawal_fee_reimbursements
+            .insert(burn_index, pending);
+    }
+
+    fn process_reimbursed_spl_withdrawal_fee(
+        &mut self,
+        burn_index: LedgerBurnIndex,
+        mint_block_index: &LedgerMintIndex,
+        reimbursed_at: u64,
+    ) {
+        let pending = self
+            .pending_spl_withdrawal_fee_reimbursements
+            .remove(&burn_index)
+            .unwrap_or_else(|| {
+                panic!("Attempted to complete the fee reimbursement of SPL withdrawal {burn_index} that has no pending request")
+            });
+        self.completed_spl_withdrawal_fee_reimbursements.insert(
+            burn_index,
+            CompletedSplWithdrawalFeeReimbursement {
+                request: pending.request,
+                mint_block_index: *mint_block_index,
+                fee_burned_at: pending.fee_burned_at,
+                created_at: pending.created_at,
+                reimbursed_at,
+            },
+        );
+    }
+
     fn process_burned_cksol_withdrawal_fee(
         &mut self,
         cksol_burn_block_index: LedgerBurnIndex,
@@ -835,6 +889,12 @@ impl State {
                     .contains_key(&cksol_burn_block_index)
                 && !self
                     .pending_spl_withdrawal_fee_reimbursements
+                    .contains_key(&cksol_burn_block_index)
+                && !self
+                    .completed_spl_withdrawal_fee_reimbursements
+                    .contains_key(&cksol_burn_block_index)
+                && !self
+                    .quarantined_spl_withdrawal_fee_reimbursements
                     .contains_key(&cksol_burn_block_index),
             "Attempted to record an already recorded SPL withdrawal fee burn: {cksol_burn_block_index}"
         );
@@ -1356,6 +1416,8 @@ impl TryFrom<InitArgs> for State {
             pending_spl_withdrawal_requests: BTreeMap::new(),
             spl_withdrawal_token_burns: BTreeSet::new(),
             pending_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
+            completed_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
+            quarantined_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
         };
         state.validate()?;
         Ok(state)
@@ -1383,6 +1445,16 @@ pub struct PendingSplWithdrawalFeeReimbursement {
     pub request: SplWithdrawalFeeReimbursementRequest,
     pub fee_burned_at: u64,
     pub created_at: u64,
+}
+
+/// A failed token burn whose ckSOL fee was minted back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedSplWithdrawalFeeReimbursement {
+    pub request: SplWithdrawalFeeReimbursementRequest,
+    pub mint_block_index: LedgerMintIndex,
+    pub fee_burned_at: u64,
+    pub created_at: u64,
+    pub reimbursed_at: u64,
 }
 
 /// A pending withdrawal request.

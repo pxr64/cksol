@@ -1986,6 +1986,19 @@ pub mod arb {
                     )
                 },
             ),
+            (arb_ledger_burn_index(), arb_ledger_mint_index()).prop_map(
+                |(cksol_burn_block_index, mint_block_index)| {
+                    EventType::ReimbursedSplWithdrawalFee {
+                        cksol_burn_block_index,
+                        mint_block_index,
+                    }
+                },
+            ),
+            arb_ledger_burn_index().prop_map(|cksol_burn_block_index| {
+                EventType::QuarantinedSplWithdrawalFeeReimbursement {
+                    cksol_burn_block_index,
+                }
+            }),
             (arb_ledger_burn_index(), any::<u64>(), arb_account()).prop_map(
                 |(cksol_burn_block_index, reimbursed_amount, to)| {
                     EventType::FailedSplWithdrawalRequest(

@@ -154,6 +154,21 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
         EventType::AcceptedSplWithdrawalRequest(request) => {
             state.process_accepted_spl_withdrawal(request, timestamp);
         }
+        EventType::QuarantinedSplWithdrawalFeeReimbursement {
+            cksol_burn_block_index,
+        } => {
+            state.process_quarantined_spl_withdrawal_fee_reimbursement(*cksol_burn_block_index);
+        }
+        EventType::ReimbursedSplWithdrawalFee {
+            cksol_burn_block_index,
+            mint_block_index,
+        } => {
+            state.process_reimbursed_spl_withdrawal_fee(
+                *cksol_burn_block_index,
+                mint_block_index,
+                timestamp,
+            );
+        }
         EventType::FailedSplWithdrawalRequest(request) => {
             state.process_failed_spl_withdrawal(request, timestamp);
         }
