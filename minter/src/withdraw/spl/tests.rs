@@ -1,7 +1,11 @@
 use super::*;
 use crate::{
-    guard::withdrawal_guard,
-    state::{TokenProgram, audit::process_event, event::EventType, mutate_state},
+    constants::LEDGER_DEDUPLICATION_WINDOW,
+    guard::{TimerGuard, withdrawal_guard},
+    state::{
+        TaskType, TokenProgram, audit::process_event, event::EventType, mutate_state, reset_state,
+    },
+    storage::reset_events,
     test_fixtures::{
         EventsAssert, MINTER_ADDRESS, NONCE_ACCOUNT, account, init_schnorr_master_key, init_state,
         ledger_canister_id, runtime::TestCanisterRuntime, spl_token,
@@ -10,7 +14,7 @@ use crate::{
 use candid::Nat;
 use ic_canister_runtime::IcError;
 use icrc_ledger_types::{
-    icrc1::account::Account,
+    icrc1::{account::Account, transfer::TransferError},
     icrc2::transfer_from::{TransferFromArgs, TransferFromError},
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -729,4 +733,213 @@ fn should_not_schedule_a_second_refund_for_the_same_fee_burn() {
             },
         ))
         .assert_no_more_events();
+}
+
+#[test]
+fn should_build_fee_reimbursement_mint_arguments_from_the_recorded_request() {
+    for (subaccount, reimbursed_amount) in [(None, 100_000_u64), (Some([7; 32]), 90_000)] {
+        let to = Account {
+            subaccount,
+            ..account(1)
+        };
+        let pending = PendingSplWithdrawalFeeReimbursement {
+            request: SplWithdrawalFeeReimbursementRequest {
+                cksol_burn_block_index: 42.into(),
+                reimbursed_amount,
+                to,
+            },
+            fee_burned_at: 123,
+            created_at: 999,
+        };
+
+        let args = fee_reimbursement_transfer_arg(&pending);
+
+        assert_eq!(args.to, to);
+        assert_eq!(args.amount, Nat::from(reimbursed_amount));
+        assert_eq!(args.from_subaccount, None);
+        assert_eq!(args.fee, None);
+        assert_eq!(args.created_at_time, Some(999));
+        assert_eq!(
+            minicbor::decode::<Memo>(&args.memo.unwrap().0).unwrap(),
+            Memo::Mint(MintMemo::SplWithdrawalFeeReimbursement {
+                cksol_burn_block_index: 42,
+            }),
+        );
+    }
+}
+
+fn queued_fee_reimbursement() -> PendingSplWithdrawalFeeReimbursement {
+    reset_state();
+    reset_events();
+    init_state();
+    let token = register_token(TokenProgram::Classic);
+    queue_fee_reimbursement(&token, 42.into())
+}
+
+fn queue_fee_reimbursement(
+    token: &SupportedSplToken,
+    cksol_burn_block_index: LedgerBurnIndex,
+) -> PendingSplWithdrawalFeeReimbursement {
+    record_fee_checkpoint(&withdrawal_terms(token), cksol_burn_block_index);
+    schedule_withdrawal_fee_reimbursement(
+        &TestCanisterRuntime::new().with_time(999),
+        cksol_burn_block_index,
+        &SplBurnError::TransferFrom(TransferFromError::TemporarilyUnavailable),
+        10_000,
+    );
+    read_state(|state| {
+        state.pending_spl_withdrawal_fee_reimbursements()[&cksol_burn_block_index].clone()
+    })
+}
+
+fn reimbursement_runtime<I: IntoIterator<Item = Result<Nat, TransferError>>>(
+    replies: I,
+) -> TestCanisterRuntime {
+    let mut runtime = TestCanisterRuntime::new().with_increasing_time_from(1_000);
+    for reply in replies {
+        runtime = runtime.add_stub_response(reply);
+    }
+    runtime
+}
+
+fn assert_reimbursed(cksol_burn_block_index: LedgerBurnIndex, mint_block_index: u64) {
+    read_state(|state| {
+        assert!(
+            !state
+                .pending_spl_withdrawal_fee_reimbursements()
+                .contains_key(&cksol_burn_block_index)
+        );
+        assert_eq!(
+            state.completed_spl_withdrawal_fee_reimbursements()[&cksol_burn_block_index]
+                .mint_block_index,
+            mint_block_index.into()
+        );
+    });
+    EventsAssert::from_recorded().expect_contains_event_eq(EventType::ReimbursedSplWithdrawalFee {
+        cksol_burn_block_index,
+        mint_block_index: mint_block_index.into(),
+    });
+}
+
+#[tokio::test]
+async fn should_reimburse_a_pending_fee_with_fixed_arguments() {
+    let pending = queued_fee_reimbursement();
+    let runtime = reimbursement_runtime([Ok(100_u64.into())]);
+
+    process_pending_fee_reimbursements(runtime.clone()).await;
+
+    let calls = runtime.sent_update_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].canister_id, ledger_canister_id());
+    assert_eq!(calls[0].method, "icrc1_transfer");
+    let (args,): (TransferArg,) = calls[0].args();
+    assert_eq!(args, fee_reimbursement_transfer_arg(&pending));
+    assert_reimbursed(42.into(), 100);
+}
+
+#[tokio::test]
+async fn should_record_a_duplicate_reply_as_reimbursed() {
+    queued_fee_reimbursement();
+    let runtime = reimbursement_runtime([Err(TransferError::Duplicate {
+        duplicate_of: 100_u64.into(),
+    })]);
+
+    process_pending_fee_reimbursements(runtime).await;
+
+    assert_reimbursed(42.into(), 100);
+}
+
+#[tokio::test]
+async fn should_reimburse_every_pending_fee_in_one_round() {
+    queued_fee_reimbursement();
+    let token = read_state(|state| state.supported_spl_token(&[3; 32].into()).cloned()).unwrap();
+    queue_fee_reimbursement(&token, 43.into());
+    let runtime = reimbursement_runtime([Ok(100_u64.into()), Ok(101_u64.into())]);
+
+    process_pending_fee_reimbursements(runtime.clone()).await;
+
+    assert_eq!(runtime.sent_update_calls().len(), 2);
+    assert_reimbursed(42.into(), 100);
+    assert_reimbursed(43.into(), 101);
+}
+
+#[tokio::test]
+async fn should_keep_the_reimbursement_pending_after_a_transient_failure() {
+    for runtime in [
+        reimbursement_runtime([Err(TransferError::TemporarilyUnavailable)]),
+        reimbursement_runtime([]).add_stub_error(IcError::CallPerformFailed),
+    ] {
+        let pending = queued_fee_reimbursement();
+        let before = read_state(Clone::clone);
+
+        process_pending_fee_reimbursements(runtime.clone()).await;
+
+        assert_eq!(runtime.sent_update_calls().len(), 1);
+        read_state(|state| {
+            assert_eq!(state, &before);
+            assert_eq!(
+                state.pending_spl_withdrawal_fee_reimbursements()[&42.into()],
+                pending
+            );
+        });
+    }
+}
+
+#[tokio::test]
+async fn should_quarantine_an_expired_reimbursement_without_calling_the_ledger() {
+    let pending = queued_fee_reimbursement();
+    let expired = pending.created_at + LEDGER_DEDUPLICATION_WINDOW.as_nanos() as u64 + 1;
+    let runtime = TestCanisterRuntime::new().with_time(expired);
+
+    process_pending_fee_reimbursements(runtime.clone()).await;
+
+    assert!(runtime.sent_update_calls().is_empty());
+    assert_quarantined(pending);
+}
+
+#[tokio::test]
+async fn should_quarantine_a_reimbursement_the_ledger_rejects_as_too_old() {
+    let pending = queued_fee_reimbursement();
+    let runtime = reimbursement_runtime([Err(TransferError::TooOld)]);
+
+    process_pending_fee_reimbursements(runtime).await;
+
+    assert_quarantined(pending);
+}
+
+#[tokio::test]
+async fn should_skip_the_round_while_another_one_runs() {
+    let pending = queued_fee_reimbursement();
+    let runtime = reimbursement_runtime([Ok(100_u64.into())]);
+    let _guard = TimerGuard::new(TaskType::ReimburseSplWithdrawalFees).unwrap();
+
+    process_pending_fee_reimbursements(runtime.clone()).await;
+
+    assert!(runtime.sent_update_calls().is_empty());
+    read_state(|state| {
+        assert_eq!(
+            state.pending_spl_withdrawal_fee_reimbursements()[&42.into()],
+            pending
+        )
+    });
+}
+
+fn assert_quarantined(pending: PendingSplWithdrawalFeeReimbursement) {
+    let cksol_burn_block_index = pending.request.cksol_burn_block_index;
+    read_state(|state| {
+        assert!(
+            !state
+                .pending_spl_withdrawal_fee_reimbursements()
+                .contains_key(&cksol_burn_block_index)
+        );
+        assert_eq!(
+            state.quarantined_spl_withdrawal_fee_reimbursements()[&cksol_burn_block_index],
+            pending
+        );
+    });
+    EventsAssert::from_recorded().expect_contains_event_eq(
+        EventType::QuarantinedSplWithdrawalFeeReimbursement {
+            cksol_burn_block_index,
+        },
+    );
 }

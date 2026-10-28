@@ -1,11 +1,13 @@
 use crate::{
     address::{associated_token_address, minter_address, minter_public_key},
+    deposit::mint::{MintQueue, mint_pending, process_pending_mints_round},
     guard::GuardError,
     ledger::{self, BurnError, spl::SplBurnError},
     numeric::LedgerBurnIndex,
+    queue_cursor::QueueCursors,
     runtime::CanisterRuntime,
     state::{
-        SupportedSplToken, TokenProgram,
+        PendingSplWithdrawalFeeReimbursement, State, SupportedSplToken, TokenProgram,
         audit::process_event,
         event::{
             EventType, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
@@ -15,12 +17,12 @@ use crate::{
     },
 };
 use canlog::log;
-use cksol_types::{Memo, WithdrawSplOk};
+use cksol_types::{Memo, MintMemo, WithdrawSplOk};
 use cksol_types_internal::log::Priority;
-use icrc_ledger_types::icrc2::transfer_from::TransferFromError;
+use icrc_ledger_types::{icrc1::transfer::TransferArg, icrc2::transfer_from::TransferFromError};
 use sol_rpc_types::Lamport;
 use solana_address::Address;
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 #[cfg(test)]
 mod tests;
@@ -252,4 +254,72 @@ pub fn schedule_withdrawal_fee_reimbursement<R: CanisterRuntime>(
         "Scheduled reimbursement of {reimbursed_amount} lamports of ckSOL to {:?} for SPL withdrawal {cksol_burn_block_index} after its token burn failed: {error}",
         request.account,
     );
+}
+
+/// Builds the fixed mint arguments of a fee reimbursement, so a retry is deduplicated.
+pub fn fee_reimbursement_transfer_arg(
+    pending: &PendingSplWithdrawalFeeReimbursement,
+) -> TransferArg {
+    TransferArg {
+        from_subaccount: None,
+        to: pending.request.to,
+        fee: None,
+        created_at_time: Some(pending.created_at),
+        memo: Some(
+            Memo::from(MintMemo::spl_withdrawal_fee_reimbursement(
+                *pending.request.cksol_burn_block_index.get(),
+            ))
+            .into(),
+        ),
+        amount: pending.request.reimbursed_amount.into(),
+    }
+}
+
+thread_local! {
+    /// Where the previous reimbursement round stopped. The cursor resets on upgrade;
+    /// the mint arguments live in the event log.
+    static FEE_REIMBURSEMENT_CURSOR: QueueCursors<MintQueue, LedgerBurnIndex> =
+        const { QueueCursors::new() };
+}
+
+pub fn reset_fee_reimbursement_cursor() {
+    FEE_REIMBURSEMENT_CURSOR.with(QueueCursors::reset);
+}
+
+/// Mints the queued fee reimbursements in bounded rounds, like the deposit mints.
+pub async fn process_pending_fee_reimbursements<R: CanisterRuntime>(runtime: R) {
+    let run_again = process_pending_mints_round(
+        &runtime,
+        MintQueue::SplFeeReimbursement,
+        &FEE_REIMBURSEMENT_CURSOR,
+        |state: &State| state.pending_spl_withdrawal_fee_reimbursements(),
+        process_pending_fee_reimbursement,
+    )
+    .await;
+    if run_again {
+        runtime.set_timer(Duration::ZERO, process_pending_fee_reimbursements);
+    }
+}
+
+async fn process_pending_fee_reimbursement<R: CanisterRuntime>(
+    runtime: &R,
+    cksol_burn_block_index: LedgerBurnIndex,
+    pending: PendingSplWithdrawalFeeReimbursement,
+) {
+    let client = read_state(|state| state.ledger_client(runtime.inter_canister_call_runtime()));
+    mint_pending(
+        runtime,
+        MintQueue::SplFeeReimbursement,
+        client,
+        fee_reimbursement_transfer_arg(&pending),
+        |mint_block_index| EventType::ReimbursedSplWithdrawalFee {
+            cksol_burn_block_index,
+            mint_block_index,
+        },
+        EventType::QuarantinedSplWithdrawalFeeReimbursement {
+            cksol_burn_block_index,
+        },
+        &format!("fee reimbursement of SPL withdrawal {cksol_burn_block_index}"),
+    )
+    .await;
 }

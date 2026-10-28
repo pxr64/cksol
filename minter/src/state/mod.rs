@@ -89,6 +89,7 @@ pub fn reset_state() {
         *s.borrow_mut() = None;
     });
     crate::deposit::reset_cursors();
+    crate::withdraw::spl::reset_fee_reimbursement_cursor();
 }
 
 pub fn mutate_state<F, R>(f: F) -> R
