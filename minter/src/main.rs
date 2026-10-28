@@ -12,7 +12,10 @@ use cksol_minter::{
     monitor::{FINALIZE_TRANSACTIONS_DELAY, finalize_transactions},
     runtime::IcCanisterRuntime,
     state::read_state,
-    withdraw::{WITHDRAWAL_PROCESSING_DELAY, process_pending_withdrawals},
+    withdraw::{
+        WITHDRAWAL_PROCESSING_DELAY, process_pending_withdrawals,
+        spl::process_pending_fee_reimbursements,
+    },
 };
 use cksol_types::{
     AddSplTokenArgs, AddSplTokenError, Address, DepositSolArgs, DepositSolError, DepositSolId,
@@ -324,6 +327,9 @@ fn setup_timers() {
     });
     ic_cdk_timers::set_timer_interval(PROCESS_PENDING_MINTS_DELAY, async || {
         process_pending_spl_mints(IcCanisterRuntime::new()).await;
+    });
+    ic_cdk_timers::set_timer_interval(PROCESS_PENDING_MINTS_DELAY, async || {
+        process_pending_fee_reimbursements(IcCanisterRuntime::new()).await;
     });
     ic_cdk_timers::set_timer_interval(FINALIZE_TRANSACTIONS_DELAY, async || {
         finalize_transactions(IcCanisterRuntime::new()).await;
