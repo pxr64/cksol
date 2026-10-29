@@ -242,13 +242,6 @@ pub enum EventType {
         /// The nonce value the transaction carries in place of a recent blockhash.
         nonce_value: Hash,
     },
-    /// The ckSOL fee burn succeeded; the token burn has not yet been recorded.
-    BurnedCkSolWithdrawalFee {
-        /// The fee burn block index on the ckSOL ledger, also the withdrawal ID.
-        cksol_burn_block_index: u64,
-        /// The withdrawal terms saved before attempting the token burn.
-        request: SplWithdrawalRequestTerms,
-    },
     /// The token burn succeeded and the withdrawal was accepted for processing.
     AcceptedSplWithdrawalRequest {
         /// The terms confirmed by both ledger burns.

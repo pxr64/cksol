@@ -192,13 +192,6 @@ impl From<EventType> for CandidEventType {
                 burn_block_index: *burn_block_index.get(),
                 amount,
             },
-            EventType::BurnedCkSolWithdrawalFee {
-                cksol_burn_block_index,
-                request,
-            } => CandidEventType::BurnedCkSolWithdrawalFee {
-                cksol_burn_block_index: *cksol_burn_block_index.get(),
-                request: request.into(),
-            },
             EventType::AcceptedSplWithdrawalRequest(request) => {
                 CandidEventType::AcceptedSplWithdrawalRequest {
                     terms: request.terms.into(),
@@ -481,13 +474,6 @@ impl TryFrom<CandidEventType> for EventType {
             } => EventType::ToppedUpOperatingBalance {
                 burn_block_index: LedgerBurnIndex::new(burn_block_index),
                 amount,
-            },
-            CandidEventType::BurnedCkSolWithdrawalFee {
-                cksol_burn_block_index,
-                request,
-            } => EventType::BurnedCkSolWithdrawalFee {
-                cksol_burn_block_index: LedgerBurnIndex::new(cksol_burn_block_index),
-                request: request.into(),
             },
             CandidEventType::AcceptedSplWithdrawalRequest {
                 terms,

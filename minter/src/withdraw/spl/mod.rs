@@ -225,12 +225,13 @@ pub async fn withdraw<R: CanisterRuntime>(
         .map_err(|error| WithdrawSplError::CkSolLedgerError {
             error: cksol_burn_error(error, request.fee, &fee_ledger),
         })?;
-    match burn_withdrawal_amount(runtime, cksol_burn_block_index).await {
+    match burn_withdrawal_amount(runtime, cksol_burn_block_index, &request).await {
         Ok(receipt) => Ok(receipt),
         Err(error) => {
             schedule_withdrawal_fee_reimbursement(
                 runtime,
                 cksol_burn_block_index,
+                &request,
                 &error,
                 CKSOL_LEDGER_TRANSACTION_FEE,
             );
@@ -242,7 +243,7 @@ pub async fn withdraw<R: CanisterRuntime>(
     }
 }
 
-/// Burns the ckSOL fee and saves the terms before the token burn is attempted.
+/// Burns the ckSOL fee before attempting the token burn.
 /// The caller must validate the terms and hold the account withdrawal guard
 /// across both burns.
 pub async fn burn_withdrawal_fee<R: CanisterRuntime>(
@@ -257,33 +258,16 @@ pub async fn burn_withdrawal_fee<R: CanisterRuntime>(
         Memo::spl_withdrawal_fee(request.mint, request.amount, request.address),
     )
     .await?;
-    let cksol_burn_block_index = LedgerBurnIndex::new(burn_index);
-    mutate_state(|state| {
-        process_event(
-            state,
-            EventType::BurnedCkSolWithdrawalFee {
-                cksol_burn_block_index,
-                request: request.clone(),
-            },
-            runtime,
-        );
-    });
-    Ok(cksol_burn_block_index)
+    Ok(LedgerBurnIndex::new(burn_index))
 }
 
-/// Burns the token amount from its fee checkpoint, then accepts the withdrawal.
-/// The caller holds the account withdrawal guard across both burns, and an error
-/// leaves the checkpoint intact.
+/// Burns the token amount, then records acceptance with both burn indices.
+/// The caller holds the account withdrawal guard across both burns.
 pub async fn burn_withdrawal_amount<R: CanisterRuntime>(
     runtime: &R,
     cksol_burn_block_index: LedgerBurnIndex,
+    request: &SplWithdrawalRequestTerms,
 ) -> Result<WithdrawSplOk, SplBurnError> {
-    let fee_burn = read_state(|state| {
-        state
-            .fee_burned_spl_withdrawal_request(&cksol_burn_block_index)
-            .clone()
-    });
-    let request = fee_burn.request;
     let ckspl_burn_block_index = ledger::spl::burn(
         runtime,
         request.ledger_id,
@@ -293,7 +277,7 @@ pub async fn burn_withdrawal_amount<R: CanisterRuntime>(
     )
     .await?;
     let accepted = SplWithdrawalRequest {
-        terms: request,
+        terms: request.clone(),
         cksol_burn_block_index,
         ckspl_burn_block_index: LedgerBurnIndex::new(ckspl_burn_block_index),
     };
@@ -324,15 +308,10 @@ pub async fn burn_withdrawal_amount<R: CanisterRuntime>(
 pub fn schedule_withdrawal_fee_reimbursement<R: CanisterRuntime>(
     runtime: &R,
     cksol_burn_block_index: LedgerBurnIndex,
+    request: &SplWithdrawalRequestTerms,
     error: &SplBurnError,
     cksol_ledger_fee: Lamport,
 ) {
-    let request = read_state(|state| {
-        state
-            .fee_burned_spl_withdrawal_request(&cksol_burn_block_index)
-            .request
-            .clone()
-    });
     let reimbursed_amount = match error {
         SplBurnError::Call(_)
         | SplBurnError::TransferFrom(

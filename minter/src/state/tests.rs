@@ -901,7 +901,6 @@ mod state_from_init_args {
                 balance: 0,
                 spl_sweep_reservations: BTreeMap::new(),
                 operating_balance: 0,
-                fee_burned_spl_withdrawal_requests: BTreeMap::new(),
                 pending_spl_withdrawal_requests: BTreeMap::new(),
                 spl_withdrawal_token_burns: BTreeSet::new(),
                 pending_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
@@ -1782,8 +1781,8 @@ mod spl_withdrawals {
         lifecycle,
         numeric::LedgerBurnIndex,
         state::{
-            CompletedSplWithdrawalFeeReimbursement, FeeBurnedSplWithdrawalRequest,
-            PendingSplWithdrawalFeeReimbursement, PendingSplWithdrawalRequest, State, TokenProgram,
+            CompletedSplWithdrawalFeeReimbursement, PendingSplWithdrawalFeeReimbursement,
+            PendingSplWithdrawalRequest, State, TokenProgram,
             audit::{process_event, replay_events},
             event::{
                 Event, EventType, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
@@ -1839,7 +1838,6 @@ mod spl_withdrawals {
     fn should_replay_a_completed_fee_reimbursement_and_preserve_other_pending_refunds() {
         let request = setup();
         for id in [100_u64, 101] {
-            record_fee_burn(id, &request);
             reimburse_fee(id, request.fee, request.account);
         }
         let completed = EventType::ReimbursedSplWithdrawalFee {
@@ -1848,7 +1846,6 @@ mod spl_withdrawals {
         };
         record(completed.clone(), 40);
         assert!(catch_unwind(AssertUnwindSafe(|| record(completed, 50))).is_err());
-        assert!(catch_unwind(AssertUnwindSafe(|| record_fee_burn(100, &request))).is_err());
         assert!(
             catch_unwind(AssertUnwindSafe(|| reimburse_fee(
                 100,
@@ -1870,7 +1867,6 @@ mod spl_withdrawals {
                         to: request.account,
                     },
                     mint_block_index: 200.into(),
-                    fee_burned_at: 10,
                     created_at: 30,
                     reimbursed_at: 40,
                 }
@@ -1888,8 +1884,7 @@ mod spl_withdrawals {
 
     #[test]
     fn should_reject_fee_reimbursement_completion_without_a_pending_refund() {
-        let request = setup();
-        record_fee_burn(100, &request);
+        setup();
         for id in [100_u64, 101] {
             assert!(
                 catch_unwind(AssertUnwindSafe(|| record(
@@ -1908,18 +1903,12 @@ mod spl_withdrawals {
                 .completed_spl_withdrawal_fee_reimbursements()
                 .is_empty()
         );
-        assert!(
-            replayed
-                .fee_burned_spl_withdrawal_requests()
-                .contains_key(&100.into())
-        );
     }
 
     #[test]
     fn should_replay_quarantine_and_keep_the_original_refund_out_of_the_pending_queue() {
         let request = setup();
         for id in [100_u64, 101] {
-            record_fee_burn(id, &request);
             reimburse_fee(id, request.fee, request.account);
         }
         let original = read_state(|state| {
@@ -1930,7 +1919,6 @@ mod spl_withdrawals {
         };
         record(quarantined.clone(), 40);
         assert!(catch_unwind(AssertUnwindSafe(|| record(quarantined, 50))).is_err());
-        assert!(catch_unwind(AssertUnwindSafe(|| record_fee_burn(100, &request))).is_err());
         assert!(
             catch_unwind(AssertUnwindSafe(|| reimburse_fee(
                 100,
@@ -1966,8 +1954,7 @@ mod spl_withdrawals {
 
     #[test]
     fn should_reject_quarantine_without_a_pending_refund() {
-        let request = setup();
-        record_fee_burn(100, &request);
+        setup();
         for id in [100_u64, 101] {
             assert!(
                 catch_unwind(AssertUnwindSafe(|| record(
@@ -1983,16 +1970,6 @@ mod spl_withdrawals {
             assert_replay_matches()
                 .quarantined_spl_withdrawal_fee_reimbursements()
                 .is_empty()
-        );
-    }
-
-    fn record_fee_burn(id: u64, request: &SplWithdrawalRequestTerms) {
-        record(
-            EventType::BurnedCkSolWithdrawalFee {
-                cksol_burn_block_index: id.into(),
-                request: request.clone(),
-            },
-            10,
         );
     }
 
@@ -2038,38 +2015,62 @@ mod spl_withdrawals {
     }
 
     #[test]
-    fn should_replay_the_fee_checkpoint_then_accept_directly_into_pending() {
+    fn should_replay_an_accepted_withdrawal_into_pending() {
         let request = setup();
-        let id = LedgerBurnIndex::new(100);
-        record_fee_burn(100, &request);
-        let replayed = assert_replay_matches();
-        assert_eq!(
-            replayed.fee_burned_spl_withdrawal_requests().get(&id),
-            Some(&FeeBurnedSplWithdrawalRequest {
-                request: request.clone(),
-                created_at: 10,
-            })
-        );
-        assert!(replayed.pending_spl_withdrawal_requests().is_empty());
-
         accept(100, 7, &request);
         let replayed = assert_replay_matches();
-        assert!(replayed.fee_burned_spl_withdrawal_requests().is_empty());
         assert_eq!(
-            replayed.pending_spl_withdrawal_requests().get(&id),
+            replayed
+                .pending_spl_withdrawal_requests()
+                .get(&LedgerBurnIndex::new(100)),
             Some(&PendingSplWithdrawalRequest {
                 request: accepted_request(100, 7, &request),
-                fee_burned_at: 10,
                 created_at: 20,
             })
         );
+        assert!(
+            replayed
+                .pending_spl_withdrawal_fee_reimbursements()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn should_reject_a_zero_fee_reimbursement() {
+        let request = setup();
+        assert!(catch_unwind(AssertUnwindSafe(|| reimburse_fee(100, 0, request.account))).is_err());
+        assert!(
+            assert_replay_matches()
+                .pending_spl_withdrawal_fee_reimbursements()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn should_reject_invalid_terms_on_acceptance() {
+        let request = setup();
+        let changes: [fn(&mut SplWithdrawalRequestTerms); 4] = [
+            |r| r.mint = [3; 32].into(),
+            |r| r.ledger_id = Principal::from_slice(&[99]),
+            |r| r.amount = 0,
+            |r| r.fee = 0,
+        ];
+        for change in changes {
+            let mut changed = request.clone();
+            change(&mut changed);
+            assert!(catch_unwind(AssertUnwindSafe(|| accept(100, 7, &changed))).is_err());
+            assert!(
+                assert_replay_matches()
+                    .pending_spl_withdrawal_requests()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
     fn should_replay_an_older_log_without_spl_withdrawals() {
         setup();
         let replayed = assert_replay_matches();
-        assert!(replayed.fee_burned_spl_withdrawal_requests().is_empty());
         assert!(replayed.pending_spl_withdrawal_requests().is_empty());
         assert!(
             replayed
@@ -2084,11 +2085,9 @@ mod spl_withdrawals {
         request.account.subaccount = Some([42; 32]);
         for (index, refund) in [1, 999_990, 1_000_000].into_iter().enumerate() {
             let burn_index = 100 + index as u64;
-            record_fee_burn(burn_index, &request);
             reimburse_fee(burn_index, refund, request.account);
 
             let replayed = assert_replay_matches();
-            assert!(replayed.fee_burned_spl_withdrawal_requests().is_empty());
             assert!(replayed.pending_spl_withdrawal_requests().is_empty());
             assert_eq!(
                 replayed.pending_spl_withdrawal_fee_reimbursements().len(),
@@ -2104,7 +2103,6 @@ mod spl_withdrawals {
                         reimbursed_amount: refund,
                         to: request.account,
                     },
-                    fee_burned_at: 10,
                     created_at: 30,
                 }),
             );
@@ -2112,55 +2110,8 @@ mod spl_withdrawals {
     }
 
     #[test]
-    fn should_reject_invalid_reimbursements_without_consuming_the_fee_checkpoint() {
-        let mut request = setup();
-        request.account.subaccount = Some([42; 32]);
-        record_fee_burn(100, &request);
-        let mut changed_subaccount = request.account;
-        changed_subaccount.subaccount = Some([43; 32]);
-        for (amount, to) in [
-            (0, request.account),
-            (request.fee + 1, request.account),
-            (request.fee, account(2)),
-            (request.fee, changed_subaccount),
-        ] {
-            assert!(catch_unwind(AssertUnwindSafe(|| reimburse_fee(100, amount, to))).is_err());
-            let replayed = assert_replay_matches();
-            assert_eq!(
-                replayed.fee_burned_spl_withdrawal_requests()[&100.into()].request,
-                request
-            );
-            assert!(
-                replayed
-                    .pending_spl_withdrawal_fee_reimbursements()
-                    .is_empty()
-            );
-        }
-    }
-
-    #[test]
-    fn should_reject_a_reimbursement_without_a_fee_burn() {
-        let request = setup();
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| reimburse_fee(
-                100,
-                request.fee,
-                request.account
-            )))
-            .is_err()
-        );
-        let replayed = assert_replay_matches();
-        assert!(
-            replayed
-                .pending_spl_withdrawal_fee_reimbursements()
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn should_not_reimburse_an_accepted_withdrawal() {
         let request = setup();
-        record_fee_burn(100, &request);
         accept(100, 7, &request);
         assert!(
             catch_unwind(AssertUnwindSafe(|| reimburse_fee(
@@ -2182,7 +2133,6 @@ mod spl_withdrawals {
     #[test]
     fn should_not_accept_a_withdrawal_scheduled_for_fee_reimbursement() {
         let request = setup();
-        record_fee_burn(100, &request);
         reimburse_fee(100, request.fee, request.account);
         assert!(catch_unwind(AssertUnwindSafe(|| accept(100, 7, &request))).is_err());
         let replayed = assert_replay_matches();
@@ -2196,7 +2146,6 @@ mod spl_withdrawals {
     #[test]
     fn should_not_replace_an_existing_fee_reimbursement() {
         let request = setup();
-        record_fee_burn(100, &request);
         reimburse_fee(100, request.fee, request.account);
         assert!(
             catch_unwind(AssertUnwindSafe(|| reimburse_fee(
@@ -2216,28 +2165,11 @@ mod spl_withdrawals {
     }
 
     #[test]
-    fn should_not_reuse_a_fee_burn_scheduled_for_reimbursement() {
-        let request = setup();
-        record_fee_burn(100, &request);
-        reimburse_fee(100, request.fee, request.account);
-        assert!(catch_unwind(AssertUnwindSafe(|| record_fee_burn(100, &request))).is_err());
-        let replayed = assert_replay_matches();
-        assert!(replayed.fee_burned_spl_withdrawal_requests().is_empty());
-        assert_eq!(
-            replayed.pending_spl_withdrawal_fee_reimbursements().len(),
-            1
-        );
-    }
-
-    #[test]
     fn should_only_move_the_failed_withdrawal_into_the_reimbursement_queue() {
         let request = setup();
-        record_fee_burn(100, &request);
-        record_fee_burn(101, &request);
         reimburse_fee(100, request.fee, request.account);
         accept(101, 7, &request);
         let replayed = assert_replay_matches();
-        assert!(replayed.fee_burned_spl_withdrawal_requests().is_empty());
         assert_eq!(replayed.pending_spl_withdrawal_requests().len(), 1);
         assert!(
             replayed
@@ -2273,34 +2205,9 @@ mod spl_withdrawals {
     }
 
     #[test]
-    #[should_panic(expected = "already recorded SPL withdrawal fee burn")]
-    fn should_reject_a_duplicate_fee_burn() {
-        let request = setup();
-        record_fee_burn(100, &request);
-        record_fee_burn(100, &request);
-    }
-
-    #[test]
-    #[should_panic(expected = "already recorded SPL withdrawal fee burn")]
-    fn should_reject_reusing_a_fee_burn_after_acceptance() {
-        let request = setup();
-        record_fee_burn(100, &request);
-        accept(100, 7, &request);
-        record_fee_burn(100, &request);
-    }
-
-    #[test]
-    #[should_panic(expected = "without a recorded fee burn")]
-    fn should_reject_acceptance_without_a_fee_burn() {
-        let request = setup();
-        accept(100, 7, &request);
-    }
-
-    #[test]
     #[should_panic(expected = "already accepted SPL withdrawal request")]
     fn should_reject_accepting_a_withdrawal_twice() {
         let request = setup();
-        record_fee_burn(100, &request);
         accept(100, 7, &request);
         accept(100, 8, &request);
     }
@@ -2309,8 +2216,6 @@ mod spl_withdrawals {
     #[should_panic(expected = "already belongs to a withdrawal")]
     fn should_reject_reusing_a_token_burn_on_the_same_ledger() {
         let request = setup();
-        record_fee_burn(100, &request);
-        record_fee_burn(101, &request);
         accept(100, 7, &request);
         accept(101, 7, &request);
     }
@@ -2323,8 +2228,6 @@ mod spl_withdrawals {
             EventType::AddedSplToken(spl_token(second.mint, TokenProgram::Classic)),
             3,
         );
-        record_fee_burn(100, &first);
-        record_fee_burn(101, &second);
         accept(100, 7, &first);
         accept(101, 7, &second);
         let replayed = assert_replay_matches();
@@ -2337,39 +2240,5 @@ mod spl_withdrawals {
             replayed.pending_spl_withdrawal_requests()[&LedgerBurnIndex::new(101)].request,
             accepted_request(101, 7, &second)
         );
-    }
-
-    #[test]
-    fn should_reject_changed_terms_without_consuming_the_fee_checkpoint() {
-        let request = setup();
-        record_fee_burn(100, &request);
-        let changes: [fn(&mut SplWithdrawalRequestTerms); 7] = [
-            |r| r.account = account(2),
-            |r| r.mint = [3; 32].into(),
-            |r| r.ledger_id = Principal::from_slice(&[99]),
-            |r| r.address = [8; 32].into(),
-            |r| r.amount += 1,
-            |r| r.fee += 1,
-            |r| r.create_destination_account = true,
-        ];
-        for change in changes {
-            let mut changed = request.clone();
-            change(&mut changed);
-            assert!(catch_unwind(AssertUnwindSafe(|| accept(100, 7, &changed))).is_err());
-            let replayed = assert_replay_matches();
-            assert_eq!(
-                replayed.fee_burned_spl_withdrawal_requests()[&LedgerBurnIndex::new(100)].request,
-                request
-            );
-            assert!(replayed.pending_spl_withdrawal_requests().is_empty());
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "mint's registered ledger")]
-    fn should_reject_a_fee_burn_record_for_the_wrong_token_ledger() {
-        let mut request = setup();
-        request.ledger_id = Principal::from_slice(&[99]);
-        record_fee_burn(100, &request);
     }
 }

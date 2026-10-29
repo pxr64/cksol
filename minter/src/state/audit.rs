@@ -145,12 +145,6 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
         } => {
             state.process_transaction_created(burn_indices, nonce_account, *nonce_value);
         }
-        EventType::BurnedCkSolWithdrawalFee {
-            cksol_burn_block_index,
-            request,
-        } => {
-            state.process_burned_cksol_withdrawal_fee(*cksol_burn_block_index, request, timestamp);
-        }
         EventType::AcceptedSplWithdrawalRequest(request) => {
             state.process_accepted_spl_withdrawal(request, timestamp);
         }

@@ -316,24 +316,14 @@ pub enum EventType {
         #[n(1)]
         amount: Lamport,
     },
-    /// The ckSOL fee burn succeeded; the token burn has not yet been recorded.
-    #[n(25)]
-    BurnedCkSolWithdrawalFee {
-        /// The fee burn block index on the ckSOL ledger, also the withdrawal ID.
-        #[cbor(n(0), with = "cbor::id")]
-        cksol_burn_block_index: LedgerBurnIndex,
-        /// The withdrawal terms saved before attempting the token burn.
-        #[n(1)]
-        request: SplWithdrawalRequestTerms,
-    },
     /// The token burn succeeded and the withdrawal was accepted for processing.
-    #[n(26)]
+    #[n(25)]
     AcceptedSplWithdrawalRequest(#[n(0)] SplWithdrawalRequest),
     /// The token burn returned an error; reimburse the already burned ckSOL fee.
-    #[n(27)]
+    #[n(26)]
     FailedSplWithdrawalRequest(#[n(0)] SplWithdrawalFeeReimbursementRequest),
     /// The ckSOL fee of a failed SPL withdrawal was minted back.
-    #[n(28)]
+    #[n(27)]
     ReimbursedSplWithdrawalFee {
         /// The fee burn index on the ckSOL ledger, also the withdrawal ID.
         #[cbor(n(0), with = "cbor::id")]
@@ -343,7 +333,7 @@ pub enum EventType {
         mint_block_index: LedgerMintIndex,
     },
     /// A fee reimbursement cannot be safely retried and requires manual resolution.
-    #[n(29)]
+    #[n(28)]
     QuarantinedSplWithdrawalFeeReimbursement {
         /// The fee burn index on the ckSOL ledger, also the withdrawal ID.
         #[cbor(n(0), with = "cbor::id")]

@@ -152,7 +152,6 @@ pub struct State {
     balance: Lamport,
     spl_sweep_reservations: BTreeMap<Signature, Lamport>,
     operating_balance: Lamport,
-    fee_burned_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, FeeBurnedSplWithdrawalRequest>,
     pending_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest>,
     spl_withdrawal_token_burns: BTreeSet<(Principal, LedgerBurnIndex)>,
     pending_spl_withdrawal_fee_reimbursements:
@@ -787,23 +786,6 @@ impl State {
         pending.chain(created).chain(sent).min()
     }
 
-    pub fn fee_burned_spl_withdrawal_requests(
-        &self,
-    ) -> &BTreeMap<LedgerBurnIndex, FeeBurnedSplWithdrawalRequest> {
-        &self.fee_burned_spl_withdrawal_requests
-    }
-
-    pub fn fee_burned_spl_withdrawal_request(
-        &self,
-        cksol_burn_block_index: &LedgerBurnIndex,
-    ) -> &FeeBurnedSplWithdrawalRequest {
-        self.fee_burned_spl_withdrawal_requests
-            .get(cksol_burn_block_index)
-            .unwrap_or_else(|| {
-                panic!("BUG: SPL withdrawal {cksol_burn_block_index} has no recorded fee burn")
-            })
-    }
-
     pub fn pending_spl_withdrawal_requests(
         &self,
     ) -> &BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest> {
@@ -859,77 +841,51 @@ impl State {
             CompletedSplWithdrawalFeeReimbursement {
                 request: pending.request,
                 mint_block_index: *mint_block_index,
-                fee_burned_at: pending.fee_burned_at,
                 created_at: pending.created_at,
                 reimbursed_at,
             },
         );
     }
 
-    fn process_burned_cksol_withdrawal_fee(
-        &mut self,
-        cksol_burn_block_index: LedgerBurnIndex,
-        request: &SplWithdrawalRequestTerms,
-        created_at: u64,
-    ) {
+    fn assert_valid_spl_withdrawal_terms(&self, request: &SplWithdrawalRequestTerms) {
         let token = self
             .supported_spl_tokens
             .get(&request.mint)
-            .expect("Attempted to record an SPL withdrawal fee burn for an unsupported mint");
+            .expect("Attempted to accept an SPL withdrawal for an unsupported mint");
         assert_eq!(
             token.ledger_id, request.ledger_id,
-            "Attempted to record an SPL withdrawal fee burn with a ledger different from the mint's registered ledger"
+            "Attempted to accept an SPL withdrawal with a ledger different from the mint's registered ledger"
         );
         assert!(
             request.amount > 0,
-            "Attempted to record an SPL withdrawal fee burn for a zero token amount"
+            "Attempted to accept an SPL withdrawal for a zero token amount"
         );
         assert!(
             request.fee > 0,
-            "Attempted to record a zero SPL withdrawal fee burn"
+            "Attempted to accept an SPL withdrawal with a zero fee burn"
         );
-        assert!(
-            !self
-                .fee_burned_spl_withdrawal_requests
-                .contains_key(&cksol_burn_block_index)
-                && !self
-                    .pending_spl_withdrawal_requests
-                    .contains_key(&cksol_burn_block_index)
-                && !self
-                    .pending_spl_withdrawal_fee_reimbursements
-                    .contains_key(&cksol_burn_block_index)
-                && !self
-                    .completed_spl_withdrawal_fee_reimbursements
-                    .contains_key(&cksol_burn_block_index)
-                && !self
-                    .quarantined_spl_withdrawal_fee_reimbursements
-                    .contains_key(&cksol_burn_block_index),
-            "Attempted to record an already recorded SPL withdrawal fee burn: {cksol_burn_block_index}"
-        );
-        self.fee_burned_spl_withdrawal_requests.insert(
-            cksol_burn_block_index,
-            FeeBurnedSplWithdrawalRequest {
-                request: request.clone(),
-                created_at,
-            },
-        );
+    }
+
+    fn has_spl_withdrawal_outcome(&self, burn_index: &LedgerBurnIndex) -> bool {
+        self.pending_spl_withdrawal_requests
+            .contains_key(burn_index)
+            || self
+                .pending_spl_withdrawal_fee_reimbursements
+                .contains_key(burn_index)
+            || self
+                .completed_spl_withdrawal_fee_reimbursements
+                .contains_key(burn_index)
+            || self
+                .quarantined_spl_withdrawal_fee_reimbursements
+                .contains_key(burn_index)
     }
 
     fn process_accepted_spl_withdrawal(&mut self, request: &SplWithdrawalRequest, created_at: u64) {
         let cksol_burn_block_index = request.cksol_burn_block_index;
+        self.assert_valid_spl_withdrawal_terms(&request.terms);
         assert!(
-            !self
-                .pending_spl_withdrawal_requests
-                .contains_key(&cksol_burn_block_index),
+            !self.has_spl_withdrawal_outcome(&cksol_burn_block_index),
             "Attempted to accept an already accepted SPL withdrawal request: {cksol_burn_block_index}"
-        );
-        let fee_burn = self
-            .fee_burned_spl_withdrawal_requests
-            .remove(&cksol_burn_block_index)
-            .expect("Attempted to accept an SPL withdrawal without a recorded fee burn");
-        assert_eq!(
-            fee_burn.request, request.terms,
-            "Attempted to accept an SPL withdrawal with terms different from its fee burn"
         );
         let token_burn = (request.terms.ledger_id, request.ckspl_burn_block_index);
         assert!(
@@ -941,7 +897,6 @@ impl State {
             cksol_burn_block_index,
             PendingSplWithdrawalRequest {
                 request: request.clone(),
-                fee_burned_at: fee_burn.created_at,
                 created_at,
             },
         );
@@ -954,32 +909,17 @@ impl State {
     ) {
         let burn_index = request.cksol_burn_block_index;
         assert!(
-            !self
-                .pending_spl_withdrawal_fee_reimbursements
-                .contains_key(&burn_index),
+            !self.has_spl_withdrawal_outcome(&burn_index),
             "Attempted to schedule an already scheduled SPL withdrawal fee reimbursement: {burn_index}"
-        );
-        let fee_burn = self
-            .fee_burned_spl_withdrawal_requests
-            .remove(&burn_index)
-            .expect("Attempted to reimburse an SPL withdrawal without a recorded fee burn");
-        assert_eq!(
-            request.to, fee_burn.request.account,
-            "Attempted to reimburse an SPL withdrawal to a different account than its fee-paying account"
         );
         assert!(
             request.reimbursed_amount > 0,
             "Attempted to reimburse an SPL withdrawal with a zero amount"
         );
-        assert!(
-            request.reimbursed_amount <= fee_burn.request.fee,
-            "Attempted to reimburse an SPL withdrawal for more than its burned fee"
-        );
         self.pending_spl_withdrawal_fee_reimbursements.insert(
             burn_index,
             PendingSplWithdrawalFeeReimbursement {
                 request: request.clone(),
-                fee_burned_at: fee_burn.created_at,
                 created_at,
             },
         );
@@ -1420,7 +1360,6 @@ impl TryFrom<InitArgs> for State {
             balance: 0,
             spl_sweep_reservations: BTreeMap::new(),
             operating_balance: 0,
-            fee_burned_spl_withdrawal_requests: BTreeMap::new(),
             pending_spl_withdrawal_requests: BTreeMap::new(),
             spl_withdrawal_token_burns: BTreeSet::new(),
             pending_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
@@ -1432,18 +1371,10 @@ impl TryFrom<InitArgs> for State {
     }
 }
 
-/// A withdrawal whose ckSOL fee burn is recorded but whose token burn is unresolved.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FeeBurnedSplWithdrawalRequest {
-    pub request: SplWithdrawalRequestTerms,
-    pub created_at: u64,
-}
-
 /// An accepted SPL withdrawal with both burns recorded, waiting for processing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingSplWithdrawalRequest {
     pub request: SplWithdrawalRequest,
-    pub fee_burned_at: u64,
     pub created_at: u64,
 }
 
@@ -1451,7 +1382,6 @@ pub struct PendingSplWithdrawalRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingSplWithdrawalFeeReimbursement {
     pub request: SplWithdrawalFeeReimbursementRequest,
-    pub fee_burned_at: u64,
     pub created_at: u64,
 }
 
@@ -1460,7 +1390,6 @@ pub struct PendingSplWithdrawalFeeReimbursement {
 pub struct CompletedSplWithdrawalFeeReimbursement {
     pub request: SplWithdrawalFeeReimbursementRequest,
     pub mint_block_index: LedgerMintIndex,
-    pub fee_burned_at: u64,
     pub created_at: u64,
     pub reimbursed_at: u64,
 }

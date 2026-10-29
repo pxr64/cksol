@@ -1969,14 +1969,6 @@ pub mod arb {
             )
             .boxed();
         prop_oneof![
-            (arb_ledger_burn_index(), request.clone()).prop_map(
-                |(cksol_burn_block_index, request)| {
-                    EventType::BurnedCkSolWithdrawalFee {
-                        cksol_burn_block_index,
-                        request,
-                    }
-                }
-            ),
             (arb_ledger_burn_index(), arb_ledger_burn_index(), request).prop_map(
                 |(cksol_burn_block_index, ckspl_burn_block_index, terms)| {
                     EventType::AcceptedSplWithdrawalRequest(

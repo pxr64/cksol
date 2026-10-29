@@ -237,7 +237,7 @@ fn should_reject_a_fee_that_overflows_when_rent_is_added() {
 }
 
 #[tokio::test]
-async fn should_record_the_fee_checkpoint_after_the_cksol_burn() {
+async fn should_burn_the_cksol_fee_without_recording_an_event() {
     init_state();
     init_schnorr_master_key();
     let token = register_token(TokenProgram::Classic);
@@ -247,6 +247,7 @@ async fn should_record_the_fee_checkpoint_after_the_cksol_burn() {
         .add_stub_response(Ok::<Nat, TransferFromError>(42_u64.into()))
         .with_time(123);
 
+    let events_before = EventsAssert::from_recorded();
     assert_eq!(burn_withdrawal_fee(&runtime, &request).await, Ok(42.into()));
 
     let calls = runtime.sent_update_calls();
@@ -267,22 +268,8 @@ async fn should_record_the_fee_checkpoint_after_the_cksol_burn() {
             created_at_time: None,
         }
     );
-    EventsAssert::from_recorded()
-        .expect_event_eq(EventType::AddedSplToken(token))
-        .expect_event_eq(EventType::BurnedCkSolWithdrawalFee {
-            cksol_burn_block_index: 42.into(),
-            request: request.clone(),
-        })
-        .assert_no_more_events();
+    assert_eq!(EventsAssert::from_recorded(), events_before);
     read_state(|state| {
-        assert_eq!(state.fee_burned_spl_withdrawal_requests().len(), 1);
-        assert_eq!(
-            state.fee_burned_spl_withdrawal_requests()[&42.into()],
-            crate::state::FeeBurnedSplWithdrawalRequest {
-                request: request.clone(),
-                created_at: 123,
-            }
-        );
         assert!(state.pending_spl_withdrawal_requests().is_empty());
         assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
     });
@@ -294,7 +281,7 @@ async fn should_record_the_fee_checkpoint_after_the_cksol_burn() {
 }
 
 #[tokio::test]
-async fn should_not_record_a_fee_checkpoint_when_the_ledger_rejects_the_burn() {
+async fn should_return_the_ledger_rejection_of_the_fee_burn() {
     init_state();
     let token = register_token(TokenProgram::Classic);
     let request = withdrawal_terms(&token);
@@ -324,7 +311,6 @@ async fn should_not_record_a_fee_checkpoint_when_the_ledger_rejects_the_burn() {
         assert_eq!(runtime.sent_update_calls().len(), 1);
         assert_only_registration(token.clone());
         read_state(|state| {
-            assert!(state.fee_burned_spl_withdrawal_requests().is_empty());
             assert!(state.pending_spl_withdrawal_requests().is_empty());
             assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
         });
@@ -332,7 +318,7 @@ async fn should_not_record_a_fee_checkpoint_when_the_ledger_rejects_the_burn() {
 }
 
 #[tokio::test]
-async fn should_not_record_a_fee_checkpoint_when_the_ledger_call_fails() {
+async fn should_return_a_failed_fee_burn_call_as_temporarily_unavailable() {
     init_state();
     let token = register_token(TokenProgram::Classic);
     let request = withdrawal_terms(&token);
@@ -345,44 +331,17 @@ async fn should_not_record_a_fee_checkpoint_when_the_ledger_call_fails() {
     assert_eq!(runtime.sent_update_calls().len(), 1);
     assert_only_registration(token);
     read_state(|state| {
-        assert!(state.fee_burned_spl_withdrawal_requests().is_empty());
         assert!(state.pending_spl_withdrawal_requests().is_empty());
         assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
     });
 }
 
-fn record_fee_checkpoint(
-    request: &SplWithdrawalRequestTerms,
-    cksol_burn_block_index: LedgerBurnIndex,
-) {
-    mutate_state(|state| {
-        process_event(
-            state,
-            EventType::BurnedCkSolWithdrawalFee {
-                cksol_burn_block_index,
-                request: request.clone(),
-            },
-            &TestCanisterRuntime::new().with_time(123),
-        )
-    });
-}
-
-fn assert_only_fee_checkpoint(token: SupportedSplToken, request: SplWithdrawalRequestTerms) {
+fn assert_nothing_recorded(token: SupportedSplToken) {
     read_state(|state| {
-        assert_eq!(
-            state.fee_burned_spl_withdrawal_requests()[&42.into()].request,
-            request
-        );
         assert!(state.pending_spl_withdrawal_requests().is_empty());
         assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
     });
-    EventsAssert::from_recorded()
-        .expect_event_eq(EventType::AddedSplToken(token))
-        .expect_event_eq(EventType::BurnedCkSolWithdrawalFee {
-            cksol_burn_block_index: 42.into(),
-            request,
-        })
-        .assert_no_more_events();
+    assert_only_registration(token);
 }
 
 #[tokio::test]
@@ -398,7 +357,7 @@ async fn should_burn_both_ledgers_then_accept_the_spl_withdrawal() {
 
     let fee_index = burn_withdrawal_fee(&runtime, &request).await.unwrap();
     assert_eq!(
-        burn_withdrawal_amount(&runtime, fee_index).await,
+        burn_withdrawal_amount(&runtime, fee_index, &request).await,
         Ok(WithdrawSplOk {
             cksol_burn_block_index: 42,
             ckspl_burn_block_index: 7,
@@ -433,21 +392,15 @@ async fn should_burn_both_ledgers_then_accept_the_spl_withdrawal() {
     };
     EventsAssert::from_recorded()
         .expect_event_eq(EventType::AddedSplToken(token))
-        .expect_event_eq(EventType::BurnedCkSolWithdrawalFee {
-            cksol_burn_block_index: 42.into(),
-            request,
-        })
         .expect_event_eq(EventType::AcceptedSplWithdrawalRequest(accepted.clone()))
         .assert_no_more_events();
     read_state(|state| {
-        assert!(state.fee_burned_spl_withdrawal_requests().is_empty());
         assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
         assert_eq!(state.pending_spl_withdrawal_requests().len(), 1);
         assert_eq!(
             state.pending_spl_withdrawal_requests()[&42.into()],
             crate::state::PendingSplWithdrawalRequest {
                 request: accepted,
-                fee_burned_at: 123,
                 created_at: 123,
             }
         );
@@ -461,21 +414,19 @@ async fn should_reject_an_unexpected_duplicate_token_burn_reply() {
     let token = register_token(TokenProgram::Classic);
     let request = withdrawal_terms(&token);
     let _guard = withdrawal_guard(request.account).unwrap();
-    record_fee_checkpoint(&request, 42.into());
     let runtime =
         TestCanisterRuntime::new().add_stub_response(Err::<Nat, _>(TransferFromError::Duplicate {
             duplicate_of: 7_u64.into(),
         }));
-    let _ = burn_withdrawal_amount(&runtime, 42.into()).await;
+    let _ = burn_withdrawal_amount(&runtime, 42.into(), &request).await;
 }
 
 #[tokio::test]
-async fn should_preserve_the_fee_checkpoint_when_the_token_burn_is_rejected() {
+async fn should_return_the_ledger_rejection_of_the_token_burn_without_recording_an_event() {
     init_state();
     let token = register_token(TokenProgram::Classic);
     let request = withdrawal_terms(&token);
     let _guard = withdrawal_guard(request.account).unwrap();
-    record_fee_checkpoint(&request, 42.into());
     for error in [
         TransferFromError::InsufficientFunds {
             balance: 10_u64.into(),
@@ -488,7 +439,7 @@ async fn should_preserve_the_fee_checkpoint_when_the_token_burn_is_rejected() {
         let runtime = TestCanisterRuntime::new().add_stub_response(Err::<Nat, _>(error.clone()));
 
         assert_eq!(
-            burn_withdrawal_amount(&runtime, 42.into()).await,
+            burn_withdrawal_amount(&runtime, 42.into(), &request).await,
             Err(ledger::spl::SplBurnError::TransferFrom(error))
         );
 
@@ -499,37 +450,28 @@ async fn should_preserve_the_fee_checkpoint_when_the_token_burn_is_rejected() {
             calls[0].single_arg::<TransferFromArgs>().created_at_time,
             None
         );
-        assert_only_fee_checkpoint(token.clone(), request.clone());
+        assert_nothing_recorded(token.clone());
     }
 }
 
 #[tokio::test]
-async fn should_preserve_the_fee_checkpoint_when_the_token_burn_outcome_is_unknown() {
+async fn should_return_a_failed_token_burn_call_without_recording_an_event() {
     init_state();
     let token = register_token(TokenProgram::Classic);
     let request = withdrawal_terms(&token);
     let _guard = withdrawal_guard(request.account).unwrap();
-    record_fee_checkpoint(&request, 42.into());
     let error = IcError::CandidDecodeFailed {
         message: "invalid ledger reply".to_string(),
     };
     let runtime = TestCanisterRuntime::new().add_stub_error(error.clone());
 
     assert_eq!(
-        burn_withdrawal_amount(&runtime, 42.into()).await,
+        burn_withdrawal_amount(&runtime, 42.into(), &request).await,
         Err(ledger::spl::SplBurnError::Call(error))
     );
 
     assert_eq!(runtime.sent_update_calls().len(), 1);
-    assert_only_fee_checkpoint(token, request);
-}
-
-#[tokio::test]
-#[should_panic(expected = "BUG: SPL withdrawal 42 has no recorded fee burn")]
-async fn should_require_a_fee_checkpoint_before_calling_the_token_ledger() {
-    init_state();
-    let runtime = TestCanisterRuntime::new();
-    let _ = burn_withdrawal_amount(&runtime, 42.into()).await;
+    assert_nothing_recorded(token);
 }
 
 #[tokio::test]
@@ -571,15 +513,14 @@ async fn should_queue_the_appropriate_fee_refund_after_a_returned_token_burn_err
     let mut expected_refunds = Vec::new();
     for (index, (error, reimbursed_amount)) in cases.into_iter().enumerate() {
         let burn_index = LedgerBurnIndex::new(42 + index as u64);
-        record_fee_checkpoint(&request, burn_index);
         let runtime = TestCanisterRuntime::new()
             .add_stub_response(Err::<Nat, _>(error))
             .with_time(999);
 
-        let error = burn_withdrawal_amount(&runtime, burn_index)
+        let error = burn_withdrawal_amount(&runtime, burn_index, &request)
             .await
             .unwrap_err();
-        schedule_withdrawal_fee_reimbursement(&runtime, burn_index, &error, ledger_fee);
+        schedule_withdrawal_fee_reimbursement(&runtime, burn_index, &request, &error, ledger_fee);
 
         let calls = runtime.sent_update_calls();
         assert_eq!(calls.len(), 1);
@@ -591,7 +532,6 @@ async fn should_queue_the_appropriate_fee_refund_after_a_returned_token_burn_err
             to: request.account,
         };
         read_state(|state| {
-            assert!(state.fee_burned_spl_withdrawal_requests().is_empty());
             assert!(state.pending_spl_withdrawal_requests().is_empty());
             assert_eq!(
                 state.pending_spl_withdrawal_fee_reimbursements().len(),
@@ -601,7 +541,6 @@ async fn should_queue_the_appropriate_fee_refund_after_a_returned_token_burn_err
                 state.pending_spl_withdrawal_fee_reimbursements()[&burn_index],
                 crate::state::PendingSplWithdrawalFeeReimbursement {
                     request: refund.clone(),
-                    fee_burned_at: 123,
                     created_at: 999,
                 }
             );
@@ -610,12 +549,7 @@ async fn should_queue_the_appropriate_fee_refund_after_a_returned_token_burn_err
     }
     let mut events = EventsAssert::from_recorded().expect_event_eq(EventType::AddedSplToken(token));
     for refund in expected_refunds {
-        events = events
-            .expect_event_eq(EventType::BurnedCkSolWithdrawalFee {
-                cksol_burn_block_index: refund.cksol_burn_block_index,
-                request: request.clone(),
-            })
-            .expect_event_eq(EventType::FailedSplWithdrawalRequest(refund));
+        events = events.expect_event_eq(EventType::FailedSplWithdrawalRequest(refund));
     }
     events.assert_no_more_events();
 }
@@ -626,7 +560,6 @@ fn should_keep_unexpected_ledger_errors_out_of_the_refund_queue() {
     let token = register_token(TokenProgram::Classic);
     let request = withdrawal_terms(&token);
     let _guard = withdrawal_guard(request.account).unwrap();
-    record_fee_checkpoint(&request, 42.into());
     let runtime = TestCanisterRuntime::new();
     for error in [
         ledger::spl::SplBurnError::TransferFrom(TransferFromError::TooOld),
@@ -640,30 +573,29 @@ fn should_keep_unexpected_ledger_errors_out_of_the_refund_queue() {
             duplicate_of: 7_u64.into(),
         }),
     ] {
-        schedule_withdrawal_fee_reimbursement(&runtime, 42.into(), &error, 10_000);
+        schedule_withdrawal_fee_reimbursement(&runtime, 42.into(), &request, &error, 10_000);
     }
 
     assert!(runtime.sent_update_calls().is_empty());
-    assert_only_fee_checkpoint(token, request);
+    assert_nothing_recorded(token);
 }
 
 #[test]
-fn should_skip_zero_refunds_without_underflow_or_consuming_the_checkpoint() {
+fn should_skip_zero_refunds_without_underflow() {
     init_state();
     let token = register_token(TokenProgram::Classic);
     let request = withdrawal_terms(&token);
     let _guard = withdrawal_guard(request.account).unwrap();
-    record_fee_checkpoint(&request, 42.into());
     let runtime = TestCanisterRuntime::new();
     let error = ledger::spl::SplBurnError::TransferFrom(TransferFromError::InsufficientFunds {
         balance: 0_u64.into(),
     });
     for ledger_fee in [request.fee, request.fee + 1, u64::MAX] {
-        schedule_withdrawal_fee_reimbursement(&runtime, 42.into(), &error, ledger_fee);
+        schedule_withdrawal_fee_reimbursement(&runtime, 42.into(), &request, &error, ledger_fee);
     }
 
     assert!(runtime.sent_update_calls().is_empty());
-    assert_only_fee_checkpoint(token, request);
+    assert_nothing_recorded(token);
 }
 
 #[test]
@@ -672,15 +604,15 @@ fn should_not_schedule_a_second_refund_for_the_same_fee_burn() {
     let token = register_token(TokenProgram::Classic);
     let request = withdrawal_terms(&token);
     let _guard = withdrawal_guard(request.account).unwrap();
-    record_fee_checkpoint(&request, 42.into());
     let runtime = TestCanisterRuntime::new().with_time(999);
     let error = ledger::spl::SplBurnError::TransferFrom(TransferFromError::TemporarilyUnavailable);
-    schedule_withdrawal_fee_reimbursement(&runtime, 42.into(), &error, 10_000);
+    schedule_withdrawal_fee_reimbursement(&runtime, 42.into(), &request, &error, 10_000);
 
     assert!(
         catch_unwind(AssertUnwindSafe(|| schedule_withdrawal_fee_reimbursement(
             &runtime,
             42.into(),
+            &request,
             &error,
             10_000,
         )))
@@ -689,15 +621,10 @@ fn should_not_schedule_a_second_refund_for_the_same_fee_burn() {
 
     assert!(runtime.sent_update_calls().is_empty());
     read_state(|state| {
-        assert!(state.fee_burned_spl_withdrawal_requests().is_empty());
         assert_eq!(state.pending_spl_withdrawal_fee_reimbursements().len(), 1);
     });
     EventsAssert::from_recorded()
         .expect_event_eq(EventType::AddedSplToken(token))
-        .expect_event_eq(EventType::BurnedCkSolWithdrawalFee {
-            cksol_burn_block_index: 42.into(),
-            request: request.clone(),
-        })
         .expect_event_eq(EventType::FailedSplWithdrawalRequest(
             SplWithdrawalFeeReimbursementRequest {
                 cksol_burn_block_index: 42.into(),
@@ -721,7 +648,6 @@ fn should_build_fee_reimbursement_mint_arguments_from_the_recorded_request() {
                 reimbursed_amount,
                 to,
             },
-            fee_burned_at: 123,
             created_at: 999,
         };
 
@@ -753,10 +679,10 @@ fn queue_fee_reimbursement(
     token: &SupportedSplToken,
     cksol_burn_block_index: LedgerBurnIndex,
 ) -> PendingSplWithdrawalFeeReimbursement {
-    record_fee_checkpoint(&withdrawal_terms(token), cksol_burn_block_index);
     schedule_withdrawal_fee_reimbursement(
         &TestCanisterRuntime::new().with_time(999),
         cksol_burn_block_index,
+        &withdrawal_terms(token),
         &SplBurnError::TransferFrom(TransferFromError::TemporarilyUnavailable),
         10_000,
     );
@@ -1099,7 +1025,6 @@ async fn should_refund_token_burn_errors_like_ckerc20() {
         }
         read_state(|state| {
             assert!(state.pending_spl_withdrawal_requests().is_empty());
-            assert!(state.fee_burned_spl_withdrawal_requests().is_empty());
             assert_eq!(
                 state.pending_spl_withdrawal_fee_reimbursements()[&42.into()]
                     .request
