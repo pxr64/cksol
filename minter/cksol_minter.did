@@ -881,6 +881,11 @@ type EventType = variant {
         nonce_account : Address;
         nonce_value : Hash;
     };
+    // An SPL withdrawal succeeded with its actual fee-payer spend reconciled.
+    SucceededSplWithdrawalTransaction : record {
+        signature : Signature;
+        lamports_spent : Lamport;
+    };
 };
 
 // A minter event.

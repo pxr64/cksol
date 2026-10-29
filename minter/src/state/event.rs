@@ -349,6 +349,14 @@ pub enum EventType {
         #[cbor(n(2), with = "cbor::hash")]
         nonce_value: Hash,
     },
+    /// An SPL withdrawal succeeded with its actual fee-payer spend reconciled.
+    #[n(30)]
+    SucceededSplWithdrawalTransaction {
+        #[cbor(n(0), with = "cbor::signature")]
+        signature: Signature,
+        #[n(1)]
+        lamports_spent: Lamport,
+    },
 }
 
 /// A ckSOL fee reimbursement for an SPL withdrawal whose token burn failed.

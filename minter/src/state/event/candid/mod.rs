@@ -67,6 +67,13 @@ impl From<EventType> for CandidEventType {
                     signature: CandidSignature::from(signature),
                 }
             }
+            EventType::SucceededSplWithdrawalTransaction {
+                signature,
+                lamports_spent,
+            } => CandidEventType::SucceededSplWithdrawalTransaction {
+                signature: signature.into(),
+                lamports_spent,
+            },
             EventType::FailedTransaction { signature } => CandidEventType::FailedTransaction {
                 signature: CandidSignature::from(signature),
             },
@@ -353,6 +360,13 @@ impl TryFrom<CandidEventType> for EventType {
                     signature: Signature::from(signature),
                 }
             }
+            CandidEventType::SucceededSplWithdrawalTransaction {
+                signature,
+                lamports_spent,
+            } => EventType::SucceededSplWithdrawalTransaction {
+                signature: signature.into(),
+                lamports_spent,
+            },
             CandidEventType::FailedTransaction { signature } => EventType::FailedTransaction {
                 signature: Signature::from(signature),
             },

@@ -4,11 +4,15 @@ use super::{
 };
 use crate::{
     address::minter_address,
-    constants::MAX_CONCURRENT_RPC_CALLS,
+    constants::{FEE_PER_SIGNATURE, MAX_CONCURRENT_RPC_CALLS},
     rpc::BlockHeight,
     state::{
-        MinterTransaction, TaskType,
-        event::{EventType, VersionedMessage},
+        MinterTransaction, TaskType, TokenProgram,
+        audit::process_event,
+        event::{
+            EventType, Signer, SplWithdrawalRequest, SplWithdrawalRequestTerms, TransactionPurpose,
+            VersionedMessage,
+        },
         mutate_state, read_state, reset_state,
     },
     storage::{UndecidedWithdrawalReason, reset_events, undecided_withdrawal_transaction_count},
@@ -16,7 +20,7 @@ use crate::{
         EventsAssert, GetTransactionResult, MINIMUM_WITHDRAWAL_AMOUNT, NONCE_ACCOUNT, account,
         confirmed_block_at_height, devnet_sweep, durable_nonce, events, failed_withdrawal_response,
         finalized_status, init_balance, init_schnorr_master_key, init_state, nonce_account_info,
-        runtime::TestCanisterRuntime, signature, succeeded_transaction_response,
+        runtime::TestCanisterRuntime, signature, spl_token, succeeded_transaction_response,
         succeeded_withdrawal_response,
     },
 };
@@ -419,6 +423,138 @@ mod withdrawal_finalization {
     use super::*;
 
     #[tokio::test]
+    async fn should_reconcile_successful_spl_withdrawals_from_the_payer_balance() {
+        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            for new_destination in [false, true] {
+                reset_state();
+                reset_events();
+                let signature = submit_signed_spl_withdrawal(token_program);
+                let balance_before = read_state(|state| state.balance());
+                let reserved =
+                    read_state(|state| state.spl_withdrawal_reserved_cost(&signature).unwrap());
+                let lamports_spent = FEE_PER_SIGNATURE
+                    + if new_destination {
+                        token_program.account_rent_exemption()
+                    } else {
+                        0
+                    };
+                let runtime = TestCanisterRuntime::new()
+                    .with_increasing_time()
+                    .add_stub_response(nonce_read(UNSEEN_NONCE_SEED))
+                    .add_stub_response(spl_withdrawal_response(&signature, lamports_spent));
+
+                finalize_transactions(runtime).await;
+
+                EventsAssert::from_recorded().expect_contains_event_eq(
+                    EventType::SucceededSplWithdrawalTransaction {
+                        signature,
+                        lamports_spent,
+                    },
+                );
+                read_state(|state| {
+                    assert_eq!(state.balance(), balance_before + reserved - lamports_spent);
+                    assert!(
+                        state
+                            .successful_spl_withdrawal_requests()
+                            .contains_key(&100.into())
+                    );
+                    assert!(state.submitted_transactions().is_empty());
+                });
+                assert_nonce_account_is_free();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn should_reconcile_spl_withdrawals_whose_fee_differs_from_the_constant() {
+        for (fee, lamports_spent) in [
+            (FEE_PER_SIGNATURE / 2, FEE_PER_SIGNATURE / 2),
+            (FEE_PER_SIGNATURE + 1, FEE_PER_SIGNATURE + 1),
+        ] {
+            reset_state();
+            reset_events();
+            let signature = submit_signed_spl_withdrawal(TokenProgram::Classic);
+            let balance_before = read_state(|state| state.balance());
+            let reserved =
+                read_state(|state| state.spl_withdrawal_reserved_cost(&signature).unwrap());
+            let mut response = spl_withdrawal_response(&signature, lamports_spent);
+            let GetTransactionResult::Consistent(Ok(Some(outcome))) = &mut response else {
+                unreachable!()
+            };
+            outcome.transaction.meta.as_mut().unwrap().fee = fee;
+            let runtime = TestCanisterRuntime::new()
+                .with_increasing_time()
+                .add_stub_response(nonce_read(UNSEEN_NONCE_SEED))
+                .add_stub_response(response);
+
+            finalize_transactions(runtime).await;
+
+            EventsAssert::from_recorded().expect_contains_event_eq(
+                EventType::SucceededSplWithdrawalTransaction {
+                    signature,
+                    lamports_spent,
+                },
+            );
+            read_state(|state| {
+                assert_eq!(state.balance(), balance_before + reserved - lamports_spent);
+                assert!(
+                    state
+                        .successful_spl_withdrawal_requests()
+                        .contains_key(&100.into())
+                );
+            });
+            assert_nonce_account_is_free();
+        }
+    }
+
+    #[tokio::test]
+    async fn should_keep_spl_withdrawals_unresolved_with_inconsistent_balance_metadata() {
+        for change in 0..6 {
+            reset_state();
+            reset_events();
+            let signature = submit_signed_spl_withdrawal(TokenProgram::Classic);
+            let mut response = spl_withdrawal_response(&signature, FEE_PER_SIGNATURE);
+            let GetTransactionResult::Consistent(Ok(Some(outcome))) = &mut response else {
+                unreachable!()
+            };
+            let meta = outcome.transaction.meta.as_mut().unwrap();
+            match change {
+                0 => meta.pre_balances.clear(),
+                1 => {
+                    meta.post_balances.pop();
+                }
+                2 => meta.fee += 1,
+                3 => meta.post_balances[0] = meta.pre_balances[0] + 1,
+                4 => {
+                    meta.post_balances[0] = meta.pre_balances[0]
+                        - FEE_PER_SIGNATURE
+                        - TokenProgram::Classic.account_rent_exemption()
+                        - 1
+                }
+                5 => meta.post_balances[0] = meta.pre_balances[0] - FEE_PER_SIGNATURE + 1,
+                _ => unreachable!(),
+            }
+            let events_before = EventsAssert::from_recorded();
+            let original = read_state(Clone::clone);
+            let runtime = TestCanisterRuntime::new()
+                .with_increasing_time()
+                .add_stub_response(nonce_read(UNSEEN_NONCE_SEED))
+                .add_stub_response(response);
+
+            finalize_transactions(runtime).await;
+
+            assert_eq!(EventsAssert::from_recorded(), events_before);
+            read_state(|state| assert_eq!(state, &original));
+            assert_eq!(
+                undecided_withdrawal_transaction_count(
+                    UndecidedWithdrawalReason::UnresolvedOutcome
+                ),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn should_record_a_withdrawal_as_succeeded_once_its_nonce_advanced() {
         setup_with_signing_key();
         let signature = submit_signed_withdrawal_bound_to(1, BOUND_NONCE_SEED);
@@ -675,6 +811,89 @@ fn setup() {
 fn setup_with_signing_key() {
     init_state();
     devnet_sweep::init_balance();
+}
+
+fn submit_signed_spl_withdrawal(token_program: TokenProgram) -> solana_signature::Signature {
+    setup_with_signing_key();
+    let token = spl_token([4; 32].into(), token_program);
+    let runtime = TestCanisterRuntime::new().with_time(20);
+    mutate_state(|state| {
+        process_event(state, EventType::AddedSplToken(token.clone()), &runtime);
+        process_event(
+            state,
+            EventType::AcceptedSplWithdrawalRequest(SplWithdrawalRequest {
+                terms: SplWithdrawalRequestTerms {
+                    account: account(1),
+                    mint: token.mint,
+                    ledger_id: token.ledger_id,
+                    address: [9; 32].into(),
+                    amount: 100,
+                    fee: state.withdrawal_fee() + token_program.account_rent_exemption(),
+                    create_destination_account: true,
+                },
+                cksol_burn_block_index: 100.into(),
+                ckspl_burn_block_index: 7.into(),
+            }),
+            &runtime,
+        );
+        process_event(
+            state,
+            EventType::CreatedSplWithdrawalTransaction {
+                cksol_burn_block_index: 100.into(),
+                nonce_account: NONCE_ACCOUNT,
+                nonce_value: durable_nonce(BOUND_NONCE_SEED),
+            },
+            &runtime,
+        );
+    });
+    let message = read_state(|state| {
+        state
+            .bound_spl_withdrawal_message(
+                &NONCE_ACCOUNT,
+                &state.created_spl_withdrawal_txs()[&NONCE_ACCOUNT],
+            )
+            .unwrap()
+    });
+    let signature = devnet_sweep::minter_signature_of(&message);
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::SubmittedTransaction {
+                signature,
+                message: message.into(),
+                signers: vec![Signer::Minter],
+                purpose: TransactionPurpose::SplWithdrawal {
+                    cksol_burn_block_index: 100.into(),
+                },
+            },
+            &runtime,
+        )
+    });
+    signature
+}
+
+fn spl_withdrawal_response(
+    signature: &solana_signature::Signature,
+    lamports_spent: u64,
+) -> GetTransactionResult {
+    let mut response = succeeded_withdrawal_response(signature);
+    let count = read_state(
+        |state| match state.submitted_transactions().get(signature).unwrap() {
+            MinterTransaction::Withdrawal {
+                message: VersionedMessage::Legacy(message),
+                ..
+            } => message.account_keys.len(),
+            _ => unreachable!(),
+        },
+    );
+    let GetTransactionResult::Consistent(Ok(Some(outcome))) = &mut response else {
+        unreachable!()
+    };
+    let meta = outcome.transaction.meta.as_mut().unwrap();
+    meta.pre_balances = vec![10_000_000; count];
+    meta.post_balances = meta.pre_balances.clone();
+    meta.post_balances[0] -= lamports_spent;
+    response
 }
 
 fn current_block() -> ConfirmedBlock {

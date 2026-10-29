@@ -281,6 +281,13 @@ pub enum EventType {
         /// The nonce value the transaction will carry.
         nonce_value: Hash,
     },
+    /// An SPL withdrawal succeeded with its actual fee-payer spend reconciled.
+    SucceededSplWithdrawalTransaction {
+        /// The finalized transaction signature.
+        signature: Signature,
+        /// The fee payer's observed lamport debit, including its transaction fee.
+        lamports_spent: Lamport,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

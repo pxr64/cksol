@@ -38,6 +38,12 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
         EventType::SucceededTransaction { signature } => {
             state.process_transaction_succeeded(signature);
         }
+        EventType::SucceededSplWithdrawalTransaction {
+            signature,
+            lamports_spent,
+        } => {
+            state.process_spl_withdrawal_succeeded(signature, *lamports_spent);
+        }
         EventType::FailedTransaction { signature } => {
             state.process_transaction_failed(signature);
         }

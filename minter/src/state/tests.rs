@@ -2167,6 +2167,59 @@ mod spl_withdrawals {
     }
 
     #[test]
+    fn should_replay_the_actual_spend_of_a_successful_spl_withdrawal() {
+        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            for spent_rent in [false, true] {
+                reset_state();
+                reset_events();
+                setup_created_spl_withdrawal(token_program, true);
+                record(submitted_spl_withdrawal(100), 40);
+                let lamports_spent = FEE_PER_SIGNATURE
+                    + if spent_rent {
+                        token_program.account_rent_exemption()
+                    } else {
+                        0
+                    };
+
+                let replayed = finalize(EventType::SucceededSplWithdrawalTransaction {
+                    signature: minter_signature(),
+                    lamports_spent,
+                });
+
+                assert_eq!(replayed.balance(), FUNDED_BALANCE - lamports_spent);
+                assert!(
+                    replayed
+                        .successful_spl_withdrawal_requests()
+                        .contains_key(&100.into())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_reject_spl_success_with_spend_above_the_reservation() {
+        setup_created_spl_withdrawal(TokenProgram::Classic, true);
+        record(submitted_spl_withdrawal(100), 40);
+        let original = read_state(Clone::clone);
+        let reserved = original
+            .spl_withdrawal_reserved_cost(&minter_signature())
+            .unwrap();
+        for lamports_spent in [reserved + 1, u64::MAX] {
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| record(
+                    EventType::SucceededSplWithdrawalTransaction {
+                        signature: minter_signature(),
+                        lamports_spent,
+                    },
+                    50,
+                )))
+                .is_err()
+            );
+            assert_eq!(assert_replay_matches(), original);
+        }
+    }
+
+    #[test]
     fn should_not_reuse_the_index_of_a_finalized_spl_withdrawal() {
         let request = setup_created_spl_withdrawal(TokenProgram::Classic, false);
         record(submitted_spl_withdrawal(100), 40);

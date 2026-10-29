@@ -8,7 +8,7 @@ use crate::{
         MinterTransaction, NonceRead,
         audit::process_event,
         event::{EventType, VersionedMessage},
-        mutate_state, read_state,
+        fee_payer_lamports_spent, mutate_state, read_state,
     },
     storage::{
         UndecidedWithdrawalReason, set_undecided_withdrawal_transactions, with_unstable_metrics_mut,
@@ -18,11 +18,13 @@ use crate::{
 use canlog::log;
 use cksol_types_internal::log::Priority;
 use itertools::Itertools;
+use sol_rpc_types::Lamport;
 use solana_address::Address;
 use solana_hash::Hash;
 use solana_message::Message;
 use solana_signature::Signature;
 use solana_transaction::{Transaction, versioned::VersionedTransaction};
+use solana_transaction_status_client_types::UiTransactionStatusMeta;
 use std::{collections::BTreeMap, time::Duration};
 
 #[derive(Default)]
@@ -124,6 +126,15 @@ struct InFlightWithdrawal {
 }
 
 impl InFlightWithdrawal {
+    /// The fee payer's spend, when the metadata is complete and the spend is within the reservation.
+    fn spl_lamports_spent(
+        &self,
+        meta: &UiTransactionStatusMeta,
+        reserved: Lamport,
+    ) -> Option<Lamport> {
+        fee_payer_lamports_spent(&self.message, meta).filter(|spent| *spent <= reserved)
+    }
+
     fn signed_transaction(&self) -> Transaction {
         Transaction {
             signatures: vec![self.signature],
@@ -234,8 +245,10 @@ async fn finalize_landed_withdrawal<R: CanisterRuntime>(
             meta: Some(meta), ..
         })) => match meta.err {
             None => {
-                log!(Priority::Info, "Transaction {signature} finalized");
-                EventType::SucceededTransaction { signature }
+                let Some(event) = successful_withdrawal_event(withdrawal, &meta) else {
+                    return Finalization::UnresolvedOutcome;
+                };
+                event
             }
             Some(error) => {
                 log!(
@@ -274,6 +287,34 @@ async fn finalize_landed_withdrawal<R: CanisterRuntime>(
     };
     mutate_state(|state| process_event(state, event, runtime));
     Finalization::Finalized
+}
+
+/// Idempotent account creation spends no rent when the account exists, so an SPL
+/// withdrawal records its actual spend and replay returns the unused reservation.
+fn successful_withdrawal_event(
+    withdrawal: &InFlightWithdrawal,
+    meta: &UiTransactionStatusMeta,
+) -> Option<EventType> {
+    let signature = withdrawal.signature;
+    let Some(reserved) = read_state(|state| state.spl_withdrawal_reserved_cost(&signature)) else {
+        log!(Priority::Info, "Transaction {signature} finalized");
+        return Some(EventType::SucceededTransaction { signature });
+    };
+    let Some(lamports_spent) = withdrawal.spl_lamports_spent(meta, reserved) else {
+        log!(
+            Priority::Error,
+            "SPL withdrawal transaction {signature} has inconsistent fee-payer balance metadata, retrying next round"
+        );
+        return None;
+    };
+    log!(
+        Priority::Info,
+        "SPL withdrawal transaction {signature} finalized with {lamports_spent} lamports spent"
+    );
+    Some(EventType::SucceededSplWithdrawalTransaction {
+        signature,
+        lamports_spent,
+    })
 }
 
 async fn rebroadcast<R: CanisterRuntime>(runtime: &R, withdrawal: &InFlightWithdrawal) {

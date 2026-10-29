@@ -1994,6 +1994,12 @@ pub mod arb {
                     }
                 },
             ),
+            (arb_signature(), any::<u64>()).prop_map(|(signature, lamports_spent)| {
+                EventType::SucceededSplWithdrawalTransaction {
+                    signature,
+                    lamports_spent,
+                }
+            }),
             (arb_ledger_burn_index(), arb_ledger_mint_index()).prop_map(
                 |(cksol_burn_block_index, mint_block_index)| {
                     EventType::ReimbursedSplWithdrawalFee {

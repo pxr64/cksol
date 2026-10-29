@@ -47,6 +47,7 @@ mod nonce_pool;
 mod spl;
 mod spl_deposits;
 mod sweep;
+pub use sweep::fee_payer_lamports_spent;
 use sweep::validate_sweep_transaction;
 
 pub use spl::{SupportedSplToken, TokenProgram};
@@ -1346,6 +1347,29 @@ impl State {
         .unwrap_or_else(|e| {
             panic!("BUG: cannot rebuild the withdrawal message bound to nonce account {nonce_account}: {e}")
         })
+    }
+
+    /// The lamports reserved for an in-flight SPL withdrawal, including its fee.
+    pub fn spl_withdrawal_reserved_cost(&self, signature: &Signature) -> Option<Lamport> {
+        self.sent_spl_withdrawal_requests
+            .values()
+            .find(|sent| &sent.signature == signature)
+            .map(|sent| self.spl_withdrawal_cost(&sent.request.terms))
+    }
+
+    fn process_spl_withdrawal_succeeded(&mut self, signature: &Signature, lamports_spent: Lamport) {
+        let reserved = self
+            .spl_withdrawal_reserved_cost(signature)
+            .expect("Attempted to reconcile an SPL withdrawal that is not in flight");
+        assert!(
+            lamports_spent <= reserved,
+            "Attempted to reconcile an SPL withdrawal spend above its reserved fee and rent"
+        );
+        self.balance = self
+            .balance
+            .checked_add(reserved - lamports_spent)
+            .expect("BUG: returning unspent SPL withdrawal rent overflows the balance");
+        self.process_transaction_succeeded(signature);
     }
 
     fn process_transaction_succeeded(&mut self, signature: &Signature) {

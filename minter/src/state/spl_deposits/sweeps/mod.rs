@@ -6,6 +6,7 @@ use crate::{
         QueuedSplDeposit, SchnorrPublicKey, SupportedSplToken, SweepMismatch, SweepSettlementError,
         TokenProgram, UnreadableOutcome,
         event::{CreditedSplDeposit, Signer, VersionedMessage},
+        sweep::fee_payer_lamports_spent,
         validate_sweep_transaction,
     },
 };
@@ -228,16 +229,13 @@ impl SplSweep {
     ) -> Result<SettledSplSweep, SweepSettlementError> {
         let (message, meta) =
             validate_sweep_transaction(transaction, meta, |hash| self.sweep_message(hash))?;
-        let pre_lamports = meta.pre_balances[0];
-        let post_lamports = meta.post_balances[0];
-        let lamports_spent = pre_lamports
-            .checked_sub(post_lamports)
-            .filter(|spent| *spent >= meta.fee)
-            .ok_or(SweepMismatch::UnexpectedLamportsSpent {
-                pre: pre_lamports,
-                post: post_lamports,
+        let lamports_spent = fee_payer_lamports_spent(message, meta).ok_or(
+            SweepMismatch::UnexpectedLamportsSpent {
+                pre: meta.pre_balances[0],
+                post: meta.post_balances[0],
                 fee: meta.fee,
-            })?;
+            },
+        )?;
         self.validate_token_balances(message, meta)?;
         let mints = self
             .deposits
