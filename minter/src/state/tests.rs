@@ -901,6 +901,7 @@ mod state_from_init_args {
                 balance: 0,
                 spl_sweep_reservations: BTreeMap::new(),
                 operating_balance: 0,
+                spl_treasury_balances: BTreeMap::new(),
                 pending_spl_withdrawal_requests: BTreeMap::new(),
                 created_spl_withdrawal_requests: BTreeMap::new(),
                 created_spl_withdrawal_txs: BTreeMap::new(),
@@ -1811,9 +1812,9 @@ mod spl_withdrawals {
         },
         storage::{reset_events, with_event_iter},
         test_fixtures::{
-            MINTER_ADDRESS, NONCE_ACCOUNT, account, init_args_with_nonce_account, init_balance_to,
-            minter_public_key_fetched_event, minter_signature, runtime::TestCanisterRuntime,
-            spl_token, valid_init_args,
+            MINTER_ADDRESS, NONCE_ACCOUNT, account, events, init_args_with_nonce_account,
+            init_balance_to, minter_public_key_fetched_event, minter_signature,
+            runtime::TestCanisterRuntime, spl_token, valid_init_args,
         },
     };
     use candid::Principal;
@@ -2050,6 +2051,7 @@ mod spl_withdrawals {
         let mut request = setup_with_nonce();
         let token = spl_token([4; 32].into(), token_program);
         record(EventType::AddedSplToken(token.clone()), 10);
+        events::fund_spl_treasury(&token, FUNDED_TOKENS);
         request.mint = token.mint;
         request.ledger_id = token.ledger_id;
         request.create_destination_account = create_destination_account;
@@ -2267,12 +2269,17 @@ mod spl_withdrawals {
     }
 
     const FUNDED_BALANCE: Lamport = 500_000_000;
+    const FUNDED_TOKENS: u64 = 10_000_000;
 
     /// Inits with a nonce account and funds the balance through a swept deposit.
     fn setup_with_nonce() -> SplWithdrawalRequestTerms {
         let request = setup_with(init_args_with_nonce_account());
         record(minter_public_key_fetched_event(), 3);
         init_balance_to(FUNDED_BALANCE);
+        events::fund_spl_treasury(
+            &spl_token(request.mint, TokenProgram::Classic),
+            FUNDED_TOKENS,
+        );
         request
     }
 
@@ -2317,6 +2324,7 @@ mod spl_withdrawals {
                 let mut token = spl_token([4; 32].into(), token_program);
                 token.decimals = 9;
                 record(EventType::AddedSplToken(token.clone()), 10);
+                events::fund_spl_treasury(&token, 200_000_000);
                 request.mint = token.mint;
                 request.ledger_id = token.ledger_id;
                 request.amount = 123_456_789;
@@ -2347,12 +2355,12 @@ mod spl_withdrawals {
     }
 
     #[test]
-    fn should_plan_withdrawals_of_both_kinds_oldest_first_within_one_budget() {
+    fn should_plan_withdrawals_of_both_kinds_in_burn_index_order_within_one_budget() {
         let request = setup_with_nonce();
         let sol = WithdrawalRequest {
             account: request.account,
             solana_address: request.address.to_bytes(),
-            burn_block_index: 200.into(),
+            burn_block_index: 50.into(),
             burned_amount: 20_000,
             amount_to_transfer: 10_000,
         };
@@ -2395,20 +2403,20 @@ mod spl_withdrawals {
             burned_amount: 20_000,
             amount_to_transfer: 10_000,
         };
-        record(EventType::AcceptedWithdrawalRequest(sol(200)), 10);
+        record(EventType::AcceptedWithdrawalRequest(sol(90)), 10);
         accept(100, 7, &request);
-        record(EventType::AcceptedWithdrawalRequest(sol(201)), 30);
+        record(EventType::AcceptedWithdrawalRequest(sol(110)), 30);
         let plans: Vec<_> = read_state(|state| state.withdrawal_plans().collect());
         assert_eq!(
             plans,
             vec![
-                WithdrawalPlan::Sol(vec![sol(200)]),
+                WithdrawalPlan::Sol(vec![sol(90)]),
                 WithdrawalPlan::Spl(accepted_request(100, 7, &request)),
-                WithdrawalPlan::Sol(vec![sol(201)]),
+                WithdrawalPlan::Sol(vec![sol(110)]),
             ]
         );
 
-        // The budget covers the first SOL request and the SPL request, not the newer SOL one.
+        // The budget covers the first SOL request and the SPL request, not the later SOL one.
         mutate_state(|state| {
             state.balance =
                 RENT_EXEMPTION_THRESHOLD + 10_000 + BATCH_WITHDRAWAL_TX_FEE + FEE_PER_SIGNATURE
@@ -2417,9 +2425,92 @@ mod spl_withdrawals {
         assert_eq!(
             plans,
             vec![
-                WithdrawalPlan::Sol(vec![sol(200)]),
+                WithdrawalPlan::Sol(vec![sol(90)]),
                 WithdrawalPlan::Spl(accepted_request(100, 7, &request)),
             ]
+        );
+    }
+
+    #[test]
+    fn should_credit_the_treasury_with_the_swept_token_balance() {
+        let request = setup_with_nonce();
+        let replayed = assert_replay_matches();
+        assert_eq!(replayed.spl_treasury_balance(&request.mint), FUNDED_TOKENS);
+        assert_eq!(replayed.spl_treasury_balance(&[4; 32].into()), 0);
+    }
+
+    #[test]
+    fn should_reserve_treasury_tokens_on_creation_and_return_them_on_failure() {
+        let request = setup_created_spl_withdrawal(TokenProgram::Classic, false);
+        assert_eq!(
+            assert_replay_matches().spl_treasury_balance(&request.mint),
+            FUNDED_TOKENS - request.amount
+        );
+        record(submitted_spl_withdrawal(100), 40);
+        let replayed = finalize(EventType::FailedTransaction {
+            signature: minter_signature(),
+        });
+        assert_eq!(replayed.spl_treasury_balance(&request.mint), FUNDED_TOKENS);
+    }
+
+    #[test]
+    fn should_keep_the_tokens_of_a_succeeded_spl_withdrawal_out_of_the_treasury() {
+        let request = setup_created_spl_withdrawal(TokenProgram::Classic, false);
+        record(submitted_spl_withdrawal(100), 40);
+        let replayed = finalize(EventType::SucceededTransaction {
+            signature: minter_signature(),
+        });
+        assert_eq!(
+            replayed.spl_treasury_balance(&request.mint),
+            FUNDED_TOKENS - request.amount
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient treasury tokens for SPL withdrawal")]
+    fn should_reject_spl_binding_without_treasury_tokens() {
+        let request = setup_with(init_args_with_nonce_account());
+        record(minter_public_key_fetched_event(), 3);
+        init_balance_to(FUNDED_BALANCE);
+        accept(100, 7, &request);
+        record(spl_transaction_created(100), 30);
+    }
+
+    #[test]
+    fn should_skip_spl_plans_the_treasury_cannot_pay_and_keep_sol_going() {
+        let request = setup_with_nonce();
+        let mut unfunded = request.clone();
+        unfunded.amount = FUNDED_TOKENS + 1;
+        accept(100, 7, &unfunded);
+        accept(101, 8, &request);
+        let sol = WithdrawalRequest {
+            account: request.account,
+            solana_address: request.address.to_bytes(),
+            burn_block_index: 200.into(),
+            burned_amount: 20_000,
+            amount_to_transfer: 10_000,
+        };
+        record(EventType::AcceptedWithdrawalRequest(sol.clone()), 15);
+        let plans: Vec<_> = read_state(|state| state.withdrawal_plans().collect());
+        assert_eq!(plans, vec![WithdrawalPlan::Sol(vec![sol])]);
+    }
+
+    #[test]
+    fn should_skip_sol_plans_the_balance_cannot_pay_and_keep_spl_going() {
+        let request = setup_with_nonce();
+        let sol = WithdrawalRequest {
+            account: request.account,
+            solana_address: request.address.to_bytes(),
+            burn_block_index: 90.into(),
+            burned_amount: FUNDED_BALANCE,
+            amount_to_transfer: FUNDED_BALANCE,
+        };
+        record(EventType::AcceptedWithdrawalRequest(sol), 15);
+        accept(100, 7, &request);
+        let plans: Vec<_> = read_state(|state| state.withdrawal_plans().collect());
+        assert_eq!(
+            plans,
+            vec![WithdrawalPlan::Spl(accepted_request(100, 7, &request))]
         );
     }
 

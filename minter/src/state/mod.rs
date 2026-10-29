@@ -154,6 +154,7 @@ pub struct State {
     balance: Lamport,
     spl_sweep_reservations: BTreeMap<Signature, Lamport>,
     operating_balance: Lamport,
+    spl_treasury_balances: BTreeMap<Address, u64>,
     pending_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest>,
     created_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest>,
     created_spl_withdrawal_txs: BTreeMap<Address, CreatedSplWithdrawalTransaction>,
@@ -362,6 +363,12 @@ impl State {
     /// The lamports of the balance set aside for the in-flight SPL sweeps, by signature.
     pub fn spl_sweep_reservations(&self) -> &BTreeMap<Signature, Lamport> {
         &self.spl_sweep_reservations
+    }
+
+    /// The tokens of the mint that credited sweeps moved into the treasury and no
+    /// withdrawal has claimed, in the mint's smallest units.
+    pub fn spl_treasury_balance(&self, mint: &Address) -> u64 {
+        self.spl_treasury_balances.get(mint).copied().unwrap_or(0)
     }
 
     pub fn sol_rpc_client<R: Runtime>(&self, runtime: R) -> SolRpcClient<R> {
@@ -602,8 +609,25 @@ impl State {
         mints: &[event::CreditedSplDeposit],
         timestamp: u64,
     ) {
+        let swept_tokens: Vec<(Address, u64)> = self
+            .spl_deposits
+            .finalized()
+            .get(signature)
+            .unwrap_or_else(|| {
+                panic!("Attempted to credit SPL sweep {signature} that is not finalized")
+            })
+            .deposits()
+            .values()
+            .map(|deposit| (deposit.mint, deposit.balance))
+            .collect();
         self.spl_deposits.credit_sweep(signature, mints, timestamp);
         self.release_spl_sweep_cost(signature, lamports_spent);
+        for (mint, balance) in swept_tokens {
+            let treasury = self.spl_treasury_balances.entry(mint).or_default();
+            *treasury = treasury
+                .checked_add(balance)
+                .expect("BUG: the treasury balance of a mint overflows");
+        }
     }
 
     /// Sets the most the sweep can cost aside, so that withdrawals cannot spend it meanwhile.
@@ -766,9 +790,12 @@ impl State {
     pub fn withdrawal_plans(&self) -> WithdrawalPlans<'_> {
         WithdrawalPlans {
             state: self,
-            pending_sol: self.pending_withdrawal_requests.values().peekable(),
-            pending_spl: self.pending_spl_withdrawal_requests.values().peekable(),
+            pending_sol: self.pending_withdrawal_requests.iter().peekable(),
+            pending_spl: self.pending_spl_withdrawal_requests.iter().peekable(),
             available_balance: self.spendable_balance(),
+            available_tokens: self.spl_treasury_balances.clone(),
+            sol_blocked: false,
+            spl_blocked: false,
         }
     }
 
@@ -803,6 +830,7 @@ impl State {
 
     pub fn covers_spl_withdrawal(&self, request: &SplWithdrawalRequestTerms) -> bool {
         self.spendable_balance() >= self.spl_withdrawal_cost(request)
+            && self.spl_treasury_balance(&request.mint) >= request.amount
     }
 
     pub fn created_spl_withdrawal_requests(
@@ -1106,6 +1134,13 @@ impl State {
             .balance
             .checked_sub(self.spl_withdrawal_cost(&withdrawal.request.terms))
             .expect("BUG: insufficient minter balance for SPL withdrawal");
+        let treasury = self
+            .spl_treasury_balances
+            .entry(withdrawal.request.terms.mint)
+            .or_default();
+        *treasury = treasury
+            .checked_sub(withdrawal.request.terms.amount)
+            .expect("BUG: insufficient treasury tokens for SPL withdrawal");
         self.nonce_pool.bind(nonce_account, nonce_value);
         assert_eq!(
             self.created_spl_withdrawal_requests
@@ -1481,6 +1516,13 @@ impl State {
                 .balance
                 .checked_add(unspent_rent)
                 .expect("BUG: returning unspent SPL withdrawal rent overflows the balance");
+            let treasury = self
+                .spl_treasury_balances
+                .entry(sent.request.terms.mint)
+                .or_default();
+            *treasury = treasury.checked_add(sent.request.terms.amount).expect(
+                "BUG: returning the tokens of a failed SPL withdrawal overflows the treasury",
+            );
             self.failed_spl_withdrawal_requests.insert(burn_index, sent);
         }
     }
@@ -1593,6 +1635,7 @@ impl TryFrom<InitArgs> for State {
             balance: 0,
             spl_sweep_reservations: BTreeMap::new(),
             operating_balance: 0,
+            spl_treasury_balances: BTreeMap::new(),
             pending_spl_withdrawal_requests: BTreeMap::new(),
             created_spl_withdrawal_requests: BTreeMap::new(),
             created_spl_withdrawal_txs: BTreeMap::new(),
@@ -1691,40 +1734,63 @@ pub enum WithdrawalPlan {
     Spl(SplWithdrawalRequest),
 }
 
-/// Groups pending withdrawals of both kinds, oldest first, into transactions that the
-/// minter balance can pay for: SOL requests in batches with one transaction fee each,
-/// SPL requests one per transaction with its fee and destination rent. The rent
-/// exemption threshold is held back so a transaction never leaves the main address
-/// below it.
+/// Groups pending withdrawals of both kinds into transactions that the minter can pay
+/// for, in ckSOL burn index order: SOL requests in batches with one transaction fee each,
+/// SPL requests one per transaction with its fee, its destination rent and its treasury
+/// tokens. The rent exemption threshold is held back so a transaction never leaves the
+/// main address below it.
 ///
-/// Iteration stops at the first plan the remaining balance cannot cover, so requests
-/// are never reordered or skipped.
+/// Within a kind, iteration stops at the first request the minter cannot pay for, so
+/// requests of a kind are never reordered or skipped. The other kind keeps going, so
+/// neither kind blocks the other.
 pub struct WithdrawalPlans<'a> {
     state: &'a State,
-    pending_sol: Peekable<btree_map::Values<'a, LedgerBurnIndex, PendingWithdrawalRequest>>,
-    pending_spl: Peekable<btree_map::Values<'a, LedgerBurnIndex, PendingSplWithdrawalRequest>>,
+    pending_sol: Peekable<btree_map::Iter<'a, LedgerBurnIndex, PendingWithdrawalRequest>>,
+    pending_spl: Peekable<btree_map::Iter<'a, LedgerBurnIndex, PendingSplWithdrawalRequest>>,
     available_balance: Lamport,
+    available_tokens: BTreeMap<Address, u64>,
+    sol_blocked: bool,
+    spl_blocked: bool,
 }
 
 impl Iterator for WithdrawalPlans<'_> {
     type Item = WithdrawalPlan;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next_sol = self.pending_sol.peek().map(|pending| pending.created_at);
-        let next_spl = self.pending_spl.peek().map(|pending| pending.created_at);
-        match (next_sol, next_spl) {
-            (None, None) => None,
-            (Some(sol), Some(spl)) if spl < sol => self.next_spl(),
-            (Some(_), _) => self.next_sol_batch(next_spl),
-            (None, Some(_)) => self.next_spl(),
+        loop {
+            let next_sol = self.next_burn_index_of_sol();
+            let next_spl = self.next_burn_index_of_spl();
+            let plan = match (next_sol, next_spl) {
+                (None, None) => return None,
+                (Some(sol), Some(spl)) if spl < sol => self.next_spl(),
+                (Some(_), _) => self.next_sol_batch(next_spl),
+                (None, Some(_)) => self.next_spl(),
+            };
+            if plan.is_some() {
+                return plan;
+            }
         }
     }
 }
 
 impl WithdrawalPlans<'_> {
+    fn next_burn_index_of_sol(&mut self) -> Option<LedgerBurnIndex> {
+        if self.sol_blocked {
+            return None;
+        }
+        self.pending_sol.peek().map(|(burn_index, _)| **burn_index)
+    }
+
+    fn next_burn_index_of_spl(&mut self) -> Option<LedgerBurnIndex> {
+        if self.spl_blocked {
+            return None;
+        }
+        self.pending_spl.peek().map(|(burn_index, _)| **burn_index)
+    }
+
     /// Batches SOL requests up to the next SPL request, so a batch never serves a
     /// request newer than an SPL request still waiting.
-    fn next_sol_batch(&mut self, next_spl_created_at: Option<u64>) -> Option<WithdrawalPlan> {
+    fn next_sol_batch(&mut self, next_spl: Option<LedgerBurnIndex>) -> Option<WithdrawalPlan> {
         let mut batch = Vec::new();
         while batch.len() < MAX_WITHDRAWALS_PER_NONCE_TX {
             let reserved_fee = if batch.is_empty() {
@@ -1732,10 +1798,10 @@ impl WithdrawalPlans<'_> {
             } else {
                 0
             };
-            let Some(pending) = self.pending_sol.peek() else {
+            let Some((burn_index, pending)) = self.pending_sol.peek() else {
                 break;
             };
-            if next_spl_created_at.is_some_and(|spl| spl < pending.created_at) {
+            if next_spl.is_some_and(|spl| spl < **burn_index) {
                 break;
             }
             let Some(remaining_balance) = pending
@@ -1751,6 +1817,7 @@ impl WithdrawalPlans<'_> {
             self.pending_sol.next();
         }
         if batch.is_empty() {
+            self.sol_blocked = true;
             None
         } else {
             Some(WithdrawalPlan::Sol(batch))
@@ -1758,11 +1825,21 @@ impl WithdrawalPlans<'_> {
     }
 
     fn next_spl(&mut self) -> Option<WithdrawalPlan> {
-        let pending = self.pending_spl.peek()?;
-        let remaining_balance = self
+        let (_, pending) = self.pending_spl.peek()?;
+        let terms = &pending.request.terms;
+        let affordable = self
             .available_balance
-            .checked_sub(self.state.spl_withdrawal_cost(&pending.request.terms))?;
+            .checked_sub(self.state.spl_withdrawal_cost(terms))
+            .and_then(|balance| {
+                let tokens = self.available_tokens.get(&terms.mint).copied().unwrap_or(0);
+                Some((balance, tokens.checked_sub(terms.amount)?))
+            });
+        let Some((remaining_balance, remaining_tokens)) = affordable else {
+            self.spl_blocked = true;
+            return None;
+        };
         self.available_balance = remaining_balance;
+        self.available_tokens.insert(terms.mint, remaining_tokens);
         let request = pending.request.clone();
         self.pending_spl.next();
         Some(WithdrawalPlan::Spl(request))

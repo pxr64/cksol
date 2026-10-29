@@ -819,6 +819,9 @@ fn submit_signed_spl_withdrawal(token_program: TokenProgram) -> solana_signature
     let runtime = TestCanisterRuntime::new().with_time(20);
     mutate_state(|state| {
         process_event(state, EventType::AddedSplToken(token.clone()), &runtime);
+    });
+    events::fund_spl_treasury(&token, 1_000);
+    mutate_state(|state| {
         process_event(
             state,
             EventType::AcceptedSplWithdrawalRequest(SplWithdrawalRequest {

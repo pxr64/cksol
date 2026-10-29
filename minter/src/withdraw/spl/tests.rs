@@ -11,7 +11,7 @@ use crate::{
     },
     storage::reset_events,
     test_fixtures::{
-        EventsAssert, MINTER_ADDRESS, NONCE_ACCOUNT, account, init_balance_to,
+        EventsAssert, MINTER_ADDRESS, NONCE_ACCOUNT, account, events, init_balance_to,
         init_schnorr_master_key, init_state, ledger_canister_id, minter_signature,
         runtime::TestCanisterRuntime, signer::sign_as_minter, spl_token,
     },
@@ -88,6 +88,7 @@ mod transaction_creation {
     type NonceResult = MultiRpcResult<Option<AccountInfo>>;
     type SendTransactionResult = MultiRpcResult<sol_rpc_types::Signature>;
     const FUNDED_BALANCE: u64 = 500_000_000;
+    const FUNDED_TOKENS: u64 = 10_000_000;
 
     fn setup(nonces: usize, balance: u64, program: TokenProgram) -> SupportedSplToken {
         let nonce_accounts = (0..nonces)
@@ -108,11 +109,14 @@ mod transaction_creation {
         if balance > 0 {
             init_balance_to(balance);
         }
-        register_token(program)
+        let token = register_token(program);
+        events::fund_spl_treasury(&token, FUNDED_TOKENS);
+        token
     }
 
     fn queue(token: &SupportedSplToken, id: u64, create_destination_account: bool) {
         let mut terms = withdrawal_terms(token);
+        terms.amount = 1_000;
         terms.create_destination_account = create_destination_account;
         terms.fee = quote_withdrawal_fee(
             read_state(|state| state.withdrawal_fee()),
@@ -426,8 +430,8 @@ mod transaction_creation {
         let token = setup(3, FUNDED_BALANCE, TokenProgram::Classic);
         queue(&token, 42, false);
         events::accept_withdrawal_at(account(1), 1, MINIMUM_WITHDRAWAL_AMOUNT, 100);
-        events::accept_withdrawal_at(account(2), 2, MINIMUM_WITHDRAWAL_AMOUNT, 200);
-        // The SPL request at 123 splits the SOL requests at 100 and 200 into two batches.
+        events::accept_withdrawal_at(account(2), 100, MINIMUM_WITHDRAWAL_AMOUNT, 200);
+        // SPL burn index 42 splits the SOL burn indices 1 and 100 into two batches.
         let plans: Vec<_> = read_state(|state| state.withdrawal_plans().collect());
         assert!(matches!(
             plans.as_slice(),
@@ -465,7 +469,9 @@ async fn should_re_sign_the_identical_spl_message_after_a_signing_failure() {
             init_state();
             init_balance_to(500_000_000);
             let token = register_token(token_program);
+            events::fund_spl_treasury(&token, 10_000_000);
             let mut terms = withdrawal_terms(&token);
+            terms.amount = 1_000;
             terms.create_destination_account = create_destination_account;
             let runtime = TestCanisterRuntime::new().with_time(123);
             mutate_state(|state| {

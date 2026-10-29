@@ -1218,6 +1218,55 @@ pub mod events {
         sweep
     }
 
+    /// Moves `amount` tokens of the registered `token` into the treasury through a queued,
+    /// swept and credited deposit. The sweep spends no lamports, so the balance is unchanged.
+    pub fn fund_spl_treasury(token: &crate::state::SupportedSplToken, amount: u64) {
+        let mut deposit = queued_spl_deposit(account(0xA6), token.mint, token.token_program);
+        deposit.balance = amount;
+        let deposit_id = read_state(|state| state.spl_deposits().next_id());
+        let signature = super::signature(0xA600 + deposit_id as usize);
+        let tokens = BTreeMap::from([(token.mint, token.clone())]);
+        let sweep = SplSweep::plan(
+            [(deposit_id, deposit.clone())],
+            &tokens,
+            &schnorr_master_key(),
+        );
+        let message = sweep.sweep_message(solana_hash::Hash::default());
+        let signers = sweep.signers(&message);
+        mutate_state(|state| {
+            for event in [
+                EventType::QueuedSplDeposit {
+                    deposit_id,
+                    account: deposit.account,
+                    mint: deposit.mint,
+                    address: deposit.address,
+                    balance: deposit.balance,
+                    fee: deposit.fee,
+                },
+                EventType::SubmittedTransaction {
+                    signature,
+                    message: message.into(),
+                    signers,
+                    purpose: TransactionPurpose::SweepSplDeposits {
+                        deposit_ids: vec![deposit_id],
+                        block_height: DEFAULT_BLOCK_HEIGHT,
+                    },
+                },
+                EventType::SucceededTransaction { signature },
+                EventType::CreditedSplSweep {
+                    signature,
+                    lamports_spent: 0,
+                    mints: vec![crate::state::event::CreditedSplDeposit {
+                        deposit_id,
+                        amount_to_mint: deposit.amount_to_mint(),
+                    }],
+                },
+            ] {
+                process_event(state, event, &runtime());
+            }
+        });
+    }
+
     pub fn accept_withdrawal(account: Account, burn_index: u64, amount: Lamport) {
         accept_withdrawal_at(account, burn_index, amount, 0);
     }
