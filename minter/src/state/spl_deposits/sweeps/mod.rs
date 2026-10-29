@@ -1,6 +1,7 @@
 use crate::{
     address::{account_address, associated_token_address, minter_address},
     constants::FEE_PER_SIGNATURE,
+    spl_transfer::{create_associated_token_account_instruction, transfer_checked_instruction},
     state::{
         QueuedSplDeposit, SchnorrPublicKey, SupportedSplToken, SweepMismatch, SweepSettlementError,
         TokenProgram, UnreadableOutcome,
@@ -373,28 +374,22 @@ impl SplSweep {
             let destination =
                 associated_token_address(&self.minter_address, &deposit.mint, &token_program);
             if destinations.insert(destination) {
-                instructions.push(
-                    spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(
-                        &self.minter_address.to_bytes().into(),
-                        &self.minter_address.to_bytes().into(),
-                        &deposit.mint.to_bytes().into(),
-                        &token_program.to_bytes().into(),
-                    ),
-                );
+                instructions.push(create_associated_token_account_instruction(
+                    &self.minter_address,
+                    &self.minter_address,
+                    &deposit.mint,
+                    &token_program,
+                ));
             }
-            let mut transfer_checked = spl_token_interface::instruction::transfer_checked(
-                &spl_token_interface::id(),
-                &deposit.address.to_bytes().into(),
-                &deposit.mint.to_bytes().into(),
-                &destination.to_bytes().into(),
-                &transfer.owner.to_bytes().into(),
-                &[],
+            instructions.push(transfer_checked_instruction(
+                &token_program,
+                &deposit.address,
+                &deposit.mint,
+                &destination,
+                &transfer.owner,
                 deposit.balance,
                 transfer.decimals,
-            )
-            .expect("BUG: the classic SPL token program accepts transfer_checked");
-            transfer_checked.program_id = token_program.to_bytes().into();
-            instructions.push(transfer_checked);
+            ));
         }
         Message::new_with_blockhash(&instructions, Some(&self.minter_address), &recent_blockhash)
     }

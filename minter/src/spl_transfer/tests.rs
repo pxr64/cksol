@@ -35,6 +35,192 @@ fn spl_deposit_and_token(token_program: TokenProgram) -> (QueuedSplDeposit, Supp
     )
 }
 
+#[test]
+fn should_transfer_spl_withdrawals_from_treasury_to_destination_ata() {
+    let destination = Address::from([42; 32]);
+    let amount = 12_345_678;
+    for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+        let token = spl_token(Address::from([3; 32]), token_program);
+        let instructions =
+            build_spl_withdrawal_instructions(&MINTER_ADDRESS, &token, &destination, amount, false);
+
+        assert_eq!(instructions.len(), 1);
+        let transfer = &instructions[0];
+        assert_eq!(
+            transfer.program_id.to_bytes(),
+            token_program.id().to_bytes()
+        );
+        assert_eq!(
+            spl_token_2022_interface::instruction::TokenInstruction::unpack(&transfer.data)
+                .unwrap(),
+            spl_token_2022_interface::instruction::TokenInstruction::TransferChecked {
+                amount,
+                decimals: token.decimals,
+            }
+        );
+        let expected_accounts = [
+            (
+                associated_token_address(&MINTER_ADDRESS, &token.mint, &token_program.id()),
+                false,
+                true,
+            ),
+            (token.mint, false, false),
+            (
+                associated_token_address(&destination, &token.mint, &token_program.id()),
+                false,
+                true,
+            ),
+            (MINTER_ADDRESS, true, false),
+        ];
+        assert_eq!(transfer.accounts.len(), expected_accounts.len());
+        for (actual, (address, is_signer, is_writable)) in
+            transfer.accounts.iter().zip(expected_accounts)
+        {
+            assert_eq!(actual.pubkey.to_bytes(), address.to_bytes());
+            assert_eq!(actual.is_signer, is_signer);
+            assert_eq!(actual.is_writable, is_writable);
+        }
+    }
+}
+
+#[test]
+fn should_create_spl_withdrawal_destination_before_transfer() {
+    let destination = Address::from([42; 32]);
+    for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+        let token = spl_token(Address::from([3; 32]), token_program);
+        let instructions =
+            build_spl_withdrawal_instructions(&MINTER_ADDRESS, &token, &destination, 100, true);
+
+        assert_eq!(instructions.len(), 2);
+        let create = &instructions[0];
+        assert_eq!(
+            create.program_id,
+            spl_associated_token_account_interface::program::id()
+        );
+        assert_eq!(create.data, vec![1]); // CreateIdempotent
+        assert_eq!(
+            create.accounts[0].pubkey.to_bytes(),
+            MINTER_ADDRESS.to_bytes()
+        );
+        assert!(create.accounts[0].is_signer);
+        assert!(create.accounts[0].is_writable);
+        assert_eq!(
+            create.accounts[1].pubkey,
+            instructions[1].accounts[2].pubkey
+        );
+        assert_eq!(create.accounts[2].pubkey.to_bytes(), destination.to_bytes());
+        assert_eq!(create.accounts[3].pubkey.to_bytes(), token.mint.to_bytes());
+        assert_eq!(
+            create.accounts[5].pubkey.to_bytes(),
+            token_program.id().to_bytes()
+        );
+        assert_eq!(
+            &instructions[1..],
+            build_spl_withdrawal_instructions(&MINTER_ADDRESS, &token, &destination, 100, false)
+        );
+        let message = solana_transaction::Message::new(&instructions, Some(&MINTER_ADDRESS));
+        assert_eq!(message.signer_keys(), vec![&MINTER_ADDRESS]);
+    }
+}
+
+#[test]
+fn should_build_spl_withdrawal_message_with_durable_nonce() {
+    let nonce_account = Address::from([17; 32]);
+    let nonce_value = Hash::new_from_array([18; 32]);
+    let destination = Address::from([42; 32]);
+    for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+        for create_destination_account in [false, true] {
+            let token = spl_token(Address::from([3; 32]), token_program);
+            let instructions = build_spl_withdrawal_instructions(
+                &MINTER_ADDRESS,
+                &token,
+                &destination,
+                100,
+                create_destination_account,
+            );
+            let message = build_spl_withdrawal_message(
+                &MINTER_ADDRESS,
+                &nonce_account,
+                nonce_value,
+                &instructions,
+            )
+            .unwrap();
+
+            assert_eq!(message.account_keys[0], MINTER_ADDRESS);
+            assert_eq!(message.signer_keys(), vec![&MINTER_ADDRESS]);
+            assert_eq!(message.recent_blockhash, nonce_value);
+            assert_eq!(message.instructions.len(), instructions.len() + 1);
+            let advance_nonce = &message.instructions[0];
+            assert_eq!(
+                message.account_keys[advance_nonce.program_id_index as usize],
+                solana_system_interface::program::ID
+            );
+            assert_eq!(advance_nonce.data, vec![4, 0, 0, 0]); // AdvanceNonceAccount
+            assert_eq!(
+                advance_nonce
+                    .accounts
+                    .iter()
+                    .map(|index| message.account_keys[*index as usize])
+                    .collect::<Vec<_>>(),
+                vec![
+                    nonce_account,
+                    solana_sdk_ids::sysvar::recent_blockhashes::ID,
+                    MINTER_ADDRESS,
+                ]
+            );
+            for (compiled, instruction) in message.instructions[1..].iter().zip(instructions) {
+                assert_eq!(
+                    message.account_keys[compiled.program_id_index as usize].to_bytes(),
+                    instruction.program_id.to_bytes()
+                );
+                assert_eq!(compiled.data, instruction.data);
+                assert_eq!(
+                    compiled
+                        .accounts
+                        .iter()
+                        .map(|index| message.account_keys[*index as usize].to_bytes())
+                        .collect::<Vec<_>>(),
+                    instruction
+                        .accounts
+                        .iter()
+                        .map(|account| account.pubkey.to_bytes())
+                        .collect::<Vec<_>>()
+                );
+            }
+            assert!(crate::sol_transfer::transaction_size(&message) <= MAX_TX_SIZE);
+        }
+    }
+}
+
+#[test]
+fn should_reject_oversized_spl_withdrawal_message() {
+    let token = spl_token(Address::from([3; 32]), TokenProgram::Classic);
+    let instructions: Vec<_> = (40..60)
+        .flat_map(|index| {
+            build_spl_withdrawal_instructions(
+                &MINTER_ADDRESS,
+                &token,
+                &Address::from([index; 32]),
+                100,
+                true,
+            )
+        })
+        .collect();
+
+    let result = build_spl_withdrawal_message(
+        &MINTER_ADDRESS,
+        &Address::from([17; 32]),
+        Hash::new_from_array([18; 32]),
+        &instructions,
+    );
+
+    assert_matches!(
+        result,
+        Err(CreateTransferError::TransactionTooLarge { max: MAX_TX_SIZE, got })
+            if got > MAX_TX_SIZE
+    );
+}
+
 #[tokio::test]
 async fn should_batch_spl_sweeps_and_sign_each_owner_once() {
     let (first, classic) = spl_deposit_and_token(TokenProgram::Classic);

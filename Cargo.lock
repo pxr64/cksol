@@ -1069,6 +1069,7 @@ dependencies = [
  "solana-account-decoder-client-types",
  "solana-address 2.3.0",
  "solana-hash 4.2.0",
+ "solana-instruction",
  "solana-message",
  "solana-nonce",
  "solana-program-pack",

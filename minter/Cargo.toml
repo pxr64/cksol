@@ -50,6 +50,7 @@ sol_rpc_types = { workspace = true }
 solana-account-decoder-client-types = { workspace = true }
 solana-address = { workspace = true }
 solana-hash = { workspace = true }
+solana-instruction = { workspace = true }
 solana-message = { workspace = true }
 solana-nonce = { workspace = true }
 solana-program-pack = { workspace = true }
