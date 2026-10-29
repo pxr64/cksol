@@ -1818,6 +1818,7 @@ mod spl_withdrawals {
         },
     };
     use candid::Principal;
+    use cksol_types::{TxFinalizedStatus, WithdrawSplStatus};
     use cksol_types_internal::InitArgs;
     use ic_stable_structures::Storable;
     use sol_rpc_types::Lamport;
@@ -2512,6 +2513,105 @@ mod spl_withdrawals {
             plans,
             vec![WithdrawalPlan::Spl(accepted_request(100, 7, &request))]
         );
+    }
+
+    #[test]
+    fn should_report_the_spl_withdrawal_status_through_the_transaction_stages() {
+        let request = setup_created_spl_withdrawal(TokenProgram::Classic, false);
+        let status = |id: u64| read_state(|state| state.spl_withdrawal_status(id));
+        assert_eq!(status(100), WithdrawSplStatus::Pending);
+        assert_eq!(status(101), WithdrawSplStatus::NotFound);
+        accept(101, 8, &request);
+        assert_eq!(status(101), WithdrawSplStatus::Pending);
+
+        record(submitted_spl_withdrawal(100), 40);
+        assert_eq!(
+            status(100),
+            WithdrawSplStatus::TxSent {
+                transaction_id: minter_signature().into(),
+            }
+        );
+
+        record(
+            EventType::SucceededSplWithdrawalTransaction {
+                signature: minter_signature(),
+                lamports_spent: FEE_PER_SIGNATURE,
+            },
+            50,
+        );
+        assert_eq!(
+            status(100),
+            WithdrawSplStatus::TxFinalized(TxFinalizedStatus::Success {
+                transaction_id: minter_signature().into(),
+            })
+        );
+        assert_eq!(status(101), WithdrawSplStatus::Pending);
+    }
+
+    #[test]
+    fn should_report_a_failed_spl_withdrawal_transaction() {
+        setup_created_spl_withdrawal(TokenProgram::Classic, false);
+        record(submitted_spl_withdrawal(100), 40);
+        record(
+            EventType::FailedTransaction {
+                signature: minter_signature(),
+            },
+            50,
+        );
+        assert_eq!(
+            read_state(|state| state.spl_withdrawal_status(100)),
+            WithdrawSplStatus::TxFinalized(TxFinalizedStatus::Failure {
+                transaction_id: minter_signature().into(),
+            })
+        );
+    }
+
+    #[test]
+    fn should_report_the_fee_reimbursement_stages() {
+        let request = setup();
+        let status = |id: u64| read_state(|state| state.spl_withdrawal_status(id));
+        for id in [100_u64, 101, 102] {
+            reimburse_fee(id, request.fee, request.account);
+            assert_eq!(
+                status(id),
+                WithdrawSplStatus::FeeReimbursementPending {
+                    reimbursed_amount: request.fee,
+                }
+            );
+        }
+        record(
+            EventType::ReimbursedSplWithdrawalFee {
+                cksol_burn_block_index: 100.into(),
+                mint_block_index: 200.into(),
+            },
+            40,
+        );
+        record(
+            EventType::QuarantinedSplWithdrawalFeeReimbursement {
+                cksol_burn_block_index: 101.into(),
+            },
+            41,
+        );
+        assert_eq!(
+            status(100),
+            WithdrawSplStatus::FeeReimbursed {
+                reimbursed_amount: request.fee,
+                mint_block_index: 200,
+            }
+        );
+        assert_eq!(
+            status(101),
+            WithdrawSplStatus::FeeReimbursementQuarantined {
+                reimbursed_amount: request.fee,
+            }
+        );
+        assert_eq!(
+            status(102),
+            WithdrawSplStatus::FeeReimbursementPending {
+                reimbursed_amount: request.fee,
+            }
+        );
+        assert_replay_matches();
     }
 
     #[test]

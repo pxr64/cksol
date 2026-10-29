@@ -18,6 +18,7 @@ use crate::{
 use candid::Principal;
 use cksol_types::{
     AddSplTokenError, DepositSolId, DepositSplId, TxFinalizedStatus, WithdrawSolStatus,
+    WithdrawSplStatus,
 };
 use cksol_types_internal::SolanaNetwork;
 use cksol_types_internal::{Ed25519KeyName, InitArgs, UpgradeArgs};
@@ -826,6 +827,60 @@ impl State {
         &self,
     ) -> &BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest> {
         &self.pending_spl_withdrawal_requests
+    }
+
+    pub fn spl_withdrawal_status(&self, cksol_burn_block_index: u64) -> WithdrawSplStatus {
+        let burn_index = LedgerBurnIndex::from(cksol_burn_block_index);
+        if self
+            .pending_spl_withdrawal_requests
+            .contains_key(&burn_index)
+            || self
+                .created_spl_withdrawal_requests
+                .contains_key(&burn_index)
+        {
+            return WithdrawSplStatus::Pending;
+        }
+        if let Some(sent) = self.sent_spl_withdrawal_requests.get(&burn_index) {
+            return WithdrawSplStatus::TxSent {
+                transaction_id: sent.signature.into(),
+            };
+        }
+        if let Some(sent) = self.successful_spl_withdrawal_requests.get(&burn_index) {
+            return WithdrawSplStatus::TxFinalized(TxFinalizedStatus::Success {
+                transaction_id: sent.signature.into(),
+            });
+        }
+        if let Some(sent) = self.failed_spl_withdrawal_requests.get(&burn_index) {
+            return WithdrawSplStatus::TxFinalized(TxFinalizedStatus::Failure {
+                transaction_id: sent.signature.into(),
+            });
+        }
+        if let Some(pending) = self
+            .pending_spl_withdrawal_fee_reimbursements
+            .get(&burn_index)
+        {
+            return WithdrawSplStatus::FeeReimbursementPending {
+                reimbursed_amount: pending.request.reimbursed_amount,
+            };
+        }
+        if let Some(completed) = self
+            .completed_spl_withdrawal_fee_reimbursements
+            .get(&burn_index)
+        {
+            return WithdrawSplStatus::FeeReimbursed {
+                reimbursed_amount: completed.request.reimbursed_amount,
+                mint_block_index: *completed.mint_block_index.get(),
+            };
+        }
+        if let Some(quarantined) = self
+            .quarantined_spl_withdrawal_fee_reimbursements
+            .get(&burn_index)
+        {
+            return WithdrawSplStatus::FeeReimbursementQuarantined {
+                reimbursed_amount: quarantined.request.reimbursed_amount,
+            };
+        }
+        WithdrawSplStatus::NotFound
     }
 
     pub fn covers_spl_withdrawal(&self, request: &SplWithdrawalRequestTerms) -> bool {

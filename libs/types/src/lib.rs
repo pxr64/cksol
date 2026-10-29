@@ -554,9 +554,7 @@ pub enum WithdrawSolStatus {
     TxFinalized(TxFinalizedStatus),
 }
 
-/// Arguments for an SPL withdrawal request.
-///
-/// This type prepares the withdrawal flow; no `withdraw_spl` endpoint is exposed yet.
+/// Arguments for a request to the `withdraw_spl` endpoint.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
 pub struct WithdrawSplArgs {
     /// The Solana mint identifying the registered SPL token and its ckSPL ledger.
@@ -664,6 +662,46 @@ pub enum WithdrawSplLedgerError {
     },
     /// The ledger call failed or returned another error; the outcome may be unresolved.
     TemporarilyUnavailable(String),
+}
+
+/// Arguments for a request to the `withdraw_spl_status` endpoint.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
+pub struct WithdrawSplStatusArgs {
+    /// The ckSOL fee burn block index returned by the `withdraw_spl` endpoint.
+    pub cksol_burn_block_index: WithdrawSplId,
+}
+
+/// Status of an SPL withdrawal request.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
+pub enum WithdrawSplStatus {
+    /// Withdrawal request is not found.
+    NotFound,
+    /// Withdrawal request is waiting to be processed.
+    Pending,
+    /// Solana transaction was signed and is sent to the network.
+    TxSent {
+        /// The unique identifier (signature) of the Solana transaction.
+        transaction_id: Signature,
+    },
+    /// Solana transaction is finalized.
+    TxFinalized(TxFinalizedStatus),
+    /// The token burn failed after the fee burn; the ckSOL fee refund is queued.
+    FeeReimbursementPending {
+        /// The ckSOL amount to mint back, in lamports.
+        reimbursed_amount: Lamport,
+    },
+    /// The ckSOL fee was minted back.
+    FeeReimbursed {
+        /// The ckSOL amount minted back, in lamports.
+        reimbursed_amount: Lamport,
+        /// The mint block index on the ckSOL ledger.
+        mint_block_index: u64,
+    },
+    /// The ckSOL fee refund cannot be retried safely and requires manual resolution.
+    FeeReimbursementQuarantined {
+        /// The ckSOL amount that was to be minted back, in lamports.
+        reimbursed_amount: Lamport,
+    },
 }
 
 /// Information about the ckSOL minter canister.

@@ -22,7 +22,7 @@ use crate::{
     withdraw::BoundWithdrawal,
 };
 use canlog::log;
-use cksol_types::{Memo, MintMemo, WithdrawSplOk};
+use cksol_types::{Memo, MintMemo, WithdrawSplId, WithdrawSplOk, WithdrawSplStatus};
 pub use cksol_types::{WithdrawSplError, WithdrawSplLedgerError as LedgerError};
 use cksol_types_internal::{SolanaNetwork, log::Priority};
 use icrc_ledger_types::{
@@ -36,6 +36,10 @@ use std::{str::FromStr, time::Duration};
 
 #[cfg(test)]
 mod tests;
+
+pub fn withdrawal_status(cksol_burn_block_index: WithdrawSplId) -> WithdrawSplStatus {
+    read_state(|state| state.spl_withdrawal_status(cksol_burn_block_index))
+}
 
 /// Builds the withdrawal message for the read nonce, re-checks the balance, and records
 /// the binding. The caller holds the `WithdrawalProcessing` guard.
