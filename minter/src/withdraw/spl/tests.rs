@@ -2,8 +2,12 @@ use super::*;
 use crate::{
     constants::LEDGER_DEDUPLICATION_WINDOW,
     guard::{TimerGuard, withdrawal_guard},
+    spl_transfer::{build_spl_withdrawal_instructions, build_spl_withdrawal_message},
     state::{
-        TaskType, TokenProgram, audit::process_event, event::EventType, mutate_state, reset_state,
+        TaskType, TokenProgram,
+        audit::process_event,
+        event::{EventType, Signer},
+        mutate_state, reset_state,
     },
     storage::reset_events,
     test_fixtures::{
@@ -11,6 +15,7 @@ use crate::{
         init_schnorr_master_key, init_state, ledger_canister_id, minter_signature,
         runtime::TestCanisterRuntime, signer::sign_as_minter, spl_token,
     },
+    withdraw::sign_transactions_batch,
 };
 use candid::Nat;
 use ic_canister_runtime::IcError;
@@ -64,8 +69,395 @@ fn withdrawal_terms(token: &SupportedSplToken) -> SplWithdrawalRequestTerms {
     }
 }
 
+mod transaction_creation {
+    use super::*;
+    use crate::{
+        constants::{FEE_PER_SIGNATURE, MAX_CONCURRENT_SIGNATURES, RENT_EXEMPTION_THRESHOLD},
+        state::{MinterTransaction, WithdrawalPlan, event::VersionedMessage},
+        test_fixtures::{
+            MINIMUM_WITHDRAWAL_AMOUNT, durable_nonce, events, init_state_with_args,
+            nonce_account_info, signature, valid_init_args,
+        },
+        withdraw::{
+            create_transactions_batch, process_pending_withdrawals, sign_transactions_batch,
+        },
+    };
+    use cksol_types_internal::InitArgs;
+    use sol_rpc_types::{AccountInfo, MultiRpcResult, RpcError};
+
+    type NonceResult = MultiRpcResult<Option<AccountInfo>>;
+    type SendTransactionResult = MultiRpcResult<sol_rpc_types::Signature>;
+    const FUNDED_BALANCE: u64 = 500_000_000;
+
+    fn setup(nonces: usize, balance: u64, program: TokenProgram) -> SupportedSplToken {
+        let nonce_accounts = (0..nonces)
+            .map(|i| {
+                if i == 0 {
+                    NONCE_ACCOUNT
+                } else {
+                    Address::from([20 + i as u8; 32])
+                }
+                .to_string()
+            })
+            .collect();
+        init_state_with_args(InitArgs {
+            nonce_accounts,
+            ..valid_init_args()
+        });
+        init_schnorr_master_key();
+        if balance > 0 {
+            init_balance_to(balance);
+        }
+        register_token(program)
+    }
+
+    fn queue(token: &SupportedSplToken, id: u64, create_destination_account: bool) {
+        let mut terms = withdrawal_terms(token);
+        terms.create_destination_account = create_destination_account;
+        terms.fee = quote_withdrawal_fee(
+            read_state(|state| state.withdrawal_fee()),
+            token.token_program,
+            create_destination_account,
+        )
+        .unwrap();
+        mutate_state(|state| {
+            process_event(
+                state,
+                EventType::AcceptedSplWithdrawalRequest(SplWithdrawalRequest {
+                    terms,
+                    cksol_burn_block_index: id.into(),
+                    ckspl_burn_block_index: id.into(),
+                }),
+                &TestCanisterRuntime::new().with_time(123),
+            )
+        });
+    }
+
+    fn nonce_response(authority: Address, seed: usize) -> NonceResult {
+        NonceResult::Consistent(Ok(Some(nonce_account_info(authority, seed))))
+    }
+
+    #[tokio::test]
+    async fn should_bind_only_affordable_spl_requests_in_burn_index_order() {
+        for program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            for create_destination_account in [false, true] {
+                reset_state();
+                reset_events();
+                let cost = FEE_PER_SIGNATURE
+                    + if create_destination_account {
+                        program.account_rent_exemption()
+                    } else {
+                        0
+                    };
+                let token = setup(2, RENT_EXEMPTION_THRESHOLD + cost, program);
+                queue(&token, 43, create_destination_account);
+                queue(&token, 42, create_destination_account);
+                let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
+                let runtime = TestCanisterRuntime::new()
+                    .with_time(999)
+                    .add_stub_response(nonce_response(MINTER_ADDRESS, 1));
+
+                assert_eq!(create_transactions_batch(&runtime, MINTER_ADDRESS).await, 1);
+
+                assert_eq!(runtime.sent_update_calls().len(), 1);
+                assert!(runtime.sent_transactions().is_empty());
+                read_state(|state| {
+                    assert_eq!(state.balance(), RENT_EXEMPTION_THRESHOLD);
+                    assert!(
+                        state
+                            .created_spl_withdrawal_requests()
+                            .contains_key(&42.into())
+                    );
+                    assert!(
+                        state
+                            .pending_spl_withdrawal_requests()
+                            .contains_key(&43.into())
+                    );
+                    assert_eq!(state.nonce_pool().num_free_accounts(), 1);
+                    let created = state.created_spl_withdrawal_txs().values().next().unwrap();
+                    assert_eq!(created.nonce_value, durable_nonce(1));
+                });
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn should_bind_concurrent_spl_requests_to_distinct_nonces() {
+        let token = setup(2, FUNDED_BALANCE, TokenProgram::Classic);
+        queue(&token, 42, false);
+        queue(&token, 43, false);
+        let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
+        let runtime = TestCanisterRuntime::new()
+            .with_time(999)
+            .add_stub_response(nonce_response(MINTER_ADDRESS, 1))
+            .add_stub_response(nonce_response(MINTER_ADDRESS, 2));
+
+        assert_eq!(create_transactions_batch(&runtime, MINTER_ADDRESS).await, 2);
+
+        assert_eq!(runtime.sent_update_calls().len(), 2);
+        read_state(|state| {
+            assert_eq!(state.created_spl_withdrawal_txs().len(), 2);
+            assert_eq!(state.created_spl_withdrawal_requests().len(), 2);
+            assert!(state.pending_spl_withdrawal_requests().is_empty());
+            assert_eq!(state.nonce_pool().num_free_accounts(), 0);
+            assert_eq!(state.balance(), FUNDED_BALANCE - 2 * FEE_PER_SIGNATURE);
+        });
+    }
+
+    #[tokio::test]
+    async fn should_skip_nonce_reads_without_funding_or_free_nonces() {
+        for (nonces, balance) in [(1, 0), (0, FUNDED_BALANCE)] {
+            reset_state();
+            reset_events();
+            let token = setup(nonces, balance, TokenProgram::Classic);
+            queue(&token, 42, false);
+            let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
+            let runtime = TestCanisterRuntime::new();
+            let before = EventsAssert::from_recorded();
+
+            assert_eq!(create_transactions_batch(&runtime, MINTER_ADDRESS).await, 0);
+
+            assert!(runtime.sent_update_calls().is_empty());
+            assert_eq!(EventsAssert::from_recorded(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn should_leave_spl_pending_when_the_nonce_read_fails_verification() {
+        for response in [
+            NonceResult::Consistent(Err(RpcError::ValidationError("account unavailable".into()))),
+            nonce_response(Address::from([99; 32]), 1),
+        ] {
+            reset_state();
+            reset_events();
+            let token = setup(1, FUNDED_BALANCE, TokenProgram::Classic);
+            queue(&token, 42, false);
+            let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
+            let before = read_state(Clone::clone);
+            let runtime = TestCanisterRuntime::new().add_stub_response(response);
+
+            assert_eq!(create_transactions_batch(&runtime, MINTER_ADDRESS).await, 0);
+
+            read_state(|state| assert_eq!(state, &before));
+        }
+    }
+
+    #[tokio::test]
+    async fn should_recheck_spl_funding_after_the_nonce_read() {
+        let token = setup(
+            1,
+            RENT_EXEMPTION_THRESHOLD + FEE_PER_SIGNATURE,
+            TokenProgram::Classic,
+        );
+        queue(&token, 42, false);
+        let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
+        let runtime =
+            TestCanisterRuntime::new().add_stub_response(nonce_response(MINTER_ADDRESS, 1));
+        let mut creation = Box::pin(create_transactions_batch(&runtime, MINTER_ADDRESS));
+        assert!(futures::poll!(creation.as_mut()).is_pending());
+        events::submit_spl_sweep(signature(0xA5));
+        let after_sweep = read_state(Clone::clone);
+        let events_after_sweep = EventsAssert::from_recorded();
+
+        assert_eq!(creation.await, 0);
+
+        read_state(|state| assert_eq!(state, &after_sweep));
+        assert_eq!(EventsAssert::from_recorded(), events_after_sweep);
+    }
+
+    #[tokio::test]
+    async fn should_reject_a_previously_used_nonce_for_spl_creation() {
+        let token = setup(1, FUNDED_BALANCE, TokenProgram::Classic);
+        queue(&token, 42, false);
+        let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
+        let runtime = TestCanisterRuntime::new()
+            .with_time(999)
+            .add_stub_response(nonce_response(MINTER_ADDRESS, 1));
+        assert_eq!(create_transactions_batch(&runtime, MINTER_ADDRESS).await, 1);
+        let signing = TestCanisterRuntime::new()
+            .with_time(999)
+            .add_signer(sign_as_minter());
+        assert_eq!(
+            sign_transactions_batch(&signing, MINTER_ADDRESS)
+                .await
+                .len(),
+            1
+        );
+        mutate_state(|state| {
+            process_event(
+                state,
+                EventType::SucceededSplWithdrawalTransaction {
+                    signature: minter_signature(),
+                    lamports_spent: FEE_PER_SIGNATURE,
+                },
+                &runtime,
+            )
+        });
+        queue(&token, 43, false);
+        let before = read_state(Clone::clone);
+        let stale_read =
+            TestCanisterRuntime::new().add_stub_response(nonce_response(MINTER_ADDRESS, 1));
+
+        assert_eq!(
+            create_transactions_batch(&stale_read, MINTER_ADDRESS).await,
+            0
+        );
+
+        read_state(|state| assert_eq!(state, &before));
+    }
+
+    #[tokio::test]
+    async fn should_share_the_unsigned_transaction_limit_with_sol() {
+        let token = setup(
+            MAX_CONCURRENT_SIGNATURES + 2,
+            FUNDED_BALANCE,
+            TokenProgram::Classic,
+        );
+        let nonces =
+            read_state(|state| state.nonce_pool().addresses().copied().collect::<Vec<_>>());
+        for (index, nonce_account) in nonces
+            .iter()
+            .take(MAX_CONCURRENT_SIGNATURES - 1)
+            .enumerate()
+        {
+            let id = 1000 + index as u64;
+            events::accept_withdrawal(account(index), id, MINIMUM_WITHDRAWAL_AMOUNT);
+            mutate_state(|state| {
+                process_event(
+                    state,
+                    EventType::CreatedWithdrawalTransaction {
+                        burn_indices: vec![id.into()],
+                        nonce_account: *nonce_account,
+                        nonce_value: durable_nonce(1),
+                    },
+                    &TestCanisterRuntime::new().with_time(123),
+                )
+            });
+        }
+        for id in [42, 43, 44] {
+            queue(&token, id, false);
+        }
+        let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
+        let runtime = TestCanisterRuntime::new()
+            .with_time(999)
+            .add_stub_response(nonce_response(MINTER_ADDRESS, 1));
+
+        assert_eq!(create_transactions_batch(&runtime, MINTER_ADDRESS).await, 1);
+        assert_eq!(create_transactions_batch(&runtime, MINTER_ADDRESS).await, 0);
+
+        assert_eq!(runtime.sent_update_calls().len(), 1);
+        read_state(|state| {
+            assert_eq!(state.created_spl_withdrawal_txs().len(), 1);
+            assert_eq!(
+                state.created_withdrawal_txs().len(),
+                MAX_CONCURRENT_SIGNATURES - 1
+            );
+            assert_eq!(state.pending_spl_withdrawal_requests().len(), 2);
+        });
+    }
+
+    #[tokio::test]
+    async fn should_create_sign_and_send_an_spl_withdrawal_in_one_round() {
+        let token = setup(1, FUNDED_BALANCE, TokenProgram::Classic);
+        queue(&token, 42, true);
+        let terms = read_state(|state| {
+            state.pending_spl_withdrawal_requests()[&42.into()]
+                .request
+                .terms
+                .clone()
+        });
+        let events_before = EventsAssert::from_recorded();
+        let runtime = TestCanisterRuntime::new()
+            .with_increasing_time()
+            .add_stub_response(nonce_response(MINTER_ADDRESS, 1))
+            .add_stub_response(SendTransactionResult::Consistent(Ok(
+                minter_signature().into()
+            )))
+            .add_signer(sign_as_minter());
+
+        process_pending_withdrawals(runtime.clone()).await;
+
+        let expected_message = build_spl_withdrawal_message(
+            &MINTER_ADDRESS,
+            &NONCE_ACCOUNT,
+            durable_nonce(1),
+            &build_spl_withdrawal_instructions(
+                &MINTER_ADDRESS,
+                &token,
+                &terms.address,
+                terms.amount,
+                true,
+            ),
+        )
+        .unwrap();
+        let events_after = EventsAssert::from_recorded();
+        assert_eq!(events_after.len(), events_before.len() + 2);
+        events_after
+            .expect_contains_event_eq(EventType::CreatedSplWithdrawalTransaction {
+                cksol_burn_block_index: 42.into(),
+                nonce_account: NONCE_ACCOUNT,
+                nonce_value: durable_nonce(1),
+            })
+            .expect_contains_event_eq(EventType::SubmittedTransaction {
+                signature: minter_signature(),
+                message: expected_message.clone().into(),
+                signers: vec![Signer::Minter],
+                purpose: TransactionPurpose::SplWithdrawal {
+                    cksol_burn_block_index: 42.into(),
+                },
+            });
+        assert_eq!(runtime.sent_transactions().len(), 1);
+        read_state(|state| {
+            assert!(matches!(
+                state.submitted_transactions().get(&minter_signature()),
+                Some(MinterTransaction::Withdrawal { message: VersionedMessage::Legacy(message), nonce_account, .. })
+                    if *message == expected_message && *nonce_account == NONCE_ACCOUNT
+            ));
+            assert_eq!(
+                state.sent_spl_withdrawal_requests()[&42.into()].signature,
+                minter_signature()
+            );
+            assert_eq!(state.nonce_pool().num_free_accounts(), 0);
+        });
+    }
+
+    #[tokio::test]
+    async fn should_serve_sol_and_spl_withdrawals_oldest_first_in_one_round() {
+        let token = setup(3, FUNDED_BALANCE, TokenProgram::Classic);
+        queue(&token, 42, false);
+        events::accept_withdrawal_at(account(1), 1, MINIMUM_WITHDRAWAL_AMOUNT, 100);
+        events::accept_withdrawal_at(account(2), 2, MINIMUM_WITHDRAWAL_AMOUNT, 200);
+        // The SPL request at 123 splits the SOL requests at 100 and 200 into two batches.
+        let plans: Vec<_> = read_state(|state| state.withdrawal_plans().collect());
+        assert!(matches!(
+            plans.as_slice(),
+            [
+                WithdrawalPlan::Sol(_),
+                WithdrawalPlan::Spl(_),
+                WithdrawalPlan::Sol(_)
+            ]
+        ));
+        let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
+        let runtime = TestCanisterRuntime::new()
+            .with_time(999)
+            .add_stub_response(nonce_response(MINTER_ADDRESS, 1))
+            .add_stub_response(nonce_response(MINTER_ADDRESS, 2))
+            .add_stub_response(nonce_response(MINTER_ADDRESS, 3));
+
+        assert_eq!(create_transactions_batch(&runtime, MINTER_ADDRESS).await, 3);
+
+        read_state(|state| {
+            assert_eq!(state.created_withdrawal_txs().len(), 2);
+            assert_eq!(state.created_spl_withdrawal_txs().len(), 1);
+            assert!(state.pending_withdrawal_requests().is_empty());
+            assert!(state.pending_spl_withdrawal_requests().is_empty());
+            assert_eq!(state.nonce_pool().num_free_accounts(), 0);
+        });
+    }
+}
+
 #[tokio::test]
-async fn should_retry_signing_the_recorded_spl_message_then_record_submission() {
+async fn should_re_sign_the_identical_spl_message_after_a_signing_failure() {
     for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
         for create_destination_account in [false, true] {
             reset_state();
@@ -113,16 +505,17 @@ async fn should_retry_signing_the_recorded_spl_message_then_record_submission() 
                     .expect([Err(error), Ok(minter_signature())]),
             );
 
-            assert!(matches!(
-                sign_created_transaction(&runtime, &NONCE_ACCOUNT).await,
-                Err(CreateTransferError::SigningFailed(_))
-            ));
+            assert!(
+                sign_transactions_batch(&runtime, MINTER_ADDRESS)
+                    .await
+                    .is_empty()
+            );
             read_state(|state| assert_eq!(state, &bound_state));
             assert_eq!(EventsAssert::from_recorded(), events_before);
 
-            let transaction = sign_created_transaction(&runtime, &NONCE_ACCOUNT)
+            let transaction = sign_transactions_batch(&runtime, MINTER_ADDRESS)
                 .await
-                .unwrap();
+                .remove(0);
             assert_eq!(transaction.message, message);
             assert_eq!(transaction.signatures, vec![minter_signature()]);
             read_state(|state| {

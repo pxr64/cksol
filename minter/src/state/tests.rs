@@ -1792,13 +1792,15 @@ mod withdrawal_transactions {
 
 mod spl_withdrawals {
     use crate::{
-        constants::FEE_PER_SIGNATURE,
+        constants::{FEE_PER_SIGNATURE, RENT_EXEMPTION_THRESHOLD},
         lifecycle,
         numeric::LedgerBurnIndex,
+        sol_transfer::BATCH_WITHDRAWAL_TX_FEE,
         spl_transfer::{build_spl_withdrawal_instructions, build_spl_withdrawal_message},
         state::{
             CompletedSplWithdrawalFeeReimbursement, MinterTransaction,
             PendingSplWithdrawalFeeReimbursement, PendingSplWithdrawalRequest, State, TokenProgram,
+            WithdrawalPlan,
             audit::{process_event, replay_events},
             event::{
                 Event, EventType, Signer, SplWithdrawalFeeReimbursementRequest,
@@ -2342,6 +2344,83 @@ mod spl_withdrawals {
                 assert_eq!(bound_message(&replayed), message);
             }
         }
+    }
+
+    #[test]
+    fn should_plan_withdrawals_of_both_kinds_oldest_first_within_one_budget() {
+        let request = setup_with_nonce();
+        let sol = WithdrawalRequest {
+            account: request.account,
+            solana_address: request.address.to_bytes(),
+            burn_block_index: 200.into(),
+            burned_amount: 20_000,
+            amount_to_transfer: 10_000,
+        };
+        record(EventType::AcceptedWithdrawalRequest(sol.clone()), 15);
+        accept(100, 7, &request);
+        accept(101, 8, &request);
+        let plans: Vec<_> = read_state(|state| state.withdrawal_plans().collect());
+        assert_eq!(
+            plans,
+            vec![
+                WithdrawalPlan::Sol(vec![sol.clone()]),
+                WithdrawalPlan::Spl(accepted_request(100, 7, &request)),
+                WithdrawalPlan::Spl(accepted_request(101, 8, &request)),
+            ]
+        );
+
+        mutate_state(|state| {
+            state.balance = RENT_EXEMPTION_THRESHOLD
+                + sol.amount_to_transfer
+                + BATCH_WITHDRAWAL_TX_FEE
+                + FEE_PER_SIGNATURE
+        });
+        let plans: Vec<_> = read_state(|state| state.withdrawal_plans().collect());
+        assert_eq!(
+            plans,
+            vec![
+                WithdrawalPlan::Sol(vec![sol]),
+                WithdrawalPlan::Spl(accepted_request(100, 7, &request)),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_not_batch_a_sol_request_newer_than_a_waiting_spl_request() {
+        let request = setup_with_nonce();
+        let sol = |burn_block_index: u64| WithdrawalRequest {
+            account: request.account,
+            solana_address: request.address.to_bytes(),
+            burn_block_index: burn_block_index.into(),
+            burned_amount: 20_000,
+            amount_to_transfer: 10_000,
+        };
+        record(EventType::AcceptedWithdrawalRequest(sol(200)), 10);
+        accept(100, 7, &request);
+        record(EventType::AcceptedWithdrawalRequest(sol(201)), 30);
+        let plans: Vec<_> = read_state(|state| state.withdrawal_plans().collect());
+        assert_eq!(
+            plans,
+            vec![
+                WithdrawalPlan::Sol(vec![sol(200)]),
+                WithdrawalPlan::Spl(accepted_request(100, 7, &request)),
+                WithdrawalPlan::Sol(vec![sol(201)]),
+            ]
+        );
+
+        // The budget covers the first SOL request and the SPL request, not the newer SOL one.
+        mutate_state(|state| {
+            state.balance =
+                RENT_EXEMPTION_THRESHOLD + 10_000 + BATCH_WITHDRAWAL_TX_FEE + FEE_PER_SIGNATURE
+        });
+        let plans: Vec<_> = read_state(|state| state.withdrawal_plans().collect());
+        assert_eq!(
+            plans,
+            vec![
+                WithdrawalPlan::Sol(vec![sol(200)]),
+                WithdrawalPlan::Spl(accepted_request(100, 7, &request)),
+            ]
+        );
     }
 
     #[test]

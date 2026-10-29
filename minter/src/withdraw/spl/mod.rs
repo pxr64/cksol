@@ -1,4 +1,3 @@
-pub use crate::spl_transfer::{build_spl_withdrawal_instructions, build_spl_withdrawal_message};
 use crate::{
     address::{associated_token_address, minter_address, minter_public_key},
     constants::CKSOL_LEDGER_TRANSACTION_FEE,
@@ -8,16 +7,19 @@ use crate::{
     numeric::LedgerBurnIndex,
     queue_cursor::QueueCursors,
     runtime::CanisterRuntime,
-    sol_transfer::{CreateTransferError, sign_batch_withdrawal_message},
+    sol_transfer::CreateTransferError,
+    spl_transfer::{build_spl_withdrawal_instructions, build_spl_withdrawal_message},
     state::{
-        PendingSplWithdrawalFeeReimbursement, State, SupportedSplToken, TokenProgram,
+        CreatedSplWithdrawalTransaction, PendingSplWithdrawalFeeReimbursement, State,
+        SupportedSplToken, TokenProgram,
         audit::process_event,
         event::{
-            EventType, Signer, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
+            EventType, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
             SplWithdrawalRequestTerms, TransactionPurpose,
         },
         mutate_state, read_state,
     },
+    withdraw::BoundWithdrawal,
 };
 use canlog::log;
 use cksol_types::{Memo, MintMemo, WithdrawSplOk};
@@ -29,48 +31,79 @@ use icrc_ledger_types::{
 };
 use sol_rpc_types::Lamport;
 use solana_address::Address;
-use solana_transaction::Transaction;
+use solana_hash::Hash;
 use std::{str::FromStr, time::Duration};
 
 #[cfg(test)]
 mod tests;
 
-/// Signs and records the bound SPL withdrawal before it can be sent to Solana.
-/// A failed signing attempt leaves the binding available for an identical retry.
-pub async fn sign_created_transaction<R: CanisterRuntime>(
+/// Builds the withdrawal message for the read nonce, re-checks the balance, and records
+/// the binding. The caller holds the `WithdrawalProcessing` guard.
+pub(super) fn create_transaction<R: CanisterRuntime>(
     runtime: &R,
-    nonce_account: &Address,
-) -> Result<Transaction, CreateTransferError> {
-    let (message, cksol_burn_block_index) = read_state(|state| {
-        let created = state
-            .created_spl_withdrawal_txs()
-            .get(nonce_account)
-            .unwrap_or_else(|| {
-                panic!(
-                    "BUG: no SPL withdrawal transaction was created for nonce account {nonce_account}"
-                )
-            });
-        (
-            state.bound_spl_withdrawal_message(nonce_account, created),
-            created.cksol_burn_block_index,
+    minter_address: &Address,
+    nonce_account: Address,
+    nonce_value: Hash,
+    request: &SplWithdrawalRequest,
+) -> bool {
+    let instructions = read_state(|state| {
+        let token = state
+            .supported_spl_token(&request.terms.mint)
+            .expect("BUG: an accepted SPL withdrawal has a registered mint");
+        build_spl_withdrawal_instructions(
+            minter_address,
+            token,
+            &request.terms.address,
+            request.terms.amount,
+            request.terms.create_destination_account,
         )
     });
-    let transaction = sign_batch_withdrawal_message(runtime, message?).await?;
+    if let Err(error) =
+        build_spl_withdrawal_message(minter_address, &nonce_account, nonce_value, &instructions)
+    {
+        log!(
+            Priority::Error,
+            "Failed to build SPL withdrawal transaction for burn index {}: {error}",
+            request.cksol_burn_block_index,
+        );
+        return false;
+    }
+    // An SPL sweep may have reserved part of the balance during the nonce read.
+    if !read_state(|state| state.covers_spl_withdrawal(&request.terms)) {
+        log!(
+            Priority::Info,
+            "The balance no longer covers SPL withdrawal {}, skipping it this round",
+            request.cksol_burn_block_index,
+        );
+        return false;
+    }
     mutate_state(|state| {
         process_event(
             state,
-            EventType::SubmittedTransaction {
-                signature: transaction.signatures[0],
-                message: transaction.message.clone().into(),
-                signers: vec![Signer::Minter],
-                purpose: TransactionPurpose::SplWithdrawal {
-                    cksol_burn_block_index,
-                },
+            EventType::CreatedSplWithdrawalTransaction {
+                cksol_burn_block_index: request.cksol_burn_block_index,
+                nonce_account,
+                nonce_value,
             },
             runtime,
-        );
+        )
     });
-    Ok(transaction)
+    true
+}
+
+/// Rebuilds the created transaction from state for signing.
+pub(super) fn bound_withdrawal(
+    state: &State,
+    nonce_account: &Address,
+    created: &CreatedSplWithdrawalTransaction,
+) -> Result<BoundWithdrawal, CreateTransferError> {
+    Ok(BoundWithdrawal {
+        nonce_account: *nonce_account,
+        purpose: TransactionPurpose::SplWithdrawal {
+            cksol_burn_block_index: created.cksol_burn_block_index,
+        },
+        message: state.bound_spl_withdrawal_message(nonce_account, created)?,
+    })
 }
 
 fn cksol_ledger() -> CkLedger {
