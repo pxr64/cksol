@@ -739,15 +739,15 @@ impl State {
         self.spendable_balance() >= cost
     }
 
-    pub fn withdrawal_batches(&self) -> WithdrawalBatches<'_> {
-        WithdrawalBatches {
-            pending_requests: self.pending_withdrawal_requests.values().peekable(),
+    pub fn withdrawal_plans(&self) -> WithdrawalPlans<'_> {
+        WithdrawalPlans {
+            pending_sol: self.pending_withdrawal_requests.values().peekable(),
             available_balance: self.spendable_balance(),
         }
     }
 
     pub fn can_create_withdrawal_transaction(&self) -> bool {
-        self.nonce_pool.num_free_accounts() > 0 && self.withdrawal_batches().next().is_some()
+        self.nonce_pool.num_free_accounts() > 0 && self.withdrawal_plans().next().is_some()
     }
 
     pub fn has_unsigned_withdrawal_transaction(&self) -> bool {
@@ -1217,6 +1217,13 @@ pub struct PendingWithdrawalRequest {
     pub created_at: u64,
 }
 
+/// One withdrawal transaction to create. SOL requests travel in batches; other kinds
+/// of withdrawal get their own variant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WithdrawalPlan {
+    Sol(Vec<WithdrawalRequest>),
+}
+
 /// Groups pending withdrawal requests, oldest first, into batches that the
 /// minter balance can pay for, including one transaction fee per batch and
 /// holding back the rent exemption threshold so a withdrawal transaction can
@@ -1224,15 +1231,21 @@ pub struct PendingWithdrawalRequest {
 ///
 /// Iteration stops at the first request the remaining balance cannot cover,
 /// so requests are never reordered or skipped.
-pub struct WithdrawalBatches<'a> {
-    pending_requests: Peekable<btree_map::Values<'a, LedgerBurnIndex, PendingWithdrawalRequest>>,
+pub struct WithdrawalPlans<'a> {
+    pending_sol: Peekable<btree_map::Values<'a, LedgerBurnIndex, PendingWithdrawalRequest>>,
     available_balance: Lamport,
 }
 
-impl Iterator for WithdrawalBatches<'_> {
-    type Item = Vec<WithdrawalRequest>;
+impl Iterator for WithdrawalPlans<'_> {
+    type Item = WithdrawalPlan;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.next_sol_batch()
+    }
+}
+
+impl WithdrawalPlans<'_> {
+    fn next_sol_batch(&mut self) -> Option<WithdrawalPlan> {
         let mut batch = Vec::new();
         while batch.len() < MAX_WITHDRAWALS_PER_NONCE_TX {
             let reserved_fee = if batch.is_empty() {
@@ -1240,7 +1253,7 @@ impl Iterator for WithdrawalBatches<'_> {
             } else {
                 0
             };
-            let Some(pending) = self.pending_requests.peek() else {
+            let Some(pending) = self.pending_sol.peek() else {
                 break;
             };
             let Some(remaining_balance) = pending
@@ -1253,9 +1266,13 @@ impl Iterator for WithdrawalBatches<'_> {
             };
             self.available_balance = remaining_balance;
             batch.push(pending.request.clone());
-            self.pending_requests.next();
+            self.pending_sol.next();
         }
-        if batch.is_empty() { None } else { Some(batch) }
+        if batch.is_empty() {
+            None
+        } else {
+            Some(WithdrawalPlan::Sol(batch))
+        }
     }
 }
 
