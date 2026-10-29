@@ -904,6 +904,9 @@ mod state_from_init_args {
                 pending_spl_withdrawal_requests: BTreeMap::new(),
                 created_spl_withdrawal_requests: BTreeMap::new(),
                 created_spl_withdrawal_txs: BTreeMap::new(),
+                sent_spl_withdrawal_requests: BTreeMap::new(),
+                successful_spl_withdrawal_requests: BTreeMap::new(),
+                failed_spl_withdrawal_requests: BTreeMap::new(),
                 spl_withdrawal_token_burns: BTreeSet::new(),
                 pending_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
                 completed_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
@@ -1783,21 +1786,23 @@ mod spl_withdrawals {
         constants::FEE_PER_SIGNATURE,
         lifecycle,
         numeric::LedgerBurnIndex,
+        spl_transfer::{build_spl_withdrawal_instructions, build_spl_withdrawal_message},
         state::{
-            CompletedSplWithdrawalFeeReimbursement, PendingSplWithdrawalFeeReimbursement,
-            PendingSplWithdrawalRequest, State, TokenProgram,
+            CompletedSplWithdrawalFeeReimbursement, MinterTransaction,
+            PendingSplWithdrawalFeeReimbursement, PendingSplWithdrawalRequest, State, TokenProgram,
             audit::{process_event, replay_events},
             event::{
-                Event, EventType, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
-                SplWithdrawalRequestTerms, WithdrawalRequest,
+                Event, EventType, Signer, SplWithdrawalFeeReimbursementRequest,
+                SplWithdrawalRequest, SplWithdrawalRequestTerms, TransactionPurpose,
+                VersionedMessage, WithdrawalRequest,
             },
-            mutate_state, read_state,
+            mutate_state, read_state, reset_state,
         },
-        storage::with_event_iter,
+        storage::{reset_events, with_event_iter},
         test_fixtures::{
-            NONCE_ACCOUNT, account, init_args_with_nonce_account, init_balance_to,
-            minter_public_key_fetched_event, runtime::TestCanisterRuntime, spl_token,
-            valid_init_args,
+            MINTER_ADDRESS, NONCE_ACCOUNT, account, init_args_with_nonce_account, init_balance_to,
+            minter_public_key_fetched_event, minter_signature, runtime::TestCanisterRuntime,
+            spl_token, valid_init_args,
         },
     };
     use candid::Principal;
@@ -1805,6 +1810,7 @@ mod spl_withdrawals {
     use ic_stable_structures::Storable;
     use sol_rpc_types::Lamport;
     use solana_hash::Hash;
+    use solana_transaction::Message;
     use std::{
         collections::BTreeMap,
         panic::{AssertUnwindSafe, catch_unwind},
@@ -2007,6 +2013,195 @@ mod spl_withdrawals {
         }
     }
 
+    /// The message of the withdrawal bound to the test nonce account.
+    fn bound_message(state: &State) -> Message {
+        let created = &state.created_spl_withdrawal_txs()[&NONCE_ACCOUNT];
+        state
+            .bound_spl_withdrawal_message(&NONCE_ACCOUNT, created)
+            .unwrap()
+    }
+
+    fn submitted_spl_withdrawal(id: u64) -> EventType {
+        EventType::SubmittedTransaction {
+            signature: minter_signature(),
+            message: read_state(bound_message).into(),
+            signers: vec![Signer::Minter],
+            purpose: TransactionPurpose::SplWithdrawal {
+                cksol_burn_block_index: id.into(),
+            },
+        }
+    }
+
+    fn setup_created_spl_withdrawal(
+        token_program: TokenProgram,
+        create_destination_account: bool,
+    ) -> SplWithdrawalRequestTerms {
+        let mut request = setup_with_nonce();
+        let token = spl_token([4; 32].into(), token_program);
+        record(EventType::AddedSplToken(token.clone()), 10);
+        request.mint = token.mint;
+        request.ledger_id = token.ledger_id;
+        request.create_destination_account = create_destination_account;
+        accept(100, 7, &request);
+        record(spl_transaction_created(100), 30);
+        request
+    }
+
+    #[test]
+    fn should_replay_submitted_spl_withdrawal_and_keep_its_nonce_bound() {
+        let request = setup_created_spl_withdrawal(TokenProgram::Classic, false);
+        accept(101, 8, &request);
+        let submitted = submitted_spl_withdrawal(100);
+        record(submitted.clone(), 40);
+        assert!(catch_unwind(AssertUnwindSafe(|| record(submitted, 41))).is_err());
+
+        let replayed = assert_replay_matches();
+        assert!(replayed.created_spl_withdrawal_txs().is_empty());
+        assert!(replayed.created_spl_withdrawal_requests().is_empty());
+        assert!(
+            replayed
+                .pending_spl_withdrawal_requests()
+                .contains_key(&101.into())
+        );
+        let sent = &replayed.sent_spl_withdrawal_requests()[&100.into()];
+        assert_eq!(sent.request, accepted_request(100, 7, &request));
+        assert_eq!(sent.created_at, 20);
+        assert_eq!(sent.signature, minter_signature());
+        assert_eq!(replayed.nonce_pool().num_free_accounts(), 0);
+        assert!(matches!(
+            replayed.submitted_transactions().get(&sent.signature),
+            Some(MinterTransaction::Withdrawal {
+                nonce_account, nonce_value, submitted_at: 40, ..
+            }) if *nonce_account == NONCE_ACCOUNT && *nonce_value == Hash::new_from_array([18; 32])
+        ));
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                EventType::ExpiredTransaction {
+                    signature: sent.signature
+                },
+                50
+            )))
+            .is_err()
+        );
+        assert_replay_matches();
+    }
+
+    #[test]
+    fn should_reject_spl_submission_that_does_not_match_the_binding() {
+        setup_created_spl_withdrawal(TokenProgram::Token2022, true);
+        let original = read_state(Clone::clone);
+        for change in 0..5 {
+            let mut submitted = submitted_spl_withdrawal(100);
+            let EventType::SubmittedTransaction {
+                message: VersionedMessage::Legacy(message),
+                signers,
+                purpose,
+                ..
+            } = &mut submitted
+            else {
+                unreachable!()
+            };
+            match change {
+                0 => {
+                    *purpose = TransactionPurpose::SplWithdrawal {
+                        cksol_burn_block_index: 101.into(),
+                    }
+                }
+                1 => message.recent_blockhash = Hash::new_from_array([19; 32]),
+                2 => message.instructions.last_mut().unwrap().data.push(0),
+                3 => signers.clear(),
+                4 => {
+                    message.instructions.remove(0);
+                }
+                _ => unreachable!(),
+            }
+            assert!(catch_unwind(AssertUnwindSafe(|| record(submitted, 40))).is_err());
+            assert_eq!(assert_replay_matches(), original);
+        }
+    }
+
+    #[test]
+    fn should_move_a_succeeded_spl_withdrawal_to_successful() {
+        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            reset_state();
+            reset_events();
+            let request = setup_created_spl_withdrawal(token_program, true);
+            record(submitted_spl_withdrawal(100), 40);
+            let balance_before = read_state(|state| state.balance());
+
+            let replayed = finalize(EventType::SucceededTransaction {
+                signature: minter_signature(),
+            });
+
+            assert_eq!(
+                replayed.successful_spl_withdrawal_requests()[&100.into()].request,
+                accepted_request(100, 7, &request)
+            );
+            assert!(replayed.failed_spl_withdrawal_requests().is_empty());
+            assert_eq!(replayed.balance(), balance_before);
+        }
+    }
+
+    #[test]
+    fn should_return_the_unspent_rent_of_a_failed_spl_withdrawal() {
+        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            for create_destination_account in [false, true] {
+                reset_state();
+                reset_events();
+                let request =
+                    setup_created_spl_withdrawal(token_program, create_destination_account);
+                record(submitted_spl_withdrawal(100), 40);
+
+                let replayed = finalize(EventType::FailedTransaction {
+                    signature: minter_signature(),
+                });
+
+                assert_eq!(
+                    replayed.failed_spl_withdrawal_requests()[&100.into()].request,
+                    accepted_request(100, 7, &request)
+                );
+                assert!(replayed.successful_spl_withdrawal_requests().is_empty());
+                assert_eq!(replayed.balance(), FUNDED_BALANCE - FEE_PER_SIGNATURE);
+            }
+        }
+    }
+
+    #[test]
+    fn should_not_reuse_the_index_of_a_finalized_spl_withdrawal() {
+        let request = setup_created_spl_withdrawal(TokenProgram::Classic, false);
+        record(submitted_spl_withdrawal(100), 40);
+        finalize(EventType::SucceededTransaction {
+            signature: minter_signature(),
+        });
+        assert!(catch_unwind(AssertUnwindSafe(|| accept(100, 8, &request))).is_err());
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| reimburse_fee(
+                100,
+                request.fee,
+                request.account
+            )))
+            .is_err()
+        );
+        assert_replay_matches();
+    }
+
+    /// Records the terminal event once, rejects a repeat, and checks the shared outcome:
+    /// the request left the sent map and the nonce account is free again.
+    fn finalize(terminal: EventType) -> State {
+        record(terminal.clone(), 50);
+        assert!(catch_unwind(AssertUnwindSafe(|| record(terminal, 51))).is_err());
+        let replayed = assert_replay_matches();
+        assert!(replayed.sent_spl_withdrawal_requests().is_empty());
+        assert!(
+            replayed
+                .submitted_transactions()
+                .get(&minter_signature())
+                .is_none()
+        );
+        assert_eq!(replayed.nonce_pool().num_free_accounts(), 1);
+        replayed
+    }
+
     const FUNDED_BALANCE: Lamport = 500_000_000;
 
     /// Inits with a nonce account and funds the balance through a swept deposit.
@@ -2046,6 +2241,45 @@ mod spl_withdrawals {
                 .nonce_pool()
                 .has_seen(&nonce_account, &created.nonce_value)
         );
+    }
+
+    #[test]
+    fn should_rebuild_the_bound_spl_withdrawal_message_after_replay() {
+        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            for create_destination_account in [false, true] {
+                reset_state();
+                reset_events();
+                let mut request = setup_with_nonce();
+                let mut token = spl_token([4; 32].into(), token_program);
+                token.decimals = 9;
+                record(EventType::AddedSplToken(token.clone()), 10);
+                request.mint = token.mint;
+                request.ledger_id = token.ledger_id;
+                request.amount = 123_456_789;
+                request.create_destination_account = create_destination_account;
+                accept(100, 7, &request);
+                record(spl_transaction_created(100), 30);
+                let instructions = build_spl_withdrawal_instructions(
+                    &MINTER_ADDRESS,
+                    &token,
+                    &request.address,
+                    request.amount,
+                    create_destination_account,
+                );
+                let expected = build_spl_withdrawal_message(
+                    &MINTER_ADDRESS,
+                    &NONCE_ACCOUNT,
+                    Hash::new_from_array([18; 32]),
+                    &instructions,
+                )
+                .unwrap();
+                let message = read_state(bound_message);
+                assert_eq!(message, expected);
+
+                let replayed = assert_replay_matches();
+                assert_eq!(bound_message(&replayed), message);
+            }
+        }
     }
 
     #[test]

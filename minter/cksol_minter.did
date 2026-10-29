@@ -640,6 +640,10 @@ type TransactionPurpose = variant {
         // The block height of the block whose blockhash the transaction uses.
         block_height: nat64;
     };
+    // Withdraw SPL tokens using the durable nonce bound to the accepted request.
+    SplWithdrawal : record {
+        cksol_burn_block_index: LedgerBurnIndex;
+    };
 };
 
 // Withdrawal terms retained after the ckSOL fee burn.

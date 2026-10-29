@@ -510,6 +510,12 @@ pub enum TransactionPurpose {
         #[n(1)]
         block_height: BlockHeight,
     },
+    /// Withdraw SPL tokens using the durable nonce bound to the accepted request.
+    #[n(7)]
+    SplWithdrawal {
+        #[cbor(n(0), with = "cbor::id")]
+        cksol_burn_block_index: LedgerBurnIndex,
+    },
 }
 
 impl Storable for Event {

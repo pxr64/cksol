@@ -7,16 +7,20 @@ use crate::{
     },
     storage::reset_events,
     test_fixtures::{
-        EventsAssert, MINTER_ADDRESS, NONCE_ACCOUNT, account, init_schnorr_master_key, init_state,
-        ledger_canister_id, runtime::TestCanisterRuntime, spl_token,
+        EventsAssert, MINTER_ADDRESS, NONCE_ACCOUNT, account, init_balance_to,
+        init_schnorr_master_key, init_state, ledger_canister_id, minter_signature,
+        runtime::TestCanisterRuntime, signer::sign_as_minter, spl_token,
     },
 };
 use candid::Nat;
 use ic_canister_runtime::IcError;
+use ic_cdk::call::CallRejected;
+use ic_cdk_management_canister::SignCallError;
 use icrc_ledger_types::{
     icrc1::{account::Account, transfer::TransferError},
     icrc2::transfer_from::{TransferFromArgs, TransferFromError},
 };
+use solana_hash::Hash;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 fn register_token(token_program: TokenProgram) -> SupportedSplToken {
@@ -57,6 +61,101 @@ fn withdrawal_terms(token: &SupportedSplToken) -> SplWithdrawalRequestTerms {
         )
         .unwrap(),
         create_destination_account: true,
+    }
+}
+
+#[tokio::test]
+async fn should_retry_signing_the_recorded_spl_message_then_record_submission() {
+    for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+        for create_destination_account in [false, true] {
+            reset_state();
+            reset_events();
+            init_state();
+            init_balance_to(500_000_000);
+            let token = register_token(token_program);
+            let mut terms = withdrawal_terms(&token);
+            terms.create_destination_account = create_destination_account;
+            let runtime = TestCanisterRuntime::new().with_time(123);
+            mutate_state(|state| {
+                process_event(
+                    state,
+                    EventType::AcceptedSplWithdrawalRequest(SplWithdrawalRequest {
+                        terms,
+                        cksol_burn_block_index: 42.into(),
+                        ckspl_burn_block_index: 7.into(),
+                    }),
+                    &runtime,
+                );
+                process_event(
+                    state,
+                    EventType::CreatedSplWithdrawalTransaction {
+                        cksol_burn_block_index: 42.into(),
+                        nonce_account: NONCE_ACCOUNT,
+                        nonce_value: Hash::new_from_array([18; 32]),
+                    },
+                    &runtime,
+                );
+            });
+            let bound_state = read_state(Clone::clone);
+            let message = bound_state
+                .bound_spl_withdrawal_message(
+                    &NONCE_ACCOUNT,
+                    &bound_state.created_spl_withdrawal_txs()[&NONCE_ACCOUNT],
+                )
+                .unwrap();
+            let events_before = EventsAssert::from_recorded();
+            let error = SignCallError::CallFailed(
+                CallRejected::with_rejection(4, "signing service unavailable".to_string()).into(),
+            );
+            let runtime = TestCanisterRuntime::new().with_time(321).add_signer(
+                sign_as_minter()
+                    .of_message(message.serialize())
+                    .expect([Err(error), Ok(minter_signature())]),
+            );
+
+            assert!(matches!(
+                sign_created_transaction(&runtime, &NONCE_ACCOUNT).await,
+                Err(CreateTransferError::SigningFailed(_))
+            ));
+            read_state(|state| assert_eq!(state, &bound_state));
+            assert_eq!(EventsAssert::from_recorded(), events_before);
+
+            let transaction = sign_created_transaction(&runtime, &NONCE_ACCOUNT)
+                .await
+                .unwrap();
+            assert_eq!(transaction.message, message);
+            assert_eq!(transaction.signatures, vec![minter_signature()]);
+            read_state(|state| {
+                assert!(state.created_spl_withdrawal_txs().is_empty());
+                assert!(state.created_spl_withdrawal_requests().is_empty());
+                assert_eq!(
+                    state.sent_spl_withdrawal_requests()[&42.into()].signature,
+                    minter_signature()
+                );
+                assert_eq!(state.nonce_pool().num_free_accounts(), 0);
+                assert_eq!(state.balance(), bound_state.balance());
+                assert!(
+                    state
+                        .submitted_transactions()
+                        .get(&minter_signature())
+                        .is_some()
+                );
+            });
+            assert_eq!(
+                EventsAssert::from_recorded().expect_contains_event_eq(
+                    EventType::SubmittedTransaction {
+                        signature: minter_signature(),
+                        message: message.into(),
+                        signers: vec![Signer::Minter],
+                        purpose: TransactionPurpose::SplWithdrawal {
+                            cksol_burn_block_index: 42.into()
+                        },
+                    }
+                ),
+                events_before
+            );
+            assert!(runtime.sent_transactions().is_empty());
+        }
     }
 }
 

@@ -1821,6 +1821,11 @@ pub mod arb {
                 }),
             prop::collection::vec(arb_ledger_burn_index(), 1..10)
                 .prop_map(|burn_indices| TransactionPurpose::Withdrawal { burn_indices }),
+            arb_ledger_burn_index().prop_map(|cksol_burn_block_index| {
+                TransactionPurpose::SplWithdrawal {
+                    cksol_burn_block_index,
+                }
+            }),
             (
                 prop::collection::vec(any::<u64>(), 1..10),
                 arb_block_height()

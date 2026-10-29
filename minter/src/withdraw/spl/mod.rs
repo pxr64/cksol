@@ -8,12 +8,13 @@ use crate::{
     numeric::LedgerBurnIndex,
     queue_cursor::QueueCursors,
     runtime::CanisterRuntime,
+    sol_transfer::{CreateTransferError, sign_batch_withdrawal_message},
     state::{
         PendingSplWithdrawalFeeReimbursement, State, SupportedSplToken, TokenProgram,
         audit::process_event,
         event::{
-            EventType, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
-            SplWithdrawalRequestTerms,
+            EventType, Signer, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
+            SplWithdrawalRequestTerms, TransactionPurpose,
         },
         mutate_state, read_state,
     },
@@ -28,10 +29,49 @@ use icrc_ledger_types::{
 };
 use sol_rpc_types::Lamport;
 use solana_address::Address;
+use solana_transaction::Transaction;
 use std::{str::FromStr, time::Duration};
 
 #[cfg(test)]
 mod tests;
+
+/// Signs and records the bound SPL withdrawal before it can be sent to Solana.
+/// A failed signing attempt leaves the binding available for an identical retry.
+pub async fn sign_created_transaction<R: CanisterRuntime>(
+    runtime: &R,
+    nonce_account: &Address,
+) -> Result<Transaction, CreateTransferError> {
+    let (message, cksol_burn_block_index) = read_state(|state| {
+        let created = state
+            .created_spl_withdrawal_txs()
+            .get(nonce_account)
+            .unwrap_or_else(|| {
+                panic!(
+                    "BUG: no SPL withdrawal transaction was created for nonce account {nonce_account}"
+                )
+            });
+        (
+            state.bound_spl_withdrawal_message(nonce_account, created),
+            created.cksol_burn_block_index,
+        )
+    });
+    let transaction = sign_batch_withdrawal_message(runtime, message?).await?;
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::SubmittedTransaction {
+                signature: transaction.signatures[0],
+                message: transaction.message.clone().into(),
+                signers: vec![Signer::Minter],
+                purpose: TransactionPurpose::SplWithdrawal {
+                    cksol_burn_block_index,
+                },
+            },
+            runtime,
+        );
+    });
+    Ok(transaction)
+}
 
 fn cksol_ledger() -> CkLedger {
     read_state(|state| CkLedger {

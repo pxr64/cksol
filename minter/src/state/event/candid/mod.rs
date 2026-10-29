@@ -265,6 +265,11 @@ impl From<TransactionPurpose> for CandidTransactionPurpose {
                     burn_indices: burn_indices.iter().map(|idx| *idx.get()).collect(),
                 }
             }
+            TransactionPurpose::SplWithdrawal {
+                cksol_burn_block_index,
+            } => CandidTransactionPurpose::SplWithdrawal {
+                cksol_burn_block_index: *cksol_burn_block_index.get(),
+            },
             TransactionPurpose::SweepSplDeposits {
                 deposit_ids,
                 block_height,
@@ -591,6 +596,11 @@ impl From<CandidTransactionPurpose> for TransactionPurpose {
                     burn_indices: burn_indices.into_iter().map(LedgerBurnIndex::new).collect(),
                 }
             }
+            CandidTransactionPurpose::SplWithdrawal {
+                cksol_burn_block_index,
+            } => TransactionPurpose::SplWithdrawal {
+                cksol_burn_block_index: cksol_burn_block_index.into(),
+            },
             CandidTransactionPurpose::SweepSplDeposits {
                 deposit_ids,
                 block_height,

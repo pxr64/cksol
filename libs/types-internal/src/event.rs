@@ -344,6 +344,11 @@ pub enum TransactionPurpose {
         /// The block height of the block whose blockhash the transaction uses.
         block_height: u64,
     },
+    /// Withdraw SPL tokens using the durable nonce bound to the accepted request.
+    SplWithdrawal {
+        /// The ckSOL fee burn index identifying the withdrawal.
+        cksol_burn_block_index: u64,
+    },
 }
 
 /// A versioned Solana transaction message.
