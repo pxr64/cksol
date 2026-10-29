@@ -117,7 +117,7 @@ pub fn build_nonce_message(
     Ok(message)
 }
 
-/// Signs the given withdrawal message with the minter's master key.
+/// Signs a SOL or SPL withdrawal message with the minter's master key.
 pub async fn sign_batch_withdrawal_message<R: CanisterRuntime>(
     runtime: &R,
     message: Message,

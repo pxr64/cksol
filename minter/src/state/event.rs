@@ -339,6 +339,16 @@ pub enum EventType {
         #[cbor(n(0), with = "cbor::id")]
         cksol_burn_block_index: LedgerBurnIndex,
     },
+    /// An accepted SPL withdrawal was bound to a durable nonce before signing.
+    #[n(29)]
+    CreatedSplWithdrawalTransaction {
+        #[cbor(n(0), with = "cbor::id")]
+        cksol_burn_block_index: LedgerBurnIndex,
+        #[cbor(n(1), with = "cbor::address")]
+        nonce_account: Address,
+        #[cbor(n(2), with = "cbor::hash")]
+        nonce_value: Hash,
+    },
 }
 
 /// A ckSOL fee reimbursement for an SPL withdrawal whose token burn failed.

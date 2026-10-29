@@ -153,6 +153,8 @@ pub struct State {
     spl_sweep_reservations: BTreeMap<Signature, Lamport>,
     operating_balance: Lamport,
     pending_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest>,
+    created_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest>,
+    created_spl_withdrawal_txs: BTreeMap<Address, CreatedSplWithdrawalTransaction>,
     spl_withdrawal_token_burns: BTreeSet<(Principal, LedgerBurnIndex)>,
     pending_spl_withdrawal_fee_reimbursements:
         BTreeMap<LedgerBurnIndex, PendingSplWithdrawalFeeReimbursement>,
@@ -792,6 +794,18 @@ impl State {
         &self.pending_spl_withdrawal_requests
     }
 
+    pub fn created_spl_withdrawal_requests(
+        &self,
+    ) -> &BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest> {
+        &self.created_spl_withdrawal_requests
+    }
+
+    pub fn created_spl_withdrawal_txs(
+        &self,
+    ) -> &BTreeMap<Address, CreatedSplWithdrawalTransaction> {
+        &self.created_spl_withdrawal_txs
+    }
+
     pub fn pending_spl_withdrawal_fee_reimbursements(
         &self,
     ) -> &BTreeMap<LedgerBurnIndex, PendingSplWithdrawalFeeReimbursement> {
@@ -869,6 +883,9 @@ impl State {
     fn has_spl_withdrawal_outcome(&self, burn_index: &LedgerBurnIndex) -> bool {
         self.pending_spl_withdrawal_requests
             .contains_key(burn_index)
+            || self
+                .created_spl_withdrawal_requests
+                .contains_key(burn_index)
             || self
                 .pending_spl_withdrawal_fee_reimbursements
                 .contains_key(burn_index)
@@ -1015,6 +1032,54 @@ impl State {
                 .insert(*signature, submitted_transaction),
             None,
             "Attempted to submit transaction with signature {signature:?} twice"
+        );
+    }
+
+    /// The lamports the transaction spends: its signature fee, plus the destination
+    /// account rent when the request allows creating it.
+    fn spl_withdrawal_cost(&self, terms: &SplWithdrawalRequestTerms) -> Lamport {
+        let rent = if terms.create_destination_account {
+            self.supported_spl_token(&terms.mint)
+                .expect("BUG: an accepted SPL withdrawal has a registered mint")
+                .token_program
+                .account_rent_exemption()
+        } else {
+            0
+        };
+        FEE_PER_SIGNATURE + rent
+    }
+
+    fn process_spl_transaction_created(
+        &mut self,
+        cksol_burn_block_index: LedgerBurnIndex,
+        nonce_account: &Address,
+        nonce_value: Hash,
+    ) {
+        let withdrawal = self
+            .pending_spl_withdrawal_requests
+            .remove(&cksol_burn_block_index)
+            .expect("Attempted to create a transaction for an SPL withdrawal that is not pending");
+        self.balance = self
+            .balance
+            .checked_sub(self.spl_withdrawal_cost(&withdrawal.request.terms))
+            .expect("BUG: insufficient minter balance for SPL withdrawal");
+        self.nonce_pool.bind(nonce_account, nonce_value);
+        assert_eq!(
+            self.created_spl_withdrawal_requests
+                .insert(cksol_burn_block_index, withdrawal),
+            None,
+            "Attempted to create a transaction for an already created SPL withdrawal: {cksol_burn_block_index}"
+        );
+        assert_eq!(
+            self.created_spl_withdrawal_txs.insert(
+                *nonce_account,
+                CreatedSplWithdrawalTransaction {
+                    nonce_value,
+                    cksol_burn_block_index,
+                },
+            ),
+            None,
+            "BUG: nonce account {nonce_account} already has a created SPL transaction"
         );
     }
 
@@ -1361,6 +1426,8 @@ impl TryFrom<InitArgs> for State {
             spl_sweep_reservations: BTreeMap::new(),
             operating_balance: 0,
             pending_spl_withdrawal_requests: BTreeMap::new(),
+            created_spl_withdrawal_requests: BTreeMap::new(),
+            created_spl_withdrawal_txs: BTreeMap::new(),
             spl_withdrawal_token_burns: BTreeSet::new(),
             pending_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
             completed_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
@@ -1369,6 +1436,13 @@ impl TryFrom<InitArgs> for State {
         state.validate()?;
         Ok(state)
     }
+}
+
+/// An SPL withdrawal bound to a durable nonce, waiting to be signed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedSplWithdrawalTransaction {
+    pub nonce_value: Hash,
+    pub cksol_burn_block_index: LedgerBurnIndex,
 }
 
 /// An accepted SPL withdrawal with both burns recorded, waiting for processing.

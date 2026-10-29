@@ -902,6 +902,8 @@ mod state_from_init_args {
                 spl_sweep_reservations: BTreeMap::new(),
                 operating_balance: 0,
                 pending_spl_withdrawal_requests: BTreeMap::new(),
+                created_spl_withdrawal_requests: BTreeMap::new(),
+                created_spl_withdrawal_txs: BTreeMap::new(),
                 spl_withdrawal_token_burns: BTreeSet::new(),
                 pending_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
                 completed_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
@@ -1778,6 +1780,7 @@ mod withdrawal_transactions {
 
 mod spl_withdrawals {
     use crate::{
+        constants::FEE_PER_SIGNATURE,
         lifecycle,
         numeric::LedgerBurnIndex,
         state::{
@@ -1786,15 +1789,22 @@ mod spl_withdrawals {
             audit::{process_event, replay_events},
             event::{
                 Event, EventType, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
-                SplWithdrawalRequestTerms,
+                SplWithdrawalRequestTerms, WithdrawalRequest,
             },
             mutate_state, read_state,
         },
         storage::with_event_iter,
-        test_fixtures::{account, runtime::TestCanisterRuntime, spl_token, valid_init_args},
+        test_fixtures::{
+            NONCE_ACCOUNT, account, init_args_with_nonce_account, init_balance_to,
+            minter_public_key_fetched_event, runtime::TestCanisterRuntime, spl_token,
+            valid_init_args,
+        },
     };
     use candid::Principal;
+    use cksol_types_internal::InitArgs;
     use ic_stable_structures::Storable;
+    use sol_rpc_types::Lamport;
+    use solana_hash::Hash;
     use std::{
         collections::BTreeMap,
         panic::{AssertUnwindSafe, catch_unwind},
@@ -1825,7 +1835,11 @@ mod spl_withdrawals {
     }
 
     fn setup() -> SplWithdrawalRequestTerms {
-        lifecycle::init(valid_init_args(), TestCanisterRuntime::new().with_time(1));
+        setup_with(valid_init_args())
+    }
+
+    fn setup_with(init_args: InitArgs) -> SplWithdrawalRequestTerms {
+        lifecycle::init(init_args, TestCanisterRuntime::new().with_time(1));
         let request = request(2);
         record(
             EventType::AddedSplToken(spl_token(request.mint, TokenProgram::Classic)),
@@ -1983,6 +1997,182 @@ mod spl_withdrawals {
             cksol_burn_block_index: id.into(),
             ckspl_burn_block_index: token_burn.into(),
         }
+    }
+
+    fn spl_transaction_created(id: u64) -> EventType {
+        EventType::CreatedSplWithdrawalTransaction {
+            cksol_burn_block_index: id.into(),
+            nonce_account: NONCE_ACCOUNT,
+            nonce_value: Hash::new_from_array([18; 32]),
+        }
+    }
+
+    const FUNDED_BALANCE: Lamport = 500_000_000;
+
+    /// Inits with a nonce account and funds the balance through a swept deposit.
+    fn setup_with_nonce() -> SplWithdrawalRequestTerms {
+        let request = setup_with(init_args_with_nonce_account());
+        record(minter_public_key_fetched_event(), 3);
+        init_balance_to(FUNDED_BALANCE);
+        request
+    }
+
+    #[test]
+    fn should_replay_spl_withdrawal_bound_to_nonce() {
+        let request = setup_with_nonce();
+        accept(100, 7, &request);
+        accept(101, 8, &request);
+        record(spl_transaction_created(100), 30);
+
+        let replayed = assert_replay_matches();
+        let nonce_account = NONCE_ACCOUNT;
+        assert_eq!(replayed.pending_spl_withdrawal_requests().len(), 1);
+        assert!(
+            replayed
+                .pending_spl_withdrawal_requests()
+                .contains_key(&101.into())
+        );
+        let created = &replayed.created_spl_withdrawal_txs()[&nonce_account];
+        assert_eq!(created.cksol_burn_block_index, 100.into());
+        assert_eq!(replayed.created_spl_withdrawal_requests().len(), 1);
+        let withdrawal =
+            &replayed.created_spl_withdrawal_requests()[&created.cksol_burn_block_index];
+        assert_eq!(withdrawal.request, accepted_request(100, 7, &request));
+        assert_eq!(withdrawal.created_at, 20);
+        assert_eq!(created.nonce_value, Hash::new_from_array([18; 32]));
+        assert_eq!(replayed.nonce_pool().num_free_accounts(), 0);
+        assert!(
+            replayed
+                .nonce_pool()
+                .has_seen(&nonce_account, &created.nonce_value)
+        );
+    }
+
+    #[test]
+    fn should_reserve_the_signature_fee_from_the_balance() {
+        assert_reserves(false, FEE_PER_SIGNATURE);
+    }
+
+    #[test]
+    fn should_reserve_the_destination_rent_with_the_signature_fee() {
+        assert_reserves(
+            true,
+            FEE_PER_SIGNATURE + TokenProgram::Classic.account_rent_exemption(),
+        );
+    }
+
+    fn assert_reserves(create_destination_account: bool, cost: Lamport) {
+        let mut request = setup_with_nonce();
+        request.create_destination_account = create_destination_account;
+        accept(100, 7, &request);
+        let balance_before = read_state(|state| state.balance());
+        record(spl_transaction_created(100), 30);
+        assert_eq!(assert_replay_matches().balance(), balance_before - cost);
+    }
+
+    #[test]
+    fn should_reject_spl_binding_the_balance_cannot_pay() {
+        let request = setup_with(init_args_with_nonce_account());
+        accept(100, 7, &request);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                spl_transaction_created(100),
+                30
+            )))
+            .is_err()
+        );
+        let replayed = assert_replay_matches();
+        assert_eq!(replayed.balance(), 0);
+        assert!(replayed.created_spl_withdrawal_txs().is_empty());
+        assert_eq!(replayed.nonce_pool().num_free_accounts(), 1);
+    }
+
+    #[test]
+    fn should_not_rebind_or_refund_a_created_spl_withdrawal() {
+        let request = setup_with_nonce();
+        accept(100, 7, &request);
+        record(spl_transaction_created(100), 30);
+        for event in [
+            spl_transaction_created(100),
+            EventType::AcceptedSplWithdrawalRequest(accepted_request(100, 8, &request)),
+            EventType::FailedSplWithdrawalRequest(SplWithdrawalFeeReimbursementRequest {
+                cksol_burn_block_index: 100.into(),
+                reimbursed_amount: request.fee,
+                to: request.account,
+            }),
+        ] {
+            assert!(catch_unwind(AssertUnwindSafe(|| record(event, 40))).is_err());
+            assert_eq!(
+                assert_replay_matches().created_spl_withdrawal_txs().len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_spl_binding_without_pending_request_or_available_nonce() {
+        let request = setup_with_nonce();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                spl_transaction_created(100),
+                30
+            )))
+            .is_err()
+        );
+        assert_eq!(assert_replay_matches().nonce_pool().num_free_accounts(), 1);
+        accept(100, 7, &request);
+        accept(101, 8, &request);
+        record(spl_transaction_created(100), 30);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                spl_transaction_created(101),
+                40
+            )))
+            .is_err()
+        );
+        let replayed = assert_replay_matches();
+        assert!(
+            replayed
+                .pending_spl_withdrawal_requests()
+                .contains_key(&101.into())
+        );
+        assert_eq!(replayed.created_spl_withdrawal_txs().len(), 1);
+    }
+
+    #[test]
+    fn should_not_bind_a_sol_transaction_to_an_spl_nonce() {
+        let request = setup_with_nonce();
+        accept(100, 7, &request);
+        record(spl_transaction_created(100), 30);
+        record(
+            EventType::AcceptedWithdrawalRequest(WithdrawalRequest {
+                account: request.account,
+                solana_address: request.address.to_bytes(),
+                burn_block_index: 200.into(),
+                burned_amount: 20_000,
+                amount_to_transfer: 10_000,
+            }),
+            31,
+        );
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                EventType::CreatedWithdrawalTransaction {
+                    burn_indices: vec![200.into()],
+                    nonce_account: NONCE_ACCOUNT,
+                    nonce_value: Hash::new_from_array([19; 32]),
+                },
+                40,
+            )))
+            .is_err()
+        );
+        let replayed = assert_replay_matches();
+        assert!(
+            replayed
+                .pending_withdrawal_requests()
+                .contains_key(&200.into())
+        );
+        assert_eq!(replayed.created_spl_withdrawal_txs().len(), 1);
+        assert!(replayed.created_withdrawal_txs().is_empty());
     }
 
     fn accept(id: u64, token_burn: u64, terms: &SplWithdrawalRequestTerms) {

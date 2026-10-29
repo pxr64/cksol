@@ -1980,6 +1980,15 @@ pub mod arb {
                     )
                 },
             ),
+            (arb_ledger_burn_index(), arb_address(), arb_hash()).prop_map(
+                |(cksol_burn_block_index, nonce_account, nonce_value)| {
+                    EventType::CreatedSplWithdrawalTransaction {
+                        cksol_burn_block_index,
+                        nonce_account,
+                        nonce_value,
+                    }
+                },
+            ),
             (arb_ledger_burn_index(), arb_ledger_mint_index()).prop_map(
                 |(cksol_burn_block_index, mint_block_index)| {
                     EventType::ReimbursedSplWithdrawalFee {

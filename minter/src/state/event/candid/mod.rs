@@ -204,6 +204,15 @@ impl From<EventType> for CandidEventType {
             } => CandidEventType::QuarantinedSplWithdrawalFeeReimbursement {
                 cksol_burn_block_index: *cksol_burn_block_index.get(),
             },
+            EventType::CreatedSplWithdrawalTransaction {
+                cksol_burn_block_index,
+                nonce_account,
+                nonce_value,
+            } => CandidEventType::CreatedSplWithdrawalTransaction {
+                cksol_burn_block_index: *cksol_burn_block_index.get(),
+                nonce_account: nonce_account.into(),
+                nonce_value: nonce_value.into(),
+            },
             EventType::ReimbursedSplWithdrawalFee {
                 cksol_burn_block_index,
                 mint_block_index,
@@ -488,6 +497,15 @@ impl TryFrom<CandidEventType> for EventType {
                 cksol_burn_block_index,
             } => EventType::QuarantinedSplWithdrawalFeeReimbursement {
                 cksol_burn_block_index: LedgerBurnIndex::new(cksol_burn_block_index),
+            },
+            CandidEventType::CreatedSplWithdrawalTransaction {
+                cksol_burn_block_index,
+                nonce_account,
+                nonce_value,
+            } => EventType::CreatedSplWithdrawalTransaction {
+                cksol_burn_block_index: cksol_burn_block_index.into(),
+                nonce_account: nonce_account.into(),
+                nonce_value: nonce_value.into(),
             },
             CandidEventType::ReimbursedSplWithdrawalFee {
                 cksol_burn_block_index,

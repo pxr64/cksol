@@ -272,6 +272,15 @@ pub enum EventType {
         /// The fee burn index on the ckSOL ledger, also the withdrawal ID.
         cksol_burn_block_index: u64,
     },
+    /// An accepted SPL withdrawal was bound to a durable nonce before signing.
+    CreatedSplWithdrawalTransaction {
+        /// The ckSOL fee burn index identifying the accepted withdrawal.
+        cksol_burn_block_index: u64,
+        /// The durable nonce account bound to this transaction.
+        nonce_account: Address,
+        /// The nonce value the transaction will carry.
+        nonce_value: Hash,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.
