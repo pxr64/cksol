@@ -918,6 +918,7 @@ mod state_from_init_args {
                 pending_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
                 completed_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
                 quarantined_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
+                next_withdrawal_is_retry: false,
             }
         );
     }
@@ -1266,7 +1267,7 @@ mod withdrawal_batches {
     fn should_be_empty_when_no_pending_withdrawals() {
         let state = state();
 
-        assert_eq!(state.withdrawal_plans().next(), None);
+        assert_eq!(state.withdrawal_round(usize::MAX).next(), None);
     }
 
     proptest! {
@@ -1279,7 +1280,7 @@ mod withdrawal_batches {
             let requests = [withdrawal_request(0, amount_to_transfer)];
             accept_withdrawal_requests(&mut state, requests.clone());
 
-            let batches: Vec<_> = state.withdrawal_plans().collect();
+            let batches: Vec<_> = state.withdrawal_round(usize::MAX).collect();
 
             prop_assert_eq!(batches, vec![WithdrawalPlan::Sol(vec![requests[0].clone()])]);
         }
@@ -1295,7 +1296,7 @@ mod withdrawal_batches {
             let requests = [withdrawal_request(0, amount_to_transfer)];
             accept_withdrawal_requests(&mut state, requests);
 
-            prop_assert_eq!(state.withdrawal_plans().next(), None);
+            prop_assert_eq!(state.withdrawal_round(usize::MAX).next(), None);
         }
 
         #[test]
@@ -1307,7 +1308,7 @@ mod withdrawal_batches {
             let requests = withdrawal_requests(NUM_REQUESTS_FOR_TWO_BATCHES);
             accept_withdrawal_requests(&mut state, requests.clone());
 
-            let batches: Vec<_> = state.withdrawal_plans().collect();
+            let batches: Vec<_> = state.withdrawal_round(usize::MAX).collect();
 
             prop_assert_eq!(
                 batches,
@@ -1327,7 +1328,7 @@ mod withdrawal_batches {
             let requests = withdrawal_requests(NUM_REQUESTS_FOR_TWO_BATCHES);
             accept_withdrawal_requests(&mut state, requests.clone());
 
-            let batches: Vec<_> = state.withdrawal_plans().collect();
+            let batches: Vec<_> = state.withdrawal_round(usize::MAX).collect();
 
             prop_assert_eq!(
                 batches,
@@ -1344,12 +1345,12 @@ mod withdrawal_batches {
         state.balance =
             MINIMUM_WITHDRAWAL_AMOUNT + BATCH_WITHDRAWAL_TX_FEE + RENT_EXEMPTION_THRESHOLD - 1;
 
-        assert_eq!(state.withdrawal_plans().next(), None);
+        assert_eq!(state.withdrawal_round(usize::MAX).next(), None);
 
         state.balance += 1;
 
         assert_eq!(
-            state.withdrawal_plans().next(),
+            state.withdrawal_round(usize::MAX).next(),
             Some(WithdrawalPlan::Sol(requests.to_vec()))
         );
     }
@@ -1365,7 +1366,7 @@ mod withdrawal_batches {
         };
         accept_withdrawal_requests(&mut state, [request]);
 
-        assert_eq!(state.withdrawal_plans().next(), None);
+        assert_eq!(state.withdrawal_round(usize::MAX).next(), None);
     }
 
     #[test]
@@ -1380,7 +1381,7 @@ mod withdrawal_batches {
         ];
         accept_withdrawal_requests(&mut state, requests.clone());
 
-        let batches: Vec<_> = state.withdrawal_plans().collect();
+        let batches: Vec<_> = state.withdrawal_round(usize::MAX).collect();
 
         assert_eq!(
             batches,

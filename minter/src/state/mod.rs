@@ -8,7 +8,7 @@ use crate::{
     numeric::{LedgerBurnIndex, LedgerMintIndex},
     rpc::BlockHeight,
     sol_transfer::{
-        BATCH_WITHDRAWAL_TX_FEE, CreateTransferError, MAX_SIGNATURES, MAX_WITHDRAWALS_PER_NONCE_TX,
+        BATCH_WITHDRAWAL_TX_FEE, CreateTransferError, MAX_SIGNATURES,
         build_batch_withdrawal_message,
     },
     spl_transfer::{
@@ -39,8 +39,7 @@ use solana_message::Message;
 use solana_signature::Signature;
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, btree_map},
-    iter::Peekable,
+    collections::{BTreeMap, BTreeSet},
     str::FromStr,
 };
 
@@ -64,6 +63,8 @@ pub use spl_deposits::{
     SweptSplDeposit,
 };
 mod watchlist;
+mod withdrawal;
+pub use withdrawal::{WithdrawalPlan, WithdrawalRound};
 
 pub use deposits::{
     DepositBalance, Deposits, InFlightDeposit, MintedSweep, PendingMint, QuarantineCause,
@@ -182,6 +183,8 @@ pub struct State {
         BTreeMap<LedgerBurnIndex, CompletedSplWithdrawalFeeReimbursement>,
     quarantined_spl_withdrawal_fee_reimbursements:
         BTreeMap<LedgerBurnIndex, PendingSplWithdrawalFeeReimbursement>,
+    // Transaction creation events preserve the fair turn across rounds and upgrades.
+    next_withdrawal_is_retry: bool,
 }
 
 impl State {
@@ -801,20 +804,12 @@ impl State {
         self.spendable_balance() >= cost
     }
 
-    pub fn withdrawal_plans(&self) -> WithdrawalPlans<'_> {
-        WithdrawalPlans {
-            state: self,
-            pending_sol: self.pending_withdrawal_requests.iter().peekable(),
-            pending_spl: self.pending_spl_withdrawal_requests.iter().peekable(),
-            available_balance: self.spendable_balance(),
-            available_tokens: self.spl_treasury_balances.clone(),
-            sol_blocked: false,
-            spl_blocked: false,
-        }
+    pub fn withdrawal_round(&self, slots: usize) -> WithdrawalRound {
+        WithdrawalRound::take_from_queue(self, slots)
     }
 
     pub fn can_create_withdrawal_transaction(&self) -> bool {
-        self.nonce_pool.num_free_accounts() > 0 && self.withdrawal_plans().next().is_some()
+        self.nonce_pool.num_free_accounts() > 0 && self.withdrawal_round(1).next().is_some()
     }
 
     pub fn has_unsigned_withdrawal_transaction(&self) -> bool {
@@ -1324,11 +1319,13 @@ impl State {
             .checked_sub(cost)
             .expect("BUG: insufficient minter balance for SPL withdrawal");
         self.nonce_pool.bind(nonce_account, nonce_value);
+
         let queued = if is_retry {
             &mut self.retrying_spl_withdrawal_requests
         } else {
             &mut self.pending_spl_withdrawal_requests
         };
+
         for burn_index in burn_indices {
             let withdrawal = queued
                 .remove(burn_index)
@@ -1358,6 +1355,7 @@ impl State {
             None,
             "BUG: nonce account {nonce_account} already has a created SPL transaction"
         );
+        self.next_withdrawal_is_retry = !is_retry;
     }
 
     fn process_transaction_created(
@@ -1402,6 +1400,7 @@ impl State {
             None,
             "BUG: nonce account {nonce_account} already has a created transaction"
         );
+        self.next_withdrawal_is_retry = true;
     }
 
     fn send_spl_nonce_withdrawal(
@@ -1917,6 +1916,7 @@ impl TryFrom<InitArgs> for State {
             pending_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
             completed_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
             quarantined_spl_withdrawal_fee_reimbursements: BTreeMap::new(),
+            next_withdrawal_is_retry: false,
         };
         state.validate()?;
         Ok(state)
@@ -2013,128 +2013,6 @@ pub struct CompletedSplWithdrawalFeeReimbursement {
 pub struct PendingWithdrawalRequest {
     pub request: WithdrawalRequest,
     pub created_at: u64,
-}
-
-/// One withdrawal transaction to create: a batch of SOL transfers or one SPL withdrawal.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WithdrawalPlan {
-    Sol(Vec<WithdrawalRequest>),
-    Spl(SplWithdrawalRequest),
-}
-
-/// Groups pending withdrawals of both kinds into transactions that the minter can pay
-/// for, in ckSOL burn index order: SOL requests in batches with one transaction fee each,
-/// SPL requests one per transaction with its fee, its destination rent and its treasury
-/// tokens. The rent exemption threshold is held back so a transaction never leaves the
-/// main address below it.
-///
-/// Within a kind, iteration stops at the first request the minter cannot pay for, so
-/// requests of a kind are never reordered or skipped. The other kind keeps going, so
-/// neither kind blocks the other.
-pub struct WithdrawalPlans<'a> {
-    state: &'a State,
-    pending_sol: Peekable<btree_map::Iter<'a, LedgerBurnIndex, PendingWithdrawalRequest>>,
-    pending_spl: Peekable<btree_map::Iter<'a, LedgerBurnIndex, PendingSplWithdrawalRequest>>,
-    available_balance: Lamport,
-    available_tokens: BTreeMap<Address, u64>,
-    sol_blocked: bool,
-    spl_blocked: bool,
-}
-
-impl Iterator for WithdrawalPlans<'_> {
-    type Item = WithdrawalPlan;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let next_sol = self.next_burn_index_of_sol();
-            let next_spl = self.next_burn_index_of_spl();
-            let plan = match (next_sol, next_spl) {
-                (None, None) => return None,
-                (Some(sol), Some(spl)) if spl < sol => self.next_spl(),
-                (Some(_), _) => self.next_sol_batch(next_spl),
-                (None, Some(_)) => self.next_spl(),
-            };
-            if plan.is_some() {
-                return plan;
-            }
-        }
-    }
-}
-
-impl WithdrawalPlans<'_> {
-    fn next_burn_index_of_sol(&mut self) -> Option<LedgerBurnIndex> {
-        if self.sol_blocked {
-            return None;
-        }
-        self.pending_sol.peek().map(|(burn_index, _)| **burn_index)
-    }
-
-    fn next_burn_index_of_spl(&mut self) -> Option<LedgerBurnIndex> {
-        if self.spl_blocked {
-            return None;
-        }
-        self.pending_spl.peek().map(|(burn_index, _)| **burn_index)
-    }
-
-    /// Batches SOL requests up to the next SPL request, so a batch never serves a
-    /// request newer than an SPL request still waiting.
-    fn next_sol_batch(&mut self, next_spl: Option<LedgerBurnIndex>) -> Option<WithdrawalPlan> {
-        let mut batch = Vec::new();
-        while batch.len() < MAX_WITHDRAWALS_PER_NONCE_TX {
-            let reserved_fee = if batch.is_empty() {
-                BATCH_WITHDRAWAL_TX_FEE
-            } else {
-                0
-            };
-            let Some((burn_index, pending)) = self.pending_sol.peek() else {
-                break;
-            };
-            if next_spl.is_some_and(|spl| spl < **burn_index) {
-                break;
-            }
-            let Some(remaining_balance) = pending
-                .request
-                .amount_to_transfer
-                .checked_add(reserved_fee)
-                .and_then(|cost| self.available_balance.checked_sub(cost))
-            else {
-                break;
-            };
-            self.available_balance = remaining_balance;
-            batch.push(pending.request.clone());
-            self.pending_sol.next();
-        }
-        if batch.is_empty() {
-            self.sol_blocked = true;
-            None
-        } else {
-            Some(WithdrawalPlan::Sol(batch))
-        }
-    }
-
-    fn next_spl(&mut self) -> Option<WithdrawalPlan> {
-        let (_, pending) = self.pending_spl.peek()?;
-        let terms = &pending.request.terms;
-        let affordable = self
-            .available_balance
-            .checked_sub(
-                self.state
-                    .spl_withdrawal_transaction_cost(std::iter::once(terms)),
-            )
-            .and_then(|balance| {
-                let tokens = self.available_tokens.get(&terms.mint).copied().unwrap_or(0);
-                Some((balance, tokens.checked_sub(terms.amount)?))
-            });
-        let Some((remaining_balance, remaining_tokens)) = affordable else {
-            self.spl_blocked = true;
-            return None;
-        };
-        self.available_balance = remaining_balance;
-        self.available_tokens.insert(terms.mint, remaining_tokens);
-        let request = pending.request.clone();
-        self.pending_spl.next();
-        Some(WithdrawalPlan::Spl(request))
-    }
 }
 
 /// The binding of a durable nonce account and its nonce value to the

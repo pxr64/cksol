@@ -209,12 +209,13 @@ async fn create_transactions_batch<R: CanisterRuntime>(
         let max_plans = MAX_CONCURRENT_RPC_CALLS.min(MAX_CONCURRENT_SIGNATURES.saturating_sub(
             state.created_withdrawal_txs().len() + state.created_spl_withdrawal_txs().len(),
         ));
+        let slots = max_plans.min(state.nonce_pool().num_free_accounts());
+        let round = state.withdrawal_round(slots);
         state
             .nonce_pool()
             .free_accounts()
             .copied()
-            .zip(state.withdrawal_plans())
-            .take(max_plans)
+            .zip(round)
             .map(|(nonce_account, plan)| ReservedPlan {
                 nonce_account,
                 plan,

@@ -602,7 +602,7 @@ mod transaction_creation {
         events::accept_withdrawal_at(account(1), 1, MINIMUM_WITHDRAWAL_AMOUNT, 100);
         events::accept_withdrawal_at(account(2), 100, MINIMUM_WITHDRAWAL_AMOUNT, 200);
         // SPL burn index 42 splits the SOL burn indices 1 and 100 into two batches.
-        let plans: Vec<_> = read_state(|state| state.withdrawal_plans().collect());
+        let plans: Vec<_> = read_state(|state| state.withdrawal_round(usize::MAX).collect());
         assert!(matches!(
             plans.as_slice(),
             [
