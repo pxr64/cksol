@@ -1,3 +1,4 @@
+use super::withdrawal::{SplWithdrawalTransfer, build_batch_spl_withdrawal_instructions};
 use super::*;
 use crate::{
     address::{account_address, associated_token_address},
@@ -188,6 +189,140 @@ fn should_build_spl_withdrawal_message_with_durable_nonce() {
                 );
             }
             assert!(crate::sol_transfer::transaction_size(&message) <= MAX_TX_SIZE);
+        }
+    }
+}
+
+#[test]
+fn should_build_a_mixed_mint_withdrawal_batch_with_one_nonce_and_signer() {
+    let tokens = [
+        spl_token(Address::from([3; 32]), TokenProgram::Classic),
+        spl_token(Address::from([4; 32]), TokenProgram::Token2022),
+        spl_token(Address::from([5; 32]), TokenProgram::Classic),
+        spl_token(Address::from([6; 32]), TokenProgram::Token2022),
+    ];
+    let destinations = [40, 41, 42, 43].map(|index| Address::from([index; 32]));
+    let nonce_account = Address::from([17; 32]);
+    let nonce_value = Hash::new_from_array([18; 32]);
+    for create_accounts in [[false; 4], [true; 4], [false, true, false, true]] {
+        let transfers: Vec<_> = tokens
+            .iter()
+            .zip(&destinations)
+            .enumerate()
+            .map(|(index, (token, destination))| SplWithdrawalTransfer {
+                token,
+                destination,
+                amount: 100 + index as u64,
+                create_destination_account: create_accounts[index],
+            })
+            .collect();
+        let instructions = build_batch_spl_withdrawal_instructions(&MINTER_ADDRESS, &transfers);
+        let creations = create_accounts.iter().filter(|&&create| create).count();
+        assert_eq!(instructions.len(), creations + transfers.len());
+        for (instruction, transfer) in instructions[..creations].iter().zip(
+            transfers
+                .iter()
+                .filter(|transfer| transfer.create_destination_account),
+        ) {
+            assert_eq!(
+                *instruction,
+                create_associated_token_account_instruction(
+                    &MINTER_ADDRESS,
+                    transfer.destination,
+                    &transfer.token.mint,
+                    &transfer.token.token_program.id()
+                )
+            );
+        }
+        for (instruction, transfer) in instructions[creations..].iter().zip(&transfers) {
+            let program = transfer.token.token_program.id();
+            assert_eq!(instruction.program_id.to_bytes(), program.to_bytes());
+            assert_eq!(
+                instruction.accounts[0].pubkey.to_bytes(),
+                associated_token_address(&MINTER_ADDRESS, &transfer.token.mint, &program)
+                    .to_bytes()
+            );
+            assert_eq!(
+                instruction.accounts[1].pubkey.to_bytes(),
+                transfer.token.mint.to_bytes()
+            );
+            assert_eq!(
+                instruction.accounts[2].pubkey.to_bytes(),
+                associated_token_address(transfer.destination, &transfer.token.mint, &program)
+                    .to_bytes()
+            );
+            assert_eq!(
+                instruction.accounts[3].pubkey.to_bytes(),
+                MINTER_ADDRESS.to_bytes()
+            );
+            assert_eq!(
+                spl_token_2022_interface::instruction::TokenInstruction::unpack(&instruction.data)
+                    .unwrap(),
+                spl_token_2022_interface::instruction::TokenInstruction::TransferChecked {
+                    amount: transfer.amount,
+                    decimals: transfer.token.decimals
+                }
+            );
+        }
+        let message = build_spl_withdrawal_message(
+            &MINTER_ADDRESS,
+            &nonce_account,
+            nonce_value,
+            &instructions,
+        )
+        .unwrap();
+        assert_eq!(message.signer_keys(), vec![&MINTER_ADDRESS]);
+        assert_eq!(message.recent_blockhash, nonce_value);
+        assert_eq!(message.instructions.len(), instructions.len() + 1);
+        assert_eq!(message.instructions[0].data, vec![4, 0, 0, 0]);
+        assert_eq!(
+            message.account_keys[message.instructions[0].accounts[0] as usize],
+            nonce_account
+        );
+        assert!(crate::sol_transfer::transaction_size(&message) <= MAX_TX_SIZE);
+    }
+}
+
+#[test]
+fn should_create_a_shared_destination_ata_once_before_the_batch_transfers() {
+    let destination = Address::from([42; 32]);
+    for program in [TokenProgram::Classic, TokenProgram::Token2022] {
+        let token = spl_token(Address::from([3; 32]), program);
+        let other_token = spl_token(Address::from([4; 32]), program);
+        let transfers: Vec<_> = [&token, &token, &token, &other_token]
+            .into_iter()
+            .enumerate()
+            .map(|(index, token)| SplWithdrawalTransfer {
+                token,
+                destination: &destination,
+                amount: 100 + index as u64,
+                create_destination_account: index != 0,
+            })
+            .collect();
+        let instructions = build_batch_spl_withdrawal_instructions(&MINTER_ADDRESS, &transfers);
+        assert_eq!(instructions.len(), 2 + transfers.len());
+        for (instruction, token) in instructions[..2].iter().zip([&token, &other_token]) {
+            assert_eq!(
+                *instruction,
+                create_associated_token_account_instruction(
+                    &MINTER_ADDRESS,
+                    &destination,
+                    &token.mint,
+                    &program.id()
+                )
+            );
+        }
+        for (instruction, transfer) in instructions[2..].iter().zip(&transfers) {
+            assert_eq!(
+                *instruction,
+                build_spl_withdrawal_instructions(
+                    &MINTER_ADDRESS,
+                    transfer.token,
+                    &destination,
+                    transfer.amount,
+                    false
+                )[0]
+            );
         }
     }
 }
