@@ -211,6 +211,7 @@ fn arb_mint_memo() -> impl Strategy<Value = MintMemo> {
     prop_oneof![
         arb_sweep_mint_memo(any::<DepositSolId>()),
         any::<u64>().prop_map(MintMemo::spl_withdrawal_fee_reimbursement),
+        any::<u64>().prop_map(MintMemo::spl_withdrawal_reimbursement),
         (arb_signature(), any::<u64>())
             .prop_map(|(signature, deposit_id)| MintMemo::sweep_fee(signature, deposit_id)),
     ]

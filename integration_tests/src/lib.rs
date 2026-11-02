@@ -11,7 +11,8 @@ use cksol_types::{
     GetDepositAddressArgs, GetSplDepositAddressArgs, GetSplDepositAddressError, MinterInfo,
     OperatingBalance, OperatingTopUp, ProcessOperatingTopUpError, WatchDepositAddressArgs,
     WatchDepositAddressError, WatchDepositAddressOk, WithdrawSolArgs, WithdrawSolError,
-    WithdrawSolOk, WithdrawSolStatus, WithdrawSolStatusArgs,
+    WithdrawSolOk, WithdrawSolStatus, WithdrawSolStatusArgs, WithdrawSplArgs, WithdrawSplError,
+    WithdrawSplOk, WithdrawSplStatus, WithdrawSplStatusArgs,
 };
 use cksol_types_internal::{
     MinterArg,
@@ -426,7 +427,11 @@ impl Setup {
     }
 
     pub fn ledger(&self) -> Ledger<'_> {
-        Ledger(self.canister(self.ledger_canister_id, Setup::DEFAULT_CALLER))
+        self.ledger_with_id(self.ledger_canister_id)
+    }
+
+    pub fn ledger_with_id(&self, canister_id: Principal) -> Ledger<'_> {
+        Ledger(self.canister(canister_id, Setup::DEFAULT_CALLER))
     }
 
     /// Installs a separate SPL ledger with the minter as its minting account.
@@ -808,6 +813,26 @@ impl<'a> CkSolMinter<'a> {
         args: WithdrawSolArgs,
     ) -> PendingCall<'_, Result<WithdrawSolOk, WithdrawSolError>> {
         self.submit_update_call("withdraw_sol", (args,)).await
+    }
+
+    pub async fn withdraw_spl(
+        &self,
+        args: WithdrawSplArgs,
+    ) -> Result<WithdrawSplOk, WithdrawSplError> {
+        self.try_update_call("withdraw_spl", (args,), 0)
+            .await
+            .expect("withdraw_spl failed")
+    }
+
+    pub async fn withdraw_spl_status(&self, cksol_burn_block_index: u64) -> WithdrawSplStatus {
+        self.update_call(
+            "withdraw_spl_status",
+            (WithdrawSplStatusArgs {
+                cksol_burn_block_index,
+            },),
+            0,
+        )
+        .await
     }
 
     pub async fn withdraw_sol_status(&self, block_index: u64) -> WithdrawSolStatus {

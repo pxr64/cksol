@@ -324,16 +324,20 @@ impl MockBuilder {
         )
     }
 
+    /// Reads the nonce account after the withdrawal advanced its stored nonce value.
+    pub fn get_advanced_nonce_account(self) -> Self {
+        self.expect(
+            get_account_info_request(),
+            get_account_info_nonce_response(ADVANCED_NONCE_SEED),
+        )
+    }
+
     /// Mocks for `finalize_transactions` finding only the given in-flight withdrawal
     /// transaction, which carries a durable nonce and needs no current block:
     /// `getAccountInfo` reporting its nonce account advanced → `getTransaction`
     /// reporting it as succeeded.
     pub fn finalize_withdrawal_transaction(self, withdrawal: &Transaction) -> Self {
-        self.expect(
-            get_account_info_request(),
-            get_account_info_nonce_response(ADVANCED_NONCE_SEED),
-        )
-        .expect(
+        self.get_advanced_nonce_account().expect(
             get_transaction_request(&withdrawal.signatures[0]),
             withdrawal_transaction_response(withdrawal),
         )

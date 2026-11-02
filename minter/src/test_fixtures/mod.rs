@@ -483,6 +483,8 @@ pub fn account_signature_nth(account: &Account, occurrence: usize) -> solana_sig
 
 /// Returns the [`Signature`] that [`signer::MockSchnorrSigner`] produces the first time
 /// the minter's main address signs.
+/// Every call returns the same fixed test value; using it in submission and outcome
+/// events links those events to the same transaction. It does not sign a new transaction.
 pub fn minter_signature() -> solana_signature::Signature {
     minter_signature_nth(0)
 }
@@ -2047,6 +2049,19 @@ pub mod arb {
                 EventType::SucceededSplWithdrawalTransaction {
                     signature,
                     lamports_spent,
+                }
+            }),
+            (arb_ledger_burn_index(), arb_ledger_mint_index()).prop_map(
+                |(cksol_burn_block_index, mint_block_index)| {
+                    EventType::ReimbursedSplWithdrawal {
+                        cksol_burn_block_index,
+                        mint_block_index,
+                    }
+                }
+            ),
+            arb_ledger_burn_index().prop_map(|cksol_burn_block_index| {
+                EventType::QuarantinedSplWithdrawalReimbursement {
+                    cksol_burn_block_index,
                 }
             }),
             (arb_ledger_burn_index(), arb_ledger_mint_index()).prop_map(
