@@ -116,6 +116,13 @@ pub enum MintMemo {
         #[n(0)]
         cksol_burn_block_index: WithdrawSplId,
     },
+    /// The minter reimbursed tokens after a definitive on-chain SPL withdrawal failure.
+    #[n(4)]
+    SplWithdrawalReimbursement {
+        /// The ckSOL fee burn index identifying the failed withdrawal.
+        #[n(0)]
+        cksol_burn_block_index: WithdrawSplId,
+    },
 }
 
 /// The minter burned some ckSOL tokens.
@@ -162,6 +169,13 @@ impl MintMemo {
     /// Creates the fee reimbursement memo, linked to the ckSOL fee burn it reimburses.
     pub fn spl_withdrawal_fee_reimbursement(cksol_burn_block_index: WithdrawSplId) -> Self {
         Self::SplWithdrawalFeeReimbursement {
+            cksol_burn_block_index,
+        }
+    }
+
+    /// Creates the token reimbursement memo, linked to the failed withdrawal.
+    pub fn spl_withdrawal_reimbursement(cksol_burn_block_index: WithdrawSplId) -> Self {
+        Self::SplWithdrawalReimbursement {
             cksol_burn_block_index,
         }
     }

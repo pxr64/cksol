@@ -3,15 +3,19 @@ use crate::{
     constants::CKSOL_LEDGER_TRANSACTION_FEE,
     deposit::mint::{MintQueue, mint_pending, process_pending_mints_round},
     guard::{GuardError, withdrawal_guard},
-    ledger::{self, BurnError, client::CkLedger, spl::SplBurnError},
+    ledger::{
+        self, BurnError,
+        client::{CkLedger, LedgerClient},
+        spl::SplBurnError,
+    },
     numeric::LedgerBurnIndex,
     queue_cursor::QueueCursors,
     runtime::CanisterRuntime,
     sol_transfer::CreateTransferError,
     spl_transfer::{build_spl_withdrawal_instructions, build_spl_withdrawal_message},
     state::{
-        CreatedSplWithdrawalTransaction, PendingSplWithdrawalFeeReimbursement, State,
-        SupportedSplToken, TokenProgram,
+        CreatedSplWithdrawalTransaction, PendingSplWithdrawalFeeReimbursement,
+        PendingSplWithdrawalReimbursement, State, SupportedSplToken, TokenProgram,
         audit::process_event,
         event::{
             EventType, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
@@ -452,10 +456,71 @@ thread_local! {
     /// the mint arguments live in the event log.
     static FEE_REIMBURSEMENT_CURSOR: QueueCursors<MintQueue, LedgerBurnIndex> =
         const { QueueCursors::new() };
+    static TOKEN_REIMBURSEMENT_CURSOR: QueueCursors<MintQueue, LedgerBurnIndex> =
+        const { QueueCursors::new() };
 }
 
-pub fn reset_fee_reimbursement_cursor() {
+pub fn reset_reimbursement_cursors() {
     FEE_REIMBURSEMENT_CURSOR.with(QueueCursors::reset);
+    TOKEN_REIMBURSEMENT_CURSOR.with(QueueCursors::reset);
+}
+
+/// Fixed arguments for reminting the full burned token amount to its original account.
+pub fn reimbursement_transfer_arg(pending: &PendingSplWithdrawalReimbursement) -> TransferArg {
+    TransferArg {
+        from_subaccount: None,
+        to: pending.request.terms.account,
+        fee: None,
+        created_at_time: Some(pending.created_at),
+        memo: Some(
+            Memo::from(MintMemo::spl_withdrawal_reimbursement(
+                *pending.request.cksol_burn_block_index.get(),
+            ))
+            .into(),
+        ),
+        amount: pending.request.terms.amount.into(),
+    }
+}
+
+/// Remints tokens only for withdrawals already recorded as definitively failed on Solana.
+pub async fn process_pending_reimbursements<R: CanisterRuntime>(runtime: R) {
+    let run_again = process_pending_mints_round(
+        &runtime,
+        MintQueue::SplReimbursement,
+        &TOKEN_REIMBURSEMENT_CURSOR,
+        |state: &State| state.pending_spl_withdrawal_reimbursements(),
+        process_pending_reimbursement,
+    )
+    .await;
+    if run_again {
+        runtime.set_timer(Duration::ZERO, process_pending_reimbursements);
+    }
+}
+
+async fn process_pending_reimbursement<R: CanisterRuntime>(
+    runtime: &R,
+    cksol_burn_block_index: LedgerBurnIndex,
+    pending: PendingSplWithdrawalReimbursement,
+) {
+    let client = LedgerClient::new(
+        runtime.inter_canister_call_runtime(),
+        pending.request.terms.ledger_id,
+    );
+    mint_pending(
+        runtime,
+        MintQueue::SplReimbursement,
+        client,
+        reimbursement_transfer_arg(&pending),
+        |mint_block_index| EventType::ReimbursedSplWithdrawal {
+            cksol_burn_block_index,
+            mint_block_index,
+        },
+        EventType::QuarantinedSplWithdrawalReimbursement {
+            cksol_burn_block_index,
+        },
+        &format!("token reimbursement of SPL withdrawal {cksol_burn_block_index}"),
+    )
+    .await;
 }
 
 /// Mints the queued fee reimbursements in bounded rounds, like the deposit mints.

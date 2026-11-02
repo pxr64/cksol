@@ -288,6 +288,18 @@ pub enum EventType {
         /// The fee payer's observed lamport debit, including its transaction fee.
         lamports_spent: Lamport,
     },
+    /// The tokens of a definitively failed SPL withdrawal were reminted.
+    ReimbursedSplWithdrawal {
+        /// The ckSOL fee burn index identifying the withdrawal.
+        cksol_burn_block_index: u64,
+        /// The mint block index on the ckSPL ledger.
+        mint_block_index: u64,
+    },
+    /// A token reimbursement cannot be safely retried and requires manual resolution.
+    QuarantinedSplWithdrawalReimbursement {
+        /// The ckSOL fee burn index identifying the withdrawal.
+        cksol_burn_block_index: u64,
+    },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

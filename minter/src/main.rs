@@ -14,7 +14,7 @@ use cksol_minter::{
     state::read_state,
     withdraw::{
         WITHDRAWAL_PROCESSING_DELAY, process_pending_withdrawals,
-        spl::process_pending_fee_reimbursements,
+        spl::{process_pending_fee_reimbursements, process_pending_reimbursements},
     },
 };
 use cksol_types::{
@@ -351,6 +351,9 @@ fn setup_timers() {
     });
     ic_cdk_timers::set_timer_interval(PROCESS_PENDING_MINTS_DELAY, async || {
         process_pending_fee_reimbursements(IcCanisterRuntime::new()).await;
+    });
+    ic_cdk_timers::set_timer_interval(PROCESS_PENDING_MINTS_DELAY, async || {
+        process_pending_reimbursements(IcCanisterRuntime::new()).await;
     });
     ic_cdk_timers::set_timer_interval(FINALIZE_TRANSACTIONS_DELAY, async || {
         finalize_transactions(IcCanisterRuntime::new()).await;

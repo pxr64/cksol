@@ -22,6 +22,7 @@ pub enum MintQueue {
     Spl,
     SplFee,
     SplFeeReimbursement,
+    SplReimbursement,
 }
 
 impl MintQueue {
@@ -30,14 +31,15 @@ impl MintQueue {
             Self::Sol => TaskType::Mint,
             Self::Spl | Self::SplFee => TaskType::MintSpl,
             Self::SplFeeReimbursement => TaskType::ReimburseSplWithdrawalFees,
+            Self::SplReimbursement => TaskType::ReimburseSplWithdrawals,
         }
     }
 
-    /// The metrics count the ckSOL mints only.
+    /// The existing metric counts failed ckSOL deposit mints only, not reimbursements.
     fn record_failed_mint(self, reason: FailedMintReason) {
         match self {
             Self::Sol => record_failed_mint_attempt(reason),
-            Self::Spl | Self::SplFee | Self::SplFeeReimbursement => {}
+            Self::Spl | Self::SplFee | Self::SplFeeReimbursement | Self::SplReimbursement => {}
         }
     }
 }

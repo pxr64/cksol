@@ -357,6 +357,20 @@ pub enum EventType {
         #[n(1)]
         lamports_spent: Lamport,
     },
+    /// The tokens of a definitively failed SPL withdrawal were reminted.
+    #[n(31)]
+    ReimbursedSplWithdrawal {
+        #[cbor(n(0), with = "cbor::id")]
+        cksol_burn_block_index: LedgerBurnIndex,
+        #[cbor(n(1), with = "cbor::id")]
+        mint_block_index: LedgerMintIndex,
+    },
+    /// A token reimbursement cannot be safely retried and requires manual resolution.
+    #[n(32)]
+    QuarantinedSplWithdrawalReimbursement {
+        #[cbor(n(0), with = "cbor::id")]
+        cksol_burn_block_index: LedgerBurnIndex,
+    },
 }
 
 /// A ckSOL fee reimbursement for an SPL withdrawal whose token burn failed.

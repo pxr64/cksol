@@ -639,6 +639,22 @@ type WithdrawSplStatusArgs = record {
 
 // Retrieve the status of an SPL withdrawal request.
 type WithdrawSplStatus = variant {
+    // The Solana transfer failed definitively; its burned ckSPL is queued for reimbursement.
+    ReimbursementPending : record {
+        transaction_id : Signature;
+        reimbursed_amount : nat64;
+    };
+    // The tokens of the failed Solana withdrawal were reminted.
+    Reimbursed : record {
+        transaction_id : Signature;
+        reimbursed_amount : nat64;
+        mint_block_index : nat64;
+    };
+    // The token reimbursement cannot be retried safely and requires manual resolution.
+    ReimbursementQuarantined : record {
+        transaction_id : Signature;
+        reimbursed_amount : nat64;
+    };
     // Withdrawal request is not found.
     NotFound;
     // Withdrawal request is waiting to be processed.
@@ -1001,6 +1017,15 @@ type EventType = variant {
     SucceededSplWithdrawalTransaction : record {
         signature : Signature;
         lamports_spent : Lamport;
+    };
+    // The tokens of a definitively failed SPL withdrawal were reminted.
+    ReimbursedSplWithdrawal : record {
+        cksol_burn_block_index : nat64;
+        mint_block_index : nat64;
+    };
+    // A token reimbursement cannot be safely retried and requires manual resolution.
+    QuarantinedSplWithdrawalReimbursement : record {
+        cksol_burn_block_index : nat64;
     };
 };
 

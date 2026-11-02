@@ -674,6 +674,29 @@ pub struct WithdrawSplStatusArgs {
 /// Status of an SPL withdrawal request.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
 pub enum WithdrawSplStatus {
+    /// The Solana transfer failed definitively; its burned ckSPL is queued for reimbursement.
+    ReimbursementPending {
+        /// The failed Solana transaction signature.
+        transaction_id: Signature,
+        /// The token amount to remint, in the token's smallest units.
+        reimbursed_amount: u64,
+    },
+    /// The tokens of the failed Solana withdrawal were reminted.
+    Reimbursed {
+        /// The failed Solana transaction signature.
+        transaction_id: Signature,
+        /// The token amount reminted, in the token's smallest units.
+        reimbursed_amount: u64,
+        /// The mint block index on the ckSPL ledger.
+        mint_block_index: u64,
+    },
+    /// The token reimbursement cannot be retried safely and requires manual resolution.
+    ReimbursementQuarantined {
+        /// The failed Solana transaction signature.
+        transaction_id: Signature,
+        /// The token amount that was to be reminted, in its smallest units.
+        reimbursed_amount: u64,
+    },
     /// Withdrawal request is not found.
     NotFound,
     /// Withdrawal request is waiting to be processed.

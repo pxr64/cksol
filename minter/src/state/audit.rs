@@ -45,10 +45,25 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
             state.process_spl_withdrawal_succeeded(signature, *lamports_spent);
         }
         EventType::FailedTransaction { signature } => {
-            state.process_transaction_failed(signature);
+            state.process_transaction_failed(signature, timestamp);
         }
         EventType::SplitFailedSplSweep { signature } => {
-            state.process_split_failed_spl_sweep(signature)
+            state.process_split_failed_spl_sweep(signature, timestamp)
+        }
+        EventType::ReimbursedSplWithdrawal {
+            cksol_burn_block_index,
+            mint_block_index,
+        } => {
+            state.process_reimbursed_spl_withdrawal(
+                *cksol_burn_block_index,
+                *mint_block_index,
+                timestamp,
+            );
+        }
+        EventType::QuarantinedSplWithdrawalReimbursement {
+            cksol_burn_block_index,
+        } => {
+            state.process_quarantined_spl_withdrawal_reimbursement(*cksol_burn_block_index);
         }
         EventType::ExpiredTransaction { signature } => {
             state.process_transaction_expired(signature);
