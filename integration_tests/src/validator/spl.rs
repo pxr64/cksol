@@ -18,7 +18,7 @@ use spl_associated_token_account_interface::{
     address::get_associated_token_address_with_program_id,
     instruction::create_associated_token_account,
 };
-use spl_token_interface::{
+use spl_token_2022_interface::{
     instruction::{initialize_mint2, mint_to},
     state::Mint,
 };
@@ -56,6 +56,21 @@ impl SolanaTestValidator {
 
     /// Creates a classic SPL mint on the validator, with `funder` as its mint authority.
     pub async fn create_mint(&self, funder: &Keypair, decimals: u8) -> Address {
+        self.create_mint_for_program(
+            funder,
+            decimals,
+            spl_token_interface::id().to_bytes().into(),
+        )
+        .await
+    }
+
+    /// Creates a mint without extensions for either supported token program.
+    pub async fn create_mint_for_program(
+        &self,
+        funder: &Keypair,
+        decimals: u8,
+        token_program: Address,
+    ) -> Address {
         let mint = Keypair::new();
         let rpc = self.rpc_client();
         let rent = rpc
@@ -68,10 +83,10 @@ impl SolanaTestValidator {
                 &mint.pubkey(),
                 rent,
                 Mint::LEN as u64,
-                &spl_token_interface::id().to_bytes().into(),
+                &token_program,
             ),
             initialize_mint2(
-                &spl_token_interface::id(),
+                &token_program.to_bytes().into(),
                 &mint.pubkey().to_bytes().into(),
                 &funder.pubkey().to_bytes().into(),
                 None,
@@ -100,7 +115,26 @@ impl SolanaTestValidator {
         owner: &Address,
         amount: u64,
     ) -> Address {
-        let token_program = spl_token_interface::id();
+        self.mint_to_for_program(
+            funder,
+            mint,
+            owner,
+            amount,
+            spl_token_interface::id().to_bytes().into(),
+        )
+        .await
+    }
+
+    /// Creates and funds an ATA using the given token program.
+    pub async fn mint_to_for_program(
+        &self,
+        funder: &Keypair,
+        mint: &Address,
+        owner: &Address,
+        amount: u64,
+        token_program: Address,
+    ) -> Address {
+        let token_program = token_program.to_bytes().into();
         let account = get_associated_token_address_with_program_id(
             &owner.to_bytes().into(),
             &mint.to_bytes().into(),
