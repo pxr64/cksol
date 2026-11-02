@@ -963,7 +963,7 @@ fn record_signed_spl_withdrawal(token_program: TokenProgram) -> solana_signature
         process_event(
             state,
             EventType::CreatedSplWithdrawalTransaction {
-                cksol_burn_block_index: 100.into(),
+                burn_indices: vec![100.into()],
                 nonce_account: NONCE_ACCOUNT,
                 nonce_value: durable_nonce(BOUND_NONCE_SEED),
             },
@@ -987,7 +987,7 @@ fn record_signed_spl_withdrawal(token_program: TokenProgram) -> solana_signature
                 message: message.into(),
                 signers: vec![Signer::Minter],
                 purpose: TransactionPurpose::SplWithdrawal {
-                    cksol_burn_block_index: 100.into(),
+                    burn_indices: vec![100.into()],
                 },
             },
             &runtime,

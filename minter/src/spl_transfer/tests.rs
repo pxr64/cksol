@@ -200,11 +200,12 @@ fn should_build_a_mixed_mint_withdrawal_batch_with_one_nonce_and_signer() {
         spl_token(Address::from([4; 32]), TokenProgram::Token2022),
         spl_token(Address::from([5; 32]), TokenProgram::Classic),
         spl_token(Address::from([6; 32]), TokenProgram::Token2022),
+        spl_token(Address::from([7; 32]), TokenProgram::Classic),
     ];
-    let destinations = [40, 41, 42, 43].map(|index| Address::from([index; 32]));
+    let destinations = [40, 41, 42, 43, 44].map(|index| Address::from([index; 32]));
     let nonce_account = Address::from([17; 32]);
     let nonce_value = Hash::new_from_array([18; 32]);
-    for create_accounts in [[false; 4], [true; 4], [false, true, false, true]] {
+    for create_accounts in [[false; 5], [true; 5], [false, true, false, true, false]] {
         let transfers: Vec<_> = tokens
             .iter()
             .zip(&destinations)

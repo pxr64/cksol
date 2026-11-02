@@ -332,7 +332,7 @@ async fn assert_successful_withdrawal(
     );
     setup.minter().assert_that_events().await.satisfy(|events| {
         assert!(events.iter().any(|event| matches!(event,
-            EventType::SubmittedTransaction { purpose: TransactionPurpose::SplWithdrawal { cksol_burn_block_index }, .. } if *cksol_burn_block_index == id)));
+            EventType::SubmittedTransaction { purpose: TransactionPurpose::SplWithdrawal { burn_indices }, .. } if burn_indices.as_slice() == [id])));
         assert!(events.contains(&EventType::SucceededSplWithdrawalTransaction { signature: signature.clone(), lamports_spent: FEE_PER_SIGNATURE + rent_spent }));
     });
     setup

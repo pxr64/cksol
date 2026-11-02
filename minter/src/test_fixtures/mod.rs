@@ -1872,11 +1872,11 @@ pub mod arb {
                 }),
             prop::collection::vec(arb_ledger_burn_index(), 1..10)
                 .prop_map(|burn_indices| TransactionPurpose::Withdrawal { burn_indices }),
-            arb_ledger_burn_index().prop_map(|cksol_burn_block_index| {
-                TransactionPurpose::SplWithdrawal {
-                    cksol_burn_block_index,
-                }
-            }),
+            prop::collection::vec(
+                arb_ledger_burn_index(),
+                1..=crate::constants::MAX_SPL_WITHDRAWALS_PER_NONCE_TX
+            )
+            .prop_map(|burn_indices| TransactionPurpose::SplWithdrawal { burn_indices }),
             (
                 prop::collection::vec(any::<u64>(), 1..10),
                 arb_block_height()
@@ -2036,15 +2036,21 @@ pub mod arb {
                     )
                 },
             ),
-            (arb_ledger_burn_index(), arb_address(), arb_hash()).prop_map(
-                |(cksol_burn_block_index, nonce_account, nonce_value)| {
+            (
+                prop::collection::vec(
+                    arb_ledger_burn_index(),
+                    1..=crate::constants::MAX_SPL_WITHDRAWALS_PER_NONCE_TX
+                ),
+                arb_address(),
+                arb_hash()
+            )
+                .prop_map(|(burn_indices, nonce_account, nonce_value)| {
                     EventType::CreatedSplWithdrawalTransaction {
-                        cksol_burn_block_index,
+                        burn_indices,
                         nonce_account,
                         nonce_value,
                     }
-                },
-            ),
+                },),
             (arb_signature(), any::<u64>()).prop_map(|(signature, lamports_spent)| {
                 EventType::SucceededSplWithdrawalTransaction {
                     signature,

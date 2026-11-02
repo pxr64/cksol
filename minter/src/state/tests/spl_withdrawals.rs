@@ -87,9 +87,13 @@ fn accepted_request(
     }
 }
 
-fn spl_transaction_created(id: u64) -> EventType {
+fn spl_transaction_created(burn_indices: &[u64]) -> EventType {
     EventType::CreatedSplWithdrawalTransaction {
-        cksol_burn_block_index: id.into(),
+        burn_indices: burn_indices
+            .iter()
+            .copied()
+            .map(LedgerBurnIndex::new)
+            .collect(),
         nonce_account: NONCE_ACCOUNT,
         nonce_value: Hash::new_from_array([18; 32]),
     }
@@ -104,12 +108,20 @@ fn bound_message(state: &State) -> Message {
 }
 
 fn submitted_spl_withdrawal(id: u64) -> EventType {
+    submitted_spl_withdrawals(&[id])
+}
+
+fn submitted_spl_withdrawals(burn_indices: &[u64]) -> EventType {
     EventType::SubmittedTransaction {
         signature: minter_signature(),
         message: read_state(bound_message).into(),
         signers: vec![Signer::Minter],
         purpose: TransactionPurpose::SplWithdrawal {
-            cksol_burn_block_index: id.into(),
+            burn_indices: burn_indices
+                .iter()
+                .copied()
+                .map(LedgerBurnIndex::new)
+                .collect(),
         },
     }
 }
@@ -126,8 +138,60 @@ fn setup_created_spl_withdrawal(
     request.ledger_id = token.ledger_id;
     request.create_destination_account = create_destination_account;
     accept(100, 7, &request);
-    record(spl_transaction_created(100), 30);
+    record(spl_transaction_created(&[100]), 30);
     request
+}
+
+fn setup_created_spl_batch() -> [SplWithdrawalRequestTerms; 2] {
+    let mut first = setup_with_nonce();
+    first.create_destination_account = true;
+    accept(100, 7, &first);
+    let mut token = spl_token([5; 32].into(), TokenProgram::Token2022);
+    token.decimals = 9;
+    record(EventType::AddedSplToken(token.clone()), 40);
+    events::fund_spl_treasury(&token, 200_000_000);
+    let second = SplWithdrawalRequestTerms {
+        mint: token.mint,
+        ledger_id: token.ledger_id,
+        amount: 123_456_789,
+        ..first.clone()
+    };
+    record(
+        EventType::AcceptedSplWithdrawalRequest(accepted_request(101, 8, &second)),
+        50,
+    );
+
+    record(spl_transaction_created(&[100, 101]), 60);
+    [first, second]
+}
+
+/// Submits either five requests sharing one ATA or two requests using different token programs.
+fn setup_submitted_spl_batch(shared_destination: bool) -> (Vec<u64>, Lamport) {
+    reset_state();
+    reset_events();
+    let (indices, reserved) = if shared_destination {
+        let mut request = setup_with_nonce();
+        for id in 100..105 {
+            request.create_destination_account = id != 100;
+            accept(id, id, &request);
+        }
+        let indices = vec![100, 101, 102, 103, 104];
+        record(spl_transaction_created(&indices), 60);
+        (
+            indices,
+            FEE_PER_SIGNATURE + TokenProgram::Classic.account_rent_exemption(),
+        )
+    } else {
+        setup_created_spl_batch();
+        (
+            vec![100, 101],
+            FEE_PER_SIGNATURE
+                + TokenProgram::Classic.account_rent_exemption()
+                + TokenProgram::Token2022.account_rent_exemption(),
+        )
+    };
+    record(submitted_spl_withdrawals(&indices), 70);
+    (indices, reserved)
 }
 
 /// Records the terminal event once, rejects a repeat, and checks the shared outcome:
@@ -164,7 +228,7 @@ fn assert_reserves(create_destination_account: bool, cost: Lamport) {
     request.create_destination_account = create_destination_account;
     accept(100, 7, &request);
     let balance_before = read_state(|state| state.balance());
-    record(spl_transaction_created(100), 30);
+    record(spl_transaction_created(&[100]), 30);
     assert_eq!(assert_replay_matches().balance(), balance_before - cost);
 }
 
@@ -395,7 +459,7 @@ fn should_reject_spl_submission_that_does_not_match_the_binding() {
         match change {
             0 => {
                 *purpose = TransactionPurpose::SplWithdrawal {
-                    cksol_burn_block_index: 101.into(),
+                    burn_indices: vec![101.into()],
                 }
             }
             1 => message.recent_blockhash = Hash::new_from_array([19; 32]),
@@ -533,7 +597,7 @@ fn should_replay_spl_withdrawal_bound_to_nonce() {
     let request = setup_with_nonce();
     accept(100, 7, &request);
     accept(101, 8, &request);
-    record(spl_transaction_created(100), 30);
+    record(spl_transaction_created(&[100]), 30);
 
     let replayed = assert_replay_matches();
     let nonce_account = NONCE_ACCOUNT;
@@ -544,9 +608,9 @@ fn should_replay_spl_withdrawal_bound_to_nonce() {
             .contains_key(&101.into())
     );
     let created = &replayed.created_spl_withdrawal_txs()[&nonce_account];
-    assert_eq!(created.cksol_burn_block_index, 100.into());
+    assert_eq!(created.burn_indices, vec![100.into()]);
     assert_eq!(replayed.created_spl_withdrawal_requests().len(), 1);
-    let withdrawal = &replayed.created_spl_withdrawal_requests()[&created.cksol_burn_block_index];
+    let withdrawal = &replayed.created_spl_withdrawal_requests()[&100.into()];
     assert_eq!(withdrawal.request, accepted_request(100, 7, &request));
     assert_eq!(withdrawal.created_at, 20);
     assert_eq!(created.nonce_value, Hash::new_from_array([18; 32]));
@@ -574,7 +638,7 @@ fn should_rebuild_the_bound_spl_withdrawal_message_after_replay() {
             request.amount = 123_456_789;
             request.create_destination_account = create_destination_account;
             accept(100, 7, &request);
-            record(spl_transaction_created(100), 30);
+            record(spl_transaction_created(&[100]), 30);
             let instructions = build_spl_withdrawal_instructions(
                 &MINTER_ADDRESS,
                 &token,
@@ -596,6 +660,283 @@ fn should_rebuild_the_bound_spl_withdrawal_message_after_replay() {
             assert_eq!(bound_message(&replayed), message);
         }
     }
+}
+
+#[test]
+fn should_rebuild_a_mixed_mint_spl_batch_from_created_requests() {
+    let [first, second] = setup_created_spl_batch();
+    let balance_before = FUNDED_BALANCE;
+    let state = assert_replay_matches();
+    let message = bound_message(&state);
+    assert_eq!(
+        state.balance(),
+        balance_before
+            - FEE_PER_SIGNATURE
+            - TokenProgram::Classic.account_rent_exemption()
+            - TokenProgram::Token2022.account_rent_exemption()
+    );
+    assert_eq!(state.nonce_pool().num_free_accounts(), 0);
+    assert_eq!(
+        state.created_spl_withdrawal_txs()[&NONCE_ACCOUNT].burn_indices,
+        vec![100.into(), 101.into()]
+    );
+    assert!(state.pending_spl_withdrawal_requests().is_empty());
+    assert_eq!(
+        state.spl_treasury_balance(&first.mint),
+        FUNDED_TOKENS - first.amount
+    );
+    assert_eq!(
+        state.spl_treasury_balance(&second.mint),
+        200_000_000 - second.amount
+    );
+    assert_eq!(message, read_state(bound_message));
+    assert_eq!(message.recent_blockhash, Hash::new_from_array([18; 32]));
+    assert_eq!(message.signer_keys(), vec![&MINTER_ADDRESS]);
+    assert_eq!(message.instructions.len(), 5);
+    assert_eq!(message.instructions[0].data, vec![4, 0, 0, 0]);
+    for (instruction, terms, program, decimals) in [
+        (&message.instructions[3], first, TokenProgram::Classic, 6),
+        (&message.instructions[4], second, TokenProgram::Token2022, 9),
+    ] {
+        assert_eq!(
+            message.account_keys[instruction.program_id_index as usize],
+            program.id()
+        );
+        assert_eq!(
+            message.account_keys[instruction.accounts[1] as usize],
+            terms.mint
+        );
+        assert_eq!(
+            spl_token_2022_interface::instruction::TokenInstruction::unpack(&instruction.data)
+                .unwrap(),
+            spl_token_2022_interface::instruction::TokenInstruction::TransferChecked {
+                amount: terms.amount,
+                decimals
+            }
+        );
+    }
+}
+
+#[test]
+fn should_replay_a_submitted_spl_batch_with_all_requests_under_one_signature() {
+    setup_created_spl_batch();
+    let balance_before = read_state(|state| state.balance());
+    let message = read_state(bound_message);
+    record(submitted_spl_withdrawals(&[100, 101]), 70);
+    let state = assert_replay_matches();
+    assert!(state.created_spl_withdrawal_requests().is_empty());
+    assert!(state.created_spl_withdrawal_txs().is_empty());
+    assert_eq!(state.sent_spl_withdrawal_requests().len(), 2);
+    assert_eq!(state.submitted_transactions().len(), 1);
+    assert_eq!(state.balance(), balance_before);
+    assert_eq!(state.nonce_pool().num_free_accounts(), 0);
+    for id in [100_u64, 101] {
+        let sent = &state.sent_spl_withdrawal_requests()[&id.into()];
+        assert_eq!(sent.signature, minter_signature());
+        assert_eq!(
+            state.spl_withdrawal_status(id),
+            WithdrawSplStatus::TxSent {
+                transaction_id: minter_signature().into()
+            }
+        );
+    }
+    assert!(
+        matches!(state.submitted_transactions().get(&minter_signature()),
+        Some(MinterTransaction::Withdrawal { message: VersionedMessage::Legacy(actual), nonce_account, submitted_at: 70, .. })
+        if actual == &message && *nonce_account == NONCE_ACCOUNT)
+    );
+}
+
+#[test]
+fn should_reconcile_the_whole_spl_batch_reservation_on_success() {
+    for shared_destination in [false, true] {
+        for spend_all_rent in [false, true] {
+            let (indices, reserved) = setup_submitted_spl_batch(shared_destination);
+            assert_eq!(
+                read_state(|state| state.spl_withdrawal_reserved_cost(&minter_signature())),
+                Some(reserved)
+            );
+            assert_eq!(
+                read_state(|state| state.balance()),
+                FUNDED_BALANCE - reserved
+            );
+            let lamports_spent = if spend_all_rent {
+                reserved
+            } else {
+                FEE_PER_SIGNATURE
+            };
+            record(
+                EventType::SucceededSplWithdrawalTransaction {
+                    signature: minter_signature(),
+                    lamports_spent,
+                },
+                80,
+            );
+            let state = assert_replay_matches();
+            assert_eq!(state.balance(), FUNDED_BALANCE - lamports_spent);
+            assert_eq!(
+                state.successful_spl_withdrawal_requests().len(),
+                indices.len()
+            );
+            assert!(state.sent_spl_withdrawal_requests().is_empty());
+            assert_eq!(
+                state.spl_withdrawal_reserved_cost(&minter_signature()),
+                None
+            );
+            assert_eq!(state.nonce_pool().num_free_accounts(), 1);
+        }
+    }
+}
+
+#[test]
+fn should_return_each_unused_ata_rent_once_after_an_spl_batch_fails() {
+    for shared_destination in [false, true] {
+        let (indices, reserved) = setup_submitted_spl_batch(shared_destination);
+        assert_eq!(
+            read_state(|state| state.spl_withdrawal_reserved_cost(&minter_signature())),
+            Some(reserved)
+        );
+        record(
+            EventType::FailedTransaction {
+                signature: minter_signature(),
+            },
+            80,
+        );
+        let state = assert_replay_matches();
+        assert_eq!(state.balance(), FUNDED_BALANCE - FEE_PER_SIGNATURE);
+        assert_eq!(state.failed_spl_withdrawal_requests().len(), indices.len());
+        assert!(state.sent_spl_withdrawal_requests().is_empty());
+        assert_eq!(
+            state.spl_withdrawal_reserved_cost(&minter_signature()),
+            None
+        );
+        assert_eq!(state.nonce_pool().num_free_accounts(), 1);
+        assert_eq!(state.spl_treasury_balance(&[2; 32].into()), FUNDED_TOKENS);
+        if !shared_destination {
+            assert_eq!(state.spl_treasury_balance(&[5; 32].into()), 200_000_000);
+        }
+    }
+}
+
+#[test]
+fn should_reject_spl_batch_spend_above_the_whole_transaction_reservation() {
+    let (_, reserved) = setup_submitted_spl_batch(false);
+    let before = read_state(Clone::clone);
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| record(
+            EventType::SucceededSplWithdrawalTransaction {
+                signature: minter_signature(),
+                lamports_spent: reserved + 1,
+            },
+            80
+        )))
+        .is_err()
+    );
+    read_state(|state| assert_eq!(state, &before));
+    assert_replay_matches();
+}
+
+#[test]
+fn should_reject_spl_batch_submission_that_does_not_match_the_bound_requests() {
+    setup_created_spl_batch();
+    for indices in [vec![], vec![100], vec![101, 100], vec![100, 101, 102]] {
+        let before = read_state(Clone::clone);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                submitted_spl_withdrawals(&indices),
+                70
+            )))
+            .is_err()
+        );
+        read_state(|state| assert_eq!(state, &before));
+        assert_replay_matches();
+    }
+    for change in 0..2 {
+        let before = read_state(Clone::clone);
+        let mut event = submitted_spl_withdrawals(&[100, 101]);
+        let EventType::SubmittedTransaction {
+            message: VersionedMessage::Legacy(message),
+            signers,
+            ..
+        } = &mut event
+        else {
+            unreachable!()
+        };
+        if change == 0 {
+            message.instructions.last_mut().unwrap().data.push(0);
+        } else {
+            signers.push(Signer::Account(account(2)));
+        }
+        assert!(catch_unwind(AssertUnwindSafe(|| record(event, 70))).is_err());
+        read_state(|state| assert_eq!(state, &before));
+        assert_replay_matches();
+    }
+}
+
+#[test]
+fn should_reserve_one_signature_and_one_rent_per_destination_in_an_spl_batch() {
+    let mut request = setup_with_nonce();
+    for id in 100..105 {
+        request.create_destination_account = id != 100;
+        accept(id, id, &request);
+    }
+    let balance_before = read_state(|state| state.balance());
+    record(spl_transaction_created(&[100, 101, 102, 103, 104]), 30);
+    let state = assert_replay_matches();
+    assert_eq!(
+        state.balance(),
+        balance_before - FEE_PER_SIGNATURE - TokenProgram::Classic.account_rent_exemption()
+    );
+    assert_eq!(
+        state.spl_treasury_balance(&request.mint),
+        FUNDED_TOKENS - 5 * request.amount
+    );
+    assert_eq!(state.created_spl_withdrawal_requests().len(), 5);
+    assert_eq!(state.created_spl_withdrawal_txs().len(), 1);
+    assert_eq!(bound_message(&state).instructions.len(), 7);
+}
+
+#[test]
+fn should_reject_invalid_spl_batch_bindings_without_changing_state() {
+    let request = setup_with_nonce();
+    for id in 100..106 {
+        accept(id, id, &request);
+    }
+    for indices in [
+        vec![],
+        vec![100, 100],
+        vec![100, 101, 102, 103, 104, 105],
+        vec![100, 106],
+    ] {
+        let before = read_state(Clone::clone);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                spl_transaction_created(&indices),
+                30
+            )))
+            .is_err()
+        );
+        read_state(|state| assert_eq!(state, &before));
+        assert_replay_matches();
+    }
+}
+
+#[test]
+fn should_reject_an_spl_batch_whose_combined_tokens_exceed_the_treasury() {
+    let mut request = setup_with_nonce();
+    request.amount = FUNDED_TOKENS / 2 + 1;
+    accept(100, 7, &request);
+    accept(101, 8, &request);
+    let before = read_state(Clone::clone);
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| record(
+            spl_transaction_created(&[100, 101]),
+            30
+        )))
+        .is_err()
+    );
+    read_state(|state| assert_eq!(state, &before));
+    assert_replay_matches();
 }
 
 #[test]
@@ -717,7 +1058,7 @@ fn should_reject_spl_binding_without_treasury_tokens() {
     record(minter_public_key_fetched_event(), 3);
     init_balance_to(FUNDED_BALANCE);
     accept(100, 7, &request);
-    record(spl_transaction_created(100), 30);
+    record(spl_transaction_created(&[100]), 30);
 }
 
 #[test]
@@ -937,7 +1278,7 @@ fn should_reject_spl_binding_the_balance_cannot_pay() {
     accept(100, 7, &request);
     assert!(
         catch_unwind(AssertUnwindSafe(|| record(
-            spl_transaction_created(100),
+            spl_transaction_created(&[100]),
             30
         )))
         .is_err()
@@ -952,9 +1293,9 @@ fn should_reject_spl_binding_the_balance_cannot_pay() {
 fn should_not_rebind_or_refund_a_created_spl_withdrawal() {
     let request = setup_with_nonce();
     accept(100, 7, &request);
-    record(spl_transaction_created(100), 30);
+    record(spl_transaction_created(&[100]), 30);
     for event in [
-        spl_transaction_created(100),
+        spl_transaction_created(&[100]),
         EventType::AcceptedSplWithdrawalRequest(accepted_request(100, 8, &request)),
         EventType::FailedSplWithdrawalRequest(SplWithdrawalFeeReimbursementRequest {
             cksol_burn_block_index: 100.into(),
@@ -975,7 +1316,7 @@ fn should_reject_spl_binding_without_pending_request_or_available_nonce() {
     let request = setup_with_nonce();
     assert!(
         catch_unwind(AssertUnwindSafe(|| record(
-            spl_transaction_created(100),
+            spl_transaction_created(&[100]),
             30
         )))
         .is_err()
@@ -983,10 +1324,10 @@ fn should_reject_spl_binding_without_pending_request_or_available_nonce() {
     assert_eq!(assert_replay_matches().nonce_pool().num_free_accounts(), 1);
     accept(100, 7, &request);
     accept(101, 8, &request);
-    record(spl_transaction_created(100), 30);
+    record(spl_transaction_created(&[100]), 30);
     assert!(
         catch_unwind(AssertUnwindSafe(|| record(
-            spl_transaction_created(101),
+            spl_transaction_created(&[101]),
             40
         )))
         .is_err()
@@ -1004,7 +1345,7 @@ fn should_reject_spl_binding_without_pending_request_or_available_nonce() {
 fn should_not_bind_a_sol_transaction_to_an_spl_nonce() {
     let request = setup_with_nonce();
     accept(100, 7, &request);
-    record(spl_transaction_created(100), 30);
+    record(spl_transaction_created(&[100]), 30);
     record(
         EventType::AcceptedWithdrawalRequest(WithdrawalRequest {
             account: request.account,

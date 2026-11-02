@@ -239,7 +239,7 @@ fn create_withdrawal(terms: SplWithdrawalRequestTerms) {
         process_event(
             state,
             EventType::CreatedSplWithdrawalTransaction {
-                cksol_burn_block_index: 42.into(),
+                burn_indices: vec![42.into()],
                 nonce_account: NONCE_ACCOUNT,
                 nonce_value: Hash::new_from_array([18; 32]),
             },
@@ -275,7 +275,7 @@ fn submitted_withdrawal(program: TokenProgram) {
                 message: message.into(),
                 signers: vec![Signer::Minter],
                 purpose: TransactionPurpose::SplWithdrawal {
-                    cksol_burn_block_index: 42.into(),
+                    burn_indices: vec![42.into()],
                 },
             },
             &runtime,
@@ -568,7 +568,7 @@ mod transaction_creation {
         assert_eq!(events_after.len(), events_before.len() + 2);
         events_after
             .expect_contains_event_eq(EventType::CreatedSplWithdrawalTransaction {
-                cksol_burn_block_index: 42.into(),
+                burn_indices: vec![42.into()],
                 nonce_account: NONCE_ACCOUNT,
                 nonce_value: durable_nonce(1),
             })
@@ -577,7 +577,7 @@ mod transaction_creation {
                 message: expected_message.clone().into(),
                 signers: vec![Signer::Minter],
                 purpose: TransactionPurpose::SplWithdrawal {
-                    cksol_burn_block_index: 42.into(),
+                    burn_indices: vec![42.into()],
                 },
             });
         assert_eq!(runtime.sent_transactions().len(), 1);
@@ -632,6 +632,63 @@ mod transaction_creation {
 
 mod transaction_signing {
     use super::*;
+
+    #[tokio::test]
+    async fn should_sign_one_spl_transaction_for_all_requests_in_a_created_batch() {
+        let token = setup_transactions(1, FUNDED_BALANCE, TokenProgram::Classic);
+        queue_withdrawal(&token, 42, false);
+        queue_withdrawal(&token, 43, true);
+        mutate_state(|state| {
+            process_event(
+                state,
+                EventType::CreatedSplWithdrawalTransaction {
+                    burn_indices: vec![42.into(), 43.into()],
+                    nonce_account: NONCE_ACCOUNT,
+                    nonce_value: Hash::new_from_array([18; 32]),
+                },
+                &TestCanisterRuntime::new().with_time(123),
+            )
+        });
+        let message = read_state(|state| {
+            state
+                .bound_spl_withdrawal_message(
+                    &NONCE_ACCOUNT,
+                    &state.created_spl_withdrawal_txs()[&NONCE_ACCOUNT],
+                )
+                .unwrap()
+        });
+        let balance_before = read_state(|state| state.balance());
+        let runtime = TestCanisterRuntime::new()
+            .with_time(321)
+            .add_signer(sign_as_minter());
+
+        let transactions = sign_transactions_batch(&runtime, MINTER_ADDRESS).await;
+
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].message, message);
+        assert_eq!(transactions[0].signatures, vec![minter_signature()]);
+        EventsAssert::from_recorded().expect_contains_event_eq(EventType::SubmittedTransaction {
+            signature: minter_signature(),
+            message: message.into(),
+            signers: vec![Signer::Minter],
+            purpose: TransactionPurpose::SplWithdrawal {
+                burn_indices: vec![42.into(), 43.into()],
+            },
+        });
+        read_state(|state| {
+            assert!(state.created_spl_withdrawal_requests().is_empty());
+            assert!(state.created_spl_withdrawal_txs().is_empty());
+            assert_eq!(state.sent_spl_withdrawal_requests().len(), 2);
+            for id in [42_u64, 43] {
+                assert_eq!(
+                    state.sent_spl_withdrawal_requests()[&id.into()].signature,
+                    minter_signature()
+                );
+            }
+            assert_eq!(state.balance(), balance_before);
+            assert_eq!(state.nonce_pool().num_free_accounts(), 0);
+        });
+    }
 
     #[tokio::test]
     async fn should_re_sign_the_identical_spl_message_after_a_signing_failure() {
@@ -701,7 +758,7 @@ mod transaction_signing {
                             message: message.into(),
                             signers: vec![Signer::Minter],
                             purpose: TransactionPurpose::SplWithdrawal {
-                                cksol_burn_block_index: 42.into()
+                                burn_indices: vec![42.into()]
                             },
                         }
                     ),
