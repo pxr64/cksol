@@ -774,7 +774,7 @@ type TransactionPurpose = variant {
     };
     // Withdraw SPL tokens using the durable nonce bound to the accepted request.
     SplWithdrawal : record {
-        cksol_burn_block_index: LedgerBurnIndex;
+        burn_indices: vec LedgerBurnIndex;
     };
 };
 
@@ -1007,9 +1007,9 @@ type EventType = variant {
     QuarantinedSplWithdrawalFeeReimbursement : record {
         cksol_burn_block_index : nat64;
     };
-    // An accepted SPL withdrawal was bound to a durable nonce before signing.
+    // Accepted SPL withdrawals were bound to one durable nonce before signing.
     CreatedSplWithdrawalTransaction : record {
-        cksol_burn_block_index : nat64;
+        burn_indices : vec nat64;
         nonce_account : Address;
         nonce_value : Hash;
     };
@@ -1027,6 +1027,7 @@ type EventType = variant {
     QuarantinedSplWithdrawalReimbursement : record {
         cksol_burn_block_index : nat64;
     };
+
 };
 
 // A minter event.

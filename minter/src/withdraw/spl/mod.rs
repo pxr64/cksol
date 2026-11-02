@@ -89,7 +89,7 @@ pub(super) fn create_transaction<R: CanisterRuntime>(
         process_event(
             state,
             EventType::CreatedSplWithdrawalTransaction {
-                cksol_burn_block_index: request.cksol_burn_block_index,
+                burn_indices: vec![request.cksol_burn_block_index],
                 nonce_account,
                 nonce_value,
             },
@@ -108,7 +108,7 @@ pub(super) fn bound_withdrawal(
     Ok(BoundWithdrawal {
         nonce_account: *nonce_account,
         purpose: TransactionPurpose::SplWithdrawal {
-            cksol_burn_block_index: created.cksol_burn_block_index,
+            burn_indices: created.burn_indices.clone(),
         },
         message: state.bound_spl_withdrawal_message(nonce_account, created)?,
     })

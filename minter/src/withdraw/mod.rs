@@ -366,7 +366,7 @@ fn bound_withdrawals(state: &State, minter_address: &Address) -> Vec<BoundWithdr
         .iter()
         .map(|(nonce_account, created)| {
             (
-                Some(created.cksol_burn_block_index),
+                created.burn_indices.iter().min().copied(),
                 nonce_account,
                 spl::bound_withdrawal(state, nonce_account, created),
             )

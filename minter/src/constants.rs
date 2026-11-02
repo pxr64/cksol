@@ -28,6 +28,9 @@ pub const MAX_CONCURRENT_RPC_CALLS: usize = 10;
 /// in a single round of a timer.
 pub const MAX_CONCURRENT_SIGNATURES: usize = 10;
 
+/// Maximum number of SPL withdrawals served by one durable-nonce transaction.
+pub const MAX_SPL_WITHDRAWALS_PER_NONCE_TX: usize = 5;
+
 /// Maximum number of attempts to fetch a recent block, each attempt consisting of
 /// at most one `getSlot` and one `getBlock` call.
 pub const GET_RECENT_BLOCK_MAX_TRIES: NonZeroUsize =

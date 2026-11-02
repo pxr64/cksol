@@ -10,7 +10,7 @@ use solana_transaction::Transaction;
 
 #[cfg(test)]
 mod tests;
-mod withdrawal;
+pub mod withdrawal;
 
 pub use withdrawal::{build_spl_withdrawal_instructions, build_spl_withdrawal_message};
 

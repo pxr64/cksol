@@ -212,11 +212,11 @@ impl From<EventType> for CandidEventType {
                 cksol_burn_block_index: *cksol_burn_block_index.get(),
             },
             EventType::CreatedSplWithdrawalTransaction {
-                cksol_burn_block_index,
+                burn_indices,
                 nonce_account,
                 nonce_value,
             } => CandidEventType::CreatedSplWithdrawalTransaction {
-                cksol_burn_block_index: *cksol_burn_block_index.get(),
+                burn_indices: burn_indices.into_iter().map(|index| *index.get()).collect(),
                 nonce_account: nonce_account.into(),
                 nonce_value: nonce_value.into(),
             },
@@ -284,11 +284,11 @@ impl From<TransactionPurpose> for CandidTransactionPurpose {
                     burn_indices: burn_indices.iter().map(|idx| *idx.get()).collect(),
                 }
             }
-            TransactionPurpose::SplWithdrawal {
-                cksol_burn_block_index,
-            } => CandidTransactionPurpose::SplWithdrawal {
-                cksol_burn_block_index: *cksol_burn_block_index.get(),
-            },
+            TransactionPurpose::SplWithdrawal { burn_indices } => {
+                CandidTransactionPurpose::SplWithdrawal {
+                    burn_indices: burn_indices.into_iter().map(|index| *index.get()).collect(),
+                }
+            }
             TransactionPurpose::SweepSplDeposits {
                 deposit_ids,
                 block_height,
@@ -530,11 +530,11 @@ impl TryFrom<CandidEventType> for EventType {
                 cksol_burn_block_index: LedgerBurnIndex::new(cksol_burn_block_index),
             },
             CandidEventType::CreatedSplWithdrawalTransaction {
-                cksol_burn_block_index,
+                burn_indices,
                 nonce_account,
                 nonce_value,
             } => EventType::CreatedSplWithdrawalTransaction {
-                cksol_burn_block_index: cksol_burn_block_index.into(),
+                burn_indices: burn_indices.into_iter().map(LedgerBurnIndex::new).collect(),
                 nonce_account: nonce_account.into(),
                 nonce_value: nonce_value.into(),
             },
@@ -634,11 +634,11 @@ impl From<CandidTransactionPurpose> for TransactionPurpose {
                     burn_indices: burn_indices.into_iter().map(LedgerBurnIndex::new).collect(),
                 }
             }
-            CandidTransactionPurpose::SplWithdrawal {
-                cksol_burn_block_index,
-            } => TransactionPurpose::SplWithdrawal {
-                cksol_burn_block_index: cksol_burn_block_index.into(),
-            },
+            CandidTransactionPurpose::SplWithdrawal { burn_indices } => {
+                TransactionPurpose::SplWithdrawal {
+                    burn_indices: burn_indices.into_iter().map(LedgerBurnIndex::new).collect(),
+                }
+            }
             CandidTransactionPurpose::SweepSplDeposits {
                 deposit_ids,
                 block_height,

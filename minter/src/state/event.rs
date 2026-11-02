@@ -339,11 +339,11 @@ pub enum EventType {
         #[cbor(n(0), with = "cbor::id")]
         cksol_burn_block_index: LedgerBurnIndex,
     },
-    /// An accepted SPL withdrawal was bound to a durable nonce before signing.
+    /// Accepted SPL withdrawals were bound to one durable nonce before signing.
     #[n(29)]
     CreatedSplWithdrawalTransaction {
-        #[cbor(n(0), with = "cbor::id")]
-        cksol_burn_block_index: LedgerBurnIndex,
+        #[cbor(n(0), with = "cbor::id_vec")]
+        burn_indices: Vec<LedgerBurnIndex>,
         #[cbor(n(1), with = "cbor::address")]
         nonce_account: Address,
         #[cbor(n(2), with = "cbor::hash")]
@@ -532,11 +532,11 @@ pub enum TransactionPurpose {
         #[n(1)]
         block_height: BlockHeight,
     },
-    /// Withdraw SPL tokens using the durable nonce bound to the accepted request.
+    /// Withdraw SPL tokens using the durable nonce bound to the accepted requests.
     #[n(7)]
     SplWithdrawal {
-        #[cbor(n(0), with = "cbor::id")]
-        cksol_burn_block_index: LedgerBurnIndex,
+        #[cbor(n(0), with = "cbor::id_vec")]
+        burn_indices: Vec<LedgerBurnIndex>,
     },
 }
 

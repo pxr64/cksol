@@ -272,10 +272,10 @@ pub enum EventType {
         /// The fee burn index on the ckSOL ledger, also the withdrawal ID.
         cksol_burn_block_index: u64,
     },
-    /// An accepted SPL withdrawal was bound to a durable nonce before signing.
+    /// Accepted SPL withdrawals were bound to one durable nonce before signing.
     CreatedSplWithdrawalTransaction {
-        /// The ckSOL fee burn index identifying the accepted withdrawal.
-        cksol_burn_block_index: u64,
+        /// The ckSOL fee burn indices identifying the withdrawals in transaction order.
+        burn_indices: Vec<u64>,
         /// The durable nonce account bound to this transaction.
         nonce_account: Address,
         /// The nonce value the transaction will carry.
@@ -363,10 +363,10 @@ pub enum TransactionPurpose {
         /// The block height of the block whose blockhash the transaction uses.
         block_height: u64,
     },
-    /// Withdraw SPL tokens using the durable nonce bound to the accepted request.
+    /// Withdraw SPL tokens using the durable nonce bound to the accepted requests.
     SplWithdrawal {
-        /// The ckSOL fee burn index identifying the withdrawal.
-        cksol_burn_block_index: u64,
+        /// The ckSOL fee burn indices identifying the withdrawals in transaction order.
+        burn_indices: Vec<u64>,
     },
 }
 
