@@ -47,8 +47,11 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
         EventType::FailedTransaction { signature } => {
             state.process_transaction_failed(signature, timestamp);
         }
+        EventType::SplitFailedSplWithdrawalBatch { signature } => {
+            state.process_split_failed_spl_withdrawal_batch(signature)
+        }
         EventType::SplitFailedSplSweep { signature } => {
-            state.process_split_failed_spl_sweep(signature, timestamp)
+            state.process_split_failed_spl_sweep(signature)
         }
         EventType::ReimbursedSplWithdrawal {
             cksol_burn_block_index,

@@ -163,6 +163,7 @@ pub struct State {
     operating_balance: Lamport,
     spl_treasury_balances: BTreeMap<Address, u64>,
     pending_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest>,
+    retrying_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest>,
     created_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest>,
     created_spl_withdrawal_txs: BTreeMap<Address, CreatedSplWithdrawalTransaction>,
     sent_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, SentSplWithdrawalRequest>,
@@ -841,11 +842,20 @@ impl State {
         &self.pending_spl_withdrawal_requests
     }
 
+    pub fn retrying_spl_withdrawal_requests(
+        &self,
+    ) -> &BTreeMap<LedgerBurnIndex, PendingSplWithdrawalRequest> {
+        &self.retrying_spl_withdrawal_requests
+    }
+
     pub fn spl_withdrawal_status(&self, cksol_burn_block_index: u64) -> WithdrawSplStatus {
         let burn_index = LedgerBurnIndex::from(cksol_burn_block_index);
         if self
             .pending_spl_withdrawal_requests
             .contains_key(&burn_index)
+            || self
+                .retrying_spl_withdrawal_requests
+                .contains_key(&burn_index)
             || self
                 .created_spl_withdrawal_requests
                 .contains_key(&burn_index)
@@ -1080,6 +1090,9 @@ impl State {
     fn has_spl_withdrawal_outcome(&self, burn_index: &LedgerBurnIndex) -> bool {
         self.pending_spl_withdrawal_requests
             .contains_key(burn_index)
+            || self
+                .retrying_spl_withdrawal_requests
+                .contains_key(burn_index)
             || self
                 .created_spl_withdrawal_requests
                 .contains_key(burn_index)
@@ -1641,14 +1654,59 @@ impl State {
                 self.nonce_pool.free(nonce_account)
             }
         }
-        self.record_failed_transaction(signature, transaction, failed_at);
+        self.record_failed_transaction(signature, transaction);
+        for (burn_index, sent) in self.take_failed_spl_withdrawals(signature) {
+            assert_eq!(
+                self.pending_spl_withdrawal_reimbursements.insert(
+                    burn_index,
+                    PendingSplWithdrawalReimbursement {
+                        request: sent.request.clone(),
+                        created_at: failed_at,
+                    }
+                ),
+                None,
+                "Attempted to queue a second SPL token reimbursement for withdrawal {burn_index}"
+            );
+            self.failed_spl_withdrawal_requests.insert(burn_index, sent);
+        }
     }
 
-    fn process_split_failed_spl_sweep(&mut self, signature: &Signature, failed_at: u64) {
+    fn process_split_failed_spl_sweep(&mut self, signature: &Signature) {
         let transaction = self.take_failed_spl_batch(signature);
         self.release_failed_spl_sweep_cost(signature);
         self.spl_deposits.retry_individually(signature);
-        self.record_failed_transaction(signature, transaction, failed_at);
+        self.record_failed_transaction(signature, transaction);
+    }
+
+    fn process_split_failed_spl_withdrawal_batch(&mut self, signature: &Signature) {
+        assert!(
+            self.sent_spl_withdrawal_requests
+                .values()
+                .filter(|sent| &sent.signature == signature)
+                .count()
+                > 1,
+            "Attempted to split a transaction that is not an SPL withdrawal batch"
+        );
+        let transaction = self.take_failed_transaction(signature);
+        let MinterTransaction::Withdrawal { nonce_account, .. } = &transaction else {
+            panic!("Attempted to split a transaction that is not a withdrawal");
+        };
+        self.nonce_pool.free(nonce_account);
+        self.record_failed_transaction(signature, transaction);
+        // The failed batch moved no tokens. Keep each request executable instead of reimbursing it.
+        for (burn_index, sent) in self.take_failed_spl_withdrawals(signature) {
+            assert_eq!(
+                self.retrying_spl_withdrawal_requests.insert(
+                    burn_index,
+                    PendingSplWithdrawalRequest {
+                        request: sent.request,
+                        created_at: sent.created_at,
+                    }
+                ),
+                None,
+                "Attempted to retry SPL withdrawal {burn_index} twice"
+            );
+        }
     }
 
     fn take_failed_transaction(&mut self, signature: &Signature) -> MinterTransaction {
@@ -1673,12 +1731,7 @@ impl State {
         transaction
     }
 
-    fn record_failed_transaction(
-        &mut self,
-        signature: &Signature,
-        transaction: MinterTransaction,
-        failed_at: u64,
-    ) {
+    fn record_failed_transaction(&mut self, signature: &Signature, transaction: MinterTransaction) {
         assert_eq!(
             self.failed_transactions.insert(*signature, transaction),
             None,
@@ -1689,12 +1742,19 @@ impl State {
             .for_each(|(burn_index, sent)| {
                 self.failed_withdrawal_requests.insert(burn_index, sent);
             });
+    }
+
+    fn take_failed_spl_withdrawals(
+        &mut self,
+        signature: &Signature,
+    ) -> Vec<(LedgerBurnIndex, SentSplWithdrawalRequest)> {
         let failed_spl_withdrawals: Vec<_> = self
             .sent_spl_withdrawal_requests
             .extract_if(.., |_, sent| &sent.signature == signature)
             .collect();
         if !failed_spl_withdrawals.is_empty() {
-            // Failed Solana transactions pay one fee and create no token accounts.
+            // Failed Solana transactions roll back ATA creation but still pay the transaction fee.
+            // Subtract the spent fee from the reservation so only unused ATA rent is returned.
             let reserved = self.spl_withdrawal_transaction_cost(
                 failed_spl_withdrawals
                     .iter()
@@ -1705,7 +1765,7 @@ impl State {
                 .checked_add(reserved - FEE_PER_SIGNATURE)
                 .expect("BUG: returning unspent SPL withdrawal rent overflows the balance");
         }
-        for (burn_index, sent) in failed_spl_withdrawals {
+        for (_, sent) in &failed_spl_withdrawals {
             let treasury = self
                 .spl_treasury_balances
                 .entry(sent.request.terms.mint)
@@ -1713,19 +1773,8 @@ impl State {
             *treasury = treasury.checked_add(sent.request.terms.amount).expect(
                 "BUG: returning the tokens of a failed SPL withdrawal overflows the treasury",
             );
-            assert_eq!(
-                self.pending_spl_withdrawal_reimbursements.insert(
-                    burn_index,
-                    PendingSplWithdrawalReimbursement {
-                        request: sent.request.clone(),
-                        created_at: failed_at,
-                    }
-                ),
-                None,
-                "Attempted to queue a second SPL token reimbursement for withdrawal {burn_index}"
-            );
-            self.failed_spl_withdrawal_requests.insert(burn_index, sent);
         }
+        failed_spl_withdrawals
     }
 }
 
@@ -1838,6 +1887,7 @@ impl TryFrom<InitArgs> for State {
             operating_balance: 0,
             spl_treasury_balances: BTreeMap::new(),
             pending_spl_withdrawal_requests: BTreeMap::new(),
+            retrying_spl_withdrawal_requests: BTreeMap::new(),
             created_spl_withdrawal_requests: BTreeMap::new(),
             created_spl_withdrawal_txs: BTreeMap::new(),
             sent_spl_withdrawal_requests: BTreeMap::new(),

@@ -905,6 +905,7 @@ mod state_from_init_args {
                 operating_balance: 0,
                 spl_treasury_balances: BTreeMap::new(),
                 pending_spl_withdrawal_requests: BTreeMap::new(),
+                retrying_spl_withdrawal_requests: BTreeMap::new(),
                 created_spl_withdrawal_requests: BTreeMap::new(),
                 created_spl_withdrawal_txs: BTreeMap::new(),
                 sent_spl_withdrawal_requests: BTreeMap::new(),

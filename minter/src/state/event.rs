@@ -371,6 +371,12 @@ pub enum EventType {
         #[cbor(n(0), with = "cbor::id")]
         cksol_burn_block_index: LedgerBurnIndex,
     },
+    /// A definitively failed SPL batch was split into individual withdrawal retries.
+    #[n(33)]
+    SplitFailedSplWithdrawalBatch {
+        #[cbor(n(0), with = "cbor::signature")]
+        signature: Signature,
+    },
 }
 
 /// A ckSOL fee reimbursement for an SPL withdrawal whose token burn failed.

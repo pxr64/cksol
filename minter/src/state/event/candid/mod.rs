@@ -169,6 +169,11 @@ impl From<EventType> for CandidEventType {
             EventType::QuarantinedSplSweep { signature } => CandidEventType::QuarantinedSplSweep {
                 signature: CandidSignature::from(signature),
             },
+            EventType::SplitFailedSplWithdrawalBatch { signature } => {
+                CandidEventType::SplitFailedSplWithdrawalBatch {
+                    signature: CandidSignature::from(signature),
+                }
+            }
             EventType::SplitFailedSplSweep { signature } => CandidEventType::SplitFailedSplSweep {
                 signature: CandidSignature::from(signature),
             },
@@ -485,6 +490,11 @@ impl TryFrom<CandidEventType> for EventType {
             CandidEventType::QuarantinedSplSweep { signature } => EventType::QuarantinedSplSweep {
                 signature: Signature::from(signature),
             },
+            CandidEventType::SplitFailedSplWithdrawalBatch { signature } => {
+                EventType::SplitFailedSplWithdrawalBatch {
+                    signature: Signature::from(signature),
+                }
+            }
             CandidEventType::SplitFailedSplSweep { signature } => EventType::SplitFailedSplSweep {
                 signature: Signature::from(signature),
             },

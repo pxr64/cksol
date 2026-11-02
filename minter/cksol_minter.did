@@ -903,6 +903,10 @@ type EventType = variant {
         // The burned amount.
         amount : Lamport;
     };
+    // A definitively failed SPL batch was split into individual withdrawal retries.
+    SplitFailedSplWithdrawalBatch : record {
+        signature: Signature;
+    };
     // A batch failed on chain and its SPL deposits were requeued for individual sweeps.
     SplitFailedSplSweep : record {
         // The signature of the confirmed failed batch transaction.

@@ -2065,6 +2065,8 @@ pub mod arb {
                     }
                 }
             ),
+            arb_signature()
+                .prop_map(|signature| EventType::SplitFailedSplWithdrawalBatch { signature }),
             arb_ledger_burn_index().prop_map(|cksol_burn_block_index| {
                 EventType::QuarantinedSplWithdrawalReimbursement {
                     cksol_burn_block_index,

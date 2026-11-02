@@ -819,6 +819,129 @@ fn should_return_each_unused_ata_rent_once_after_an_spl_batch_fails() {
 }
 
 #[test]
+fn should_split_a_failed_spl_batch_without_reimbursing_its_requests() {
+    for shared_destination in [false, true] {
+        let (indices, _) = setup_submitted_spl_batch(shared_destination);
+        let sent = read_state(|state| state.sent_spl_withdrawal_requests().clone());
+        let mut fresh = sent.values().next().unwrap().request.terms.clone();
+        fresh.create_destination_account = false;
+        accept(200, 200, &fresh);
+        record(
+            EventType::SplitFailedSplWithdrawalBatch {
+                signature: minter_signature(),
+            },
+            80,
+        );
+
+        let state = assert_replay_matches();
+        assert_eq!(state.balance(), FUNDED_BALANCE - FEE_PER_SIGNATURE);
+        assert_eq!(state.nonce_pool().num_free_accounts(), 1);
+        assert!(state.submitted_transactions().is_empty());
+        assert!(
+            state
+                .failed_transactions()
+                .contains_key(&minter_signature())
+        );
+        assert!(state.sent_spl_withdrawal_requests().is_empty());
+        assert!(state.failed_spl_withdrawal_requests().is_empty());
+        assert!(state.pending_spl_withdrawal_reimbursements().is_empty());
+        assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
+        assert_eq!(
+            state.spl_withdrawal_reserved_cost(&minter_signature()),
+            None
+        );
+        assert_eq!(state.spl_treasury_balance(&[2; 32].into()), FUNDED_TOKENS);
+        if !shared_destination {
+            assert_eq!(state.spl_treasury_balance(&[5; 32].into()), 200_000_000);
+        }
+        assert_eq!(
+            state.retrying_spl_withdrawal_requests().len(),
+            indices.len()
+        );
+        for id in indices {
+            let before = &sent[&id.into()];
+            assert_eq!(
+                state.retrying_spl_withdrawal_requests()[&id.into()],
+                PendingSplWithdrawalRequest {
+                    request: before.request.clone(),
+                    created_at: before.created_at,
+                }
+            );
+            assert_eq!(state.spl_withdrawal_status(id), WithdrawSplStatus::Pending);
+        }
+        assert_eq!(state.pending_spl_withdrawal_requests().len(), 1);
+        assert!(
+            state
+                .pending_spl_withdrawal_requests()
+                .contains_key(&200.into())
+        );
+    }
+}
+
+#[test]
+fn should_reject_refunds_and_reused_burns_while_an_spl_withdrawal_is_retrying() {
+    setup_submitted_spl_batch(false);
+    let sent = read_state(|state| state.sent_spl_withdrawal_requests()[&100.into()].clone());
+    record(
+        EventType::SplitFailedSplWithdrawalBatch {
+            signature: minter_signature(),
+        },
+        80,
+    );
+    let before = read_state(Clone::clone);
+    for event in [
+        EventType::AcceptedSplWithdrawalRequest(sent.request.clone()),
+        EventType::AcceptedSplWithdrawalRequest(SplWithdrawalRequest {
+            cksol_burn_block_index: 200.into(),
+            ..sent.request.clone()
+        }),
+        EventType::FailedSplWithdrawalRequest(SplWithdrawalFeeReimbursementRequest {
+            cksol_burn_block_index: 100.into(),
+            reimbursed_amount: sent.request.terms.fee,
+            to: sent.request.terms.account,
+        }),
+        EventType::SplitFailedSplWithdrawalBatch {
+            signature: minter_signature(),
+        },
+        EventType::FailedTransaction {
+            signature: minter_signature(),
+        },
+        EventType::SucceededSplWithdrawalTransaction {
+            signature: minter_signature(),
+            lamports_spent: FEE_PER_SIGNATURE,
+        },
+    ] {
+        assert!(catch_unwind(AssertUnwindSafe(|| record(event, 90))).is_err());
+        read_state(|state| assert_eq!(state, &before));
+    }
+    assert_replay_matches();
+}
+
+#[test]
+fn should_reject_spl_withdrawal_splitting_without_a_submitted_batch() {
+    for submitted in [false, true] {
+        reset_state();
+        reset_events();
+        setup_created_spl_withdrawal(TokenProgram::Classic, false);
+        if submitted {
+            record(submitted_spl_withdrawal(100), 40);
+        }
+        let before = read_state(Clone::clone);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                EventType::SplitFailedSplWithdrawalBatch {
+                    signature: minter_signature()
+                },
+                80
+            )))
+            .is_err()
+        );
+        read_state(|state| assert_eq!(state, &before));
+        assert_replay_matches();
+    }
+}
+
+#[test]
 fn should_reject_spl_batch_spend_above_the_whole_transaction_reservation() {
     let (_, reserved) = setup_submitted_spl_batch(false);
     let before = read_state(Clone::clone);
