@@ -28,6 +28,7 @@ use cksol_types_internal::InitArgs;
 use ic_stable_structures::Storable;
 use sol_rpc_types::Lamport;
 use solana_hash::Hash;
+use solana_signature::Signature;
 use solana_transaction::Message;
 use std::{
     collections::BTreeMap,
@@ -165,14 +166,20 @@ fn setup_created_spl_batch() -> [SplWithdrawalRequestTerms; 2] {
     [first, second]
 }
 
-/// Submits either five requests sharing one ATA or two requests using different token programs.
+/// Submits a batch and returns its withdrawal IDs (ckSOL fee-burn indices) and reserved SOL.
+/// `shared_destination` selects five requests sharing one ATA; otherwise the batch contains
+/// two requests for different mints, one classic SPL and one Token-2022.
 fn setup_submitted_spl_batch(shared_destination: bool) -> (Vec<u64>, Lamport) {
     reset_state();
     reset_events();
     let (indices, reserved) = if shared_destination {
         let mut request = setup_with_nonce();
+        // All five requests use the same mint and destination wallet, so they share an ATA.
         for id in 100..105 {
+            // The first request needs no creation instruction. The other four request
+            // creation of the same ATA, whose rent must be reserved only once.
             request.create_destination_account = id != 100;
+            // Use `id` for both ledger burn indices just to keep this fixture simple.
             accept(id, id, &request);
         }
         let indices = vec![100, 101, 102, 103, 104];
@@ -182,6 +189,8 @@ fn setup_submitted_spl_batch(shared_destination: bool) -> (Vec<u64>, Lamport) {
             FEE_PER_SIGNATURE + TokenProgram::Classic.account_rent_exemption(),
         )
     } else {
+        // ID 100 withdraws classic SPL; ID 101 withdraws Token-2022.
+        // Both request ATA creation for their distinct mints, so reserve both rents.
         setup_created_spl_batch();
         (
             vec![100, 101],
@@ -190,6 +199,7 @@ fn setup_submitted_spl_batch(shared_destination: bool) -> (Vec<u64>, Lamport) {
                 + TokenProgram::Token2022.account_rent_exemption(),
         )
     };
+    // Both setups have bound their requests to a nonce. Submit them under one signature.
     record(submitted_spl_withdrawals(&indices), 70);
     (indices, reserved)
 }
@@ -262,6 +272,159 @@ fn assert_replay_matches() -> State {
     let replayed = replay_events(events);
     read_state(|state| assert_eq!(state, &replayed));
     replayed
+}
+
+/// Takes one original request from the retry queue and reserves a transaction for it.
+fn create_individual_spl_retry(
+    id: u64,
+    nonce_value: Hash,
+    created_at: u64,
+) -> PendingSplWithdrawalRequest {
+    let before = read_state(Clone::clone);
+    let pending = before.retrying_spl_withdrawal_requests()[&id.into()].clone();
+    let terms = &pending.request.terms;
+    let reserved = before.spl_withdrawal_transaction_cost(std::iter::once(terms));
+    record(
+        EventType::CreatedSplWithdrawalTransaction {
+            burn_indices: vec![id.into()],
+            nonce_account: NONCE_ACCOUNT,
+            nonce_value,
+        },
+        created_at,
+    );
+    // Replay the encoded history after each transition, as on an upgrade.
+    let created = assert_replay_matches();
+    assert_eq!(
+        created.created_spl_withdrawal_requests()[&id.into()],
+        pending
+    );
+    assert_eq!(
+        created.created_spl_withdrawal_txs()[&NONCE_ACCOUNT].burn_indices,
+        vec![id.into()]
+    );
+    assert_eq!(bound_message(&created).recent_blockhash, nonce_value);
+    assert_eq!(created.balance(), before.balance() - reserved);
+    assert_eq!(
+        created.spl_treasury_balance(&terms.mint),
+        before.spl_treasury_balance(&terms.mint) - terms.amount
+    );
+    assert_eq!(created.nonce_pool().num_free_accounts(), 0);
+    assert!(
+        !created
+            .retrying_spl_withdrawal_requests()
+            .contains_key(&id.into())
+    );
+    pending
+}
+
+/// Submits the retry with its own signature, preserving the original burns and acceptance time.
+fn submit_individual_spl_retry(
+    pending: &PendingSplWithdrawalRequest,
+    signature: Signature,
+    submitted_at: u64,
+) {
+    let id = *pending.request.cksol_burn_block_index.get();
+    let mut submitted = submitted_spl_withdrawal(id);
+    let EventType::SubmittedTransaction {
+        signature: submitted_signature,
+        ..
+    } = &mut submitted
+    else {
+        unreachable!();
+    };
+    *submitted_signature = signature;
+    record(submitted, submitted_at);
+    let sent = assert_replay_matches();
+    assert_eq!(
+        sent.sent_spl_withdrawal_requests()[&id.into()].request,
+        pending.request
+    );
+    assert_eq!(
+        sent.sent_spl_withdrawal_requests()[&id.into()].created_at,
+        pending.created_at
+    );
+    let reserved = sent.spl_withdrawal_transaction_cost(std::iter::once(&pending.request.terms));
+    assert_eq!(
+        sent.spl_withdrawal_reserved_cost(&signature),
+        Some(reserved)
+    );
+
+    // An individual retry cannot be split again into further retries.
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| record(
+            EventType::SplitFailedSplWithdrawalBatch { signature },
+            submitted_at + 5
+        )))
+        .is_err()
+    );
+    read_state(|state| assert_eq!(state, &sent));
+}
+
+/// Checks that success completes the request, while terminal failure queues its full reimbursement.
+fn finalize_individual_spl_retry(
+    pending: &PendingSplWithdrawalRequest,
+    signature: Signature,
+    succeeds: bool,
+    finalized_at: u64,
+) {
+    let id = *pending.request.cksol_burn_block_index.get();
+    let terms = &pending.request.terms;
+    let before = read_state(Clone::clone);
+    let reserved = before.spl_withdrawal_reserved_cost(&signature).unwrap();
+    record(
+        if succeeds {
+            // Model a success where the destination ATA already exists, so only the fee is spent.
+            EventType::SucceededSplWithdrawalTransaction {
+                signature,
+                lamports_spent: FEE_PER_SIGNATURE,
+            }
+        } else {
+            EventType::FailedTransaction { signature }
+        },
+        finalized_at,
+    );
+    let finalized = assert_replay_matches();
+    // Both outcomes release unused rent and keep the transaction fee deducted.
+    assert_eq!(
+        finalized.balance(),
+        before.balance() + reserved - FEE_PER_SIGNATURE
+    );
+    assert_eq!(finalized.nonce_pool().num_free_accounts(), 1);
+    assert!(finalized.sent_spl_withdrawal_requests().is_empty());
+    if succeeds {
+        // Delivered tokens stay deducted from the treasury; no reimbursement is queued.
+        assert_eq!(
+            finalized.spl_withdrawal_status(id),
+            WithdrawSplStatus::TxFinalized(TxFinalizedStatus::Success {
+                transaction_id: signature.into()
+            })
+        );
+        assert!(
+            !finalized
+                .pending_spl_withdrawal_reimbursements()
+                .contains_key(&id.into())
+        );
+        assert_eq!(
+            finalized.spl_treasury_balance(&terms.mint),
+            before.spl_treasury_balance(&terms.mint)
+        );
+    } else {
+        // Terminal failure restores the tokens and queues their full ckSPL reimbursement.
+        let reimbursement = &finalized.pending_spl_withdrawal_reimbursements()[&id.into()];
+        assert_eq!(reimbursement.request, pending.request);
+        assert_eq!(reimbursement.created_at, finalized_at);
+        assert_eq!(
+            finalized.spl_withdrawal_status(id),
+            WithdrawSplStatus::ReimbursementPending {
+                transaction_id: signature.into(),
+                reimbursed_amount: terms.amount
+            }
+        );
+        assert_eq!(
+            finalized.spl_treasury_balance(&terms.mint),
+            before.spl_treasury_balance(&terms.mint) + terms.amount
+        );
+    }
 }
 
 #[test]
@@ -939,6 +1102,69 @@ fn should_reject_spl_withdrawal_splitting_without_a_submitted_batch() {
         read_state(|state| assert_eq!(state, &before));
         assert_replay_matches();
     }
+}
+
+#[test]
+fn should_replay_individual_spl_retries_through_success_and_terminal_failure() {
+    // Swap the outcomes so both token programs exercise success and terminal failure.
+    for (classic_succeeds, token_2022_succeeds) in [(true, false), (false, true)] {
+        setup_submitted_spl_batch(false);
+        record(
+            EventType::SplitFailedSplWithdrawalBatch {
+                signature: minter_signature(),
+            },
+            80,
+        );
+
+        // Retry withdrawal 100 (classic SPL) on its own.
+        let classic_signature = [30; 64].into();
+        let classic = create_individual_spl_retry(100, Hash::new_from_array([19; 32]), 90);
+        submit_individual_spl_retry(&classic, classic_signature, 100);
+        finalize_individual_spl_retry(&classic, classic_signature, classic_succeeds, 110);
+        assert_eq!(
+            read_state(|state| state.retrying_spl_withdrawal_requests().len()),
+            1
+        );
+
+        // Retry withdrawal 101 (Token-2022) using another nonce value and signature.
+        let token_2022_signature = [31; 64].into();
+        let token_2022 = create_individual_spl_retry(101, Hash::new_from_array([20; 32]), 120);
+        submit_individual_spl_retry(&token_2022, token_2022_signature, 130);
+        finalize_individual_spl_retry(&token_2022, token_2022_signature, token_2022_succeeds, 140);
+        assert!(read_state(|state| state
+            .retrying_spl_withdrawal_requests()
+            .is_empty()));
+    }
+}
+
+#[test]
+fn should_require_spl_withdrawal_retries_to_be_sent_alone() {
+    setup_submitted_spl_batch(false);
+    record(
+        EventType::SplitFailedSplWithdrawalBatch {
+            signature: minter_signature(),
+        },
+        80,
+    );
+    let terms = read_state(|state| {
+        state.retrying_spl_withdrawal_requests()[&100.into()]
+            .request
+            .terms
+            .clone()
+    });
+    accept(200, 200, &terms);
+    let before = read_state(Clone::clone);
+    for indices in [&[100, 101][..], &[100, 200], &[200, 101]] {
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                spl_transaction_created(indices),
+                90
+            )))
+            .is_err()
+        );
+        read_state(|state| assert_eq!(state, &before));
+    }
+    assert_replay_matches();
 }
 
 #[test]

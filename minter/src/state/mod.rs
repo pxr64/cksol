@@ -1296,12 +1296,25 @@ impl State {
             burn_indices.len(),
             "Attempted to bind an SPL withdrawal twice in one transaction"
         );
+        let is_retry = burn_indices.iter().any(|burn_index| {
+            self.retrying_spl_withdrawal_requests
+                .contains_key(burn_index)
+        });
+        // A failed batch gets one individual attempt per request, never another batch.
+        assert!(
+            !is_retry || burn_indices.len() == 1,
+            "Attempted to batch an SPL withdrawal queued for individual retry"
+        );
+        let queued = if is_retry {
+            &self.retrying_spl_withdrawal_requests
+        } else {
+            &self.pending_spl_withdrawal_requests
+        };
         let cost = self.spl_withdrawal_transaction_cost(burn_indices.iter().map(|burn_index| {
-            &self
-                .pending_spl_withdrawal_requests
+            &queued
                 .get(burn_index)
                 .expect(
-                    "Attempted to create a transaction for an SPL withdrawal that is not pending",
+                    "Attempted to create a transaction for an SPL withdrawal that is not queued",
                 )
                 .request
                 .terms
@@ -1311,11 +1324,15 @@ impl State {
             .checked_sub(cost)
             .expect("BUG: insufficient minter balance for SPL withdrawal");
         self.nonce_pool.bind(nonce_account, nonce_value);
+        let queued = if is_retry {
+            &mut self.retrying_spl_withdrawal_requests
+        } else {
+            &mut self.pending_spl_withdrawal_requests
+        };
         for burn_index in burn_indices {
-            let withdrawal = self
-                .pending_spl_withdrawal_requests
+            let withdrawal = queued
                 .remove(burn_index)
-                .expect("BUG: a pending SPL withdrawal disappeared during transaction creation");
+                .expect("BUG: a queued SPL withdrawal disappeared during transaction creation");
             let treasury = self
                 .spl_treasury_balances
                 .entry(withdrawal.request.terms.mint)
