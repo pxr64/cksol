@@ -197,7 +197,7 @@ async fn sweep_and_mint_spl_deposit(
     }
 }
 
-async fn withdraw_spl_to_an_existing_ata_on_the_validator(token_program: Address) {
+async fn withdraw_spl_on_the_validator(token_program: Address, create_destination_account: bool) {
     const AMOUNT: u64 = 500_000;
 
     let validator = SolanaTestValidator::start().await;
@@ -213,13 +213,40 @@ async fn withdraw_spl_to_an_existing_ata_on_the_validator(token_program: Address
         .await;
     let ledger = setup.ledger_with_id(ledger_id);
     let destination = Keypair::new();
-    let destination_ata = validator
-        .mint_to_for_program(&funder, &mint, &destination.pubkey(), 0, token_program)
-        .await;
-    assert_eq!(validator.get_token_balance(&destination_ata).await, 0);
+    let destination_ata: Address = get_associated_token_address_with_program_id(
+        &destination.pubkey().to_bytes().into(),
+        &mint.to_bytes().into(),
+        &token_program.to_bytes().into(),
+    )
+    .to_bytes()
+    .into();
+    let destination_rent = if create_destination_account {
+        let rpc = validator.rpc_client();
+        assert!(
+            rpc.get_account_with_commitment(&destination_ata, CommitmentConfig::finalized())
+                .await
+                .unwrap()
+                .value
+                .is_none()
+        );
+        // Both ATAs use the same mint and program, so their account sizes must match.
+        let token_account_len = rpc.get_account(&treasury).await.unwrap().data.len();
+        rpc.get_minimum_balance_for_rent_exemption(token_account_len)
+            .await
+            .unwrap()
+    } else {
+        assert_eq!(
+            validator
+                .mint_to_for_program(&funder, &mint, &destination.pubkey(), 0, token_program)
+                .await,
+            destination_ata
+        );
+        assert_eq!(validator.get_token_balance(&destination_ata).await, 0);
+        0
+    };
 
     // The native funding helper mints ckSOL to the default account; fund the token subaccount's fee.
-    let fee = Setup::DEFAULT_WITHDRAWAL_FEE;
+    let fee = Setup::DEFAULT_WITHDRAWAL_FEE + destination_rent;
     setup
         .ledger()
         .transfer(account, fee + LEDGER_TRANSFER_FEE)
@@ -244,7 +271,7 @@ async fn withdraw_spl_to_an_existing_ata_on_the_validator(token_program: Address
             mint: mint.into(),
             amount: AMOUNT,
             address: destination.pubkey().to_string(),
-            create_destination_account: false,
+            create_destination_account,
         })
         .await
         .expect("withdraw_spl should burn the fee and tokens");
@@ -276,8 +303,14 @@ async fn withdraw_spl_to_an_existing_ata_on_the_validator(token_program: Address
     );
     assert_eq!(
         validator.get_balance(&MINTER_ADDRESS).await,
-        sol_before - FEE_PER_SIGNATURE
+        sol_before - FEE_PER_SIGNATURE - destination_rent
     );
+    if create_destination_account {
+        assert_eq!(
+            validator.get_balance(&destination_ata).await,
+            destination_rent
+        );
+    }
 
     setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
     setup
@@ -295,7 +328,10 @@ async fn withdraw_spl_to_an_existing_ata_on_the_validator(token_program: Address
     };
     let transaction = setup.minter().signed_transaction(&signature).await;
     assert_eq!(transaction.signatures.len(), 1);
-    assert_eq!(transaction.message.instructions.len(), 2);
+    assert_eq!(
+        transaction.message.instructions.len(),
+        if create_destination_account { 3 } else { 2 }
+    );
     let transfer = transaction.message.instructions.last().unwrap();
     assert_eq!(
         transaction.message.account_keys[transfer.program_id_index as usize],
@@ -303,7 +339,7 @@ async fn withdraw_spl_to_an_existing_ata_on_the_validator(token_program: Address
     );
     assert_eq!(
         setup.minter().get_minter_info().await.balance,
-        tracked_sol_before - FEE_PER_SIGNATURE
+        tracked_sol_before - FEE_PER_SIGNATURE - destination_rent
     );
     assert_eq!(ledger.balance_of(account).await, ckspl_before - AMOUNT);
     assert_eq!(setup.ledger().balance_of(account).await, cksol_before - fee);
@@ -324,14 +360,20 @@ async fn should_sweep_and_mint_a_classic_spl_deposit_on_the_validator() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn should_withdraw_classic_spl_to_an_existing_ata_on_the_validator() {
-    withdraw_spl_to_an_existing_ata_on_the_validator(spl_token_interface::id().to_bytes().into())
-        .await;
+    withdraw_spl_on_the_validator(spl_token_interface::id().to_bytes().into(), false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn should_withdraw_token_2022_to_an_existing_ata_on_the_validator() {
-    withdraw_spl_to_an_existing_ata_on_the_validator(
-        spl_token_2022_interface::id().to_bytes().into(),
-    )
-    .await;
+    withdraw_spl_on_the_validator(spl_token_2022_interface::id().to_bytes().into(), false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_create_a_classic_spl_destination_ata_on_the_validator() {
+    withdraw_spl_on_the_validator(spl_token_interface::id().to_bytes().into(), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_create_a_token_2022_destination_ata_on_the_validator() {
+    withdraw_spl_on_the_validator(spl_token_2022_interface::id().to_bytes().into(), true).await;
 }
