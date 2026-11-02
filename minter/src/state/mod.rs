@@ -162,9 +162,12 @@ pub struct State {
     sent_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, SentSplWithdrawalRequest>,
     successful_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, SentSplWithdrawalRequest>,
     failed_spl_withdrawal_requests: BTreeMap<LedgerBurnIndex, SentSplWithdrawalRequest>,
-    pending_spl_withdrawal_reimbursements: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalReimbursement>,
-    completed_spl_withdrawal_reimbursements: BTreeMap<LedgerBurnIndex, CompletedSplWithdrawalReimbursement>,
-    quarantined_spl_withdrawal_reimbursements: BTreeMap<LedgerBurnIndex, PendingSplWithdrawalReimbursement>,
+    pending_spl_withdrawal_reimbursements:
+        BTreeMap<LedgerBurnIndex, PendingSplWithdrawalReimbursement>,
+    completed_spl_withdrawal_reimbursements:
+        BTreeMap<LedgerBurnIndex, CompletedSplWithdrawalReimbursement>,
+    quarantined_spl_withdrawal_reimbursements:
+        BTreeMap<LedgerBurnIndex, PendingSplWithdrawalReimbursement>,
     spl_withdrawal_token_burns: BTreeSet<(Principal, LedgerBurnIndex)>,
     pending_spl_withdrawal_fee_reimbursements:
         BTreeMap<LedgerBurnIndex, PendingSplWithdrawalFeeReimbursement>,

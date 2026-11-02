@@ -625,6 +625,44 @@ mod withdrawal_finalization {
     }
 
     #[tokio::test]
+    async fn should_rebroadcast_an_spl_withdrawal_with_an_unchanged_nonce_unchanged() {
+        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            reset_state();
+            reset_events();
+            let signature = submit_signed_spl_withdrawal(token_program);
+            let original_transaction = encoded_submitted_transaction(&signature);
+            let original_state = read_state(Clone::clone);
+            let events_before = EventsAssert::from_recorded();
+            let runtime = TestCanisterRuntime::new()
+                .with_increasing_time_from(20 + min_rebroadcast_age_nanos())
+                .add_stub_response(nonce_read(BOUND_NONCE_SEED))
+                .add_stub_response(SendTransactionResult::Consistent(Ok(signature.into())));
+
+            finalize_transactions(runtime.clone()).await;
+
+            let sent = runtime.sent_transactions();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].get_transaction(), original_transaction);
+            assert_eq!(sent[0].skip_preflight, Some(true));
+            assert_eq!(
+                called_methods(&runtime),
+                vec!["getAccountInfo", "sendTransaction"]
+            );
+            assert_eq!(EventsAssert::from_recorded(), events_before);
+            read_state(|state| {
+                assert_eq!(state, &original_state);
+                assert_eq!(
+                    state.sent_spl_withdrawal_requests()[&100.into()].signature,
+                    signature
+                );
+                assert_eq!(state.nonce_pool().num_free_accounts(), 0);
+                assert!(state.pending_spl_withdrawal_reimbursements().is_empty());
+                assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
+            });
+        }
+    }
+
+    #[tokio::test]
     async fn should_rebroadcast_a_withdrawal_with_an_unchanged_nonce_only_after_the_minimum_age() {
         setup_with_signing_key();
         let signature = submit_signed_withdrawal_bound_to(1, BOUND_NONCE_SEED);
@@ -672,6 +710,44 @@ mod withdrawal_finalization {
     }
 
     #[tokio::test]
+    async fn should_take_no_decision_on_a_stale_nonce_read_for_an_spl_withdrawal() {
+        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            reset_state();
+            reset_events();
+            setup_with_signing_key();
+            // Record an earlier transaction so the pool recognizes this nonce value as stale.
+            let landed = submit_signed_withdrawal_bound_to(1, STALE_NONCE_SEED);
+            events::succeed_transaction(landed);
+            let signature = record_signed_spl_withdrawal(token_program);
+            let original_state = read_state(Clone::clone);
+            let events_before = EventsAssert::from_recorded();
+            let runtime = TestCanisterRuntime::new()
+                .with_increasing_time_from(20 + min_rebroadcast_age_nanos())
+                .add_stub_response(nonce_read(STALE_NONCE_SEED));
+
+            finalize_transactions(runtime.clone()).await;
+
+            assert_eq!(called_methods(&runtime), vec!["getAccountInfo"]);
+            assert!(runtime.sent_transactions().is_empty());
+            assert_eq!(EventsAssert::from_recorded(), events_before);
+            read_state(|state| {
+                assert_eq!(state, &original_state);
+                assert_eq!(
+                    state.sent_spl_withdrawal_requests()[&100.into()].signature,
+                    signature
+                );
+                assert_eq!(state.nonce_pool().num_free_accounts(), 0);
+                assert!(state.pending_spl_withdrawal_reimbursements().is_empty());
+                assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
+            });
+            assert_eq!(
+                undecided_withdrawal_transaction_count(UndecidedWithdrawalReason::StaleNonce),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn should_keep_the_nonce_account_bound_until_the_outcome_is_known() {
         setup_with_signing_key();
         let signature = submit_signed_withdrawal_bound_to(1, BOUND_NONCE_SEED);
@@ -694,6 +770,46 @@ mod withdrawal_finalization {
             undecided_withdrawal_transaction_count(UndecidedWithdrawalReason::UnresolvedOutcome),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn should_keep_an_spl_withdrawal_unresolved_until_its_transaction_is_available() {
+        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            reset_state();
+            reset_events();
+            let signature = submit_signed_spl_withdrawal(token_program);
+            let original_state = read_state(Clone::clone);
+            let events_before = EventsAssert::from_recorded();
+            let runtime = TestCanisterRuntime::new()
+                .with_increasing_time_from(20 + min_rebroadcast_age_nanos())
+                .add_stub_response(nonce_read(UNSEEN_NONCE_SEED))
+                .add_stub_response(GetTransactionResult::Consistent(Ok(None)));
+
+            finalize_transactions(runtime.clone()).await;
+
+            assert_eq!(
+                called_methods(&runtime),
+                vec!["getAccountInfo", "getTransaction"]
+            );
+            assert!(runtime.sent_transactions().is_empty());
+            assert_eq!(EventsAssert::from_recorded(), events_before);
+            read_state(|state| {
+                assert_eq!(state, &original_state);
+                assert_eq!(
+                    state.sent_spl_withdrawal_requests()[&100.into()].signature,
+                    signature
+                );
+                assert_eq!(state.nonce_pool().num_free_accounts(), 0);
+                assert!(state.pending_spl_withdrawal_reimbursements().is_empty());
+                assert!(state.pending_spl_withdrawal_fee_reimbursements().is_empty());
+            });
+            assert_eq!(
+                undecided_withdrawal_transaction_count(
+                    UndecidedWithdrawalReason::UnresolvedOutcome
+                ),
+                1
+            );
+        }
     }
 
     #[tokio::test]
@@ -815,6 +931,11 @@ fn setup_with_signing_key() {
 
 fn submit_signed_spl_withdrawal(token_program: TokenProgram) -> solana_signature::Signature {
     setup_with_signing_key();
+    record_signed_spl_withdrawal(token_program)
+}
+
+/// Records a signed SPL withdrawal in the existing state, preserving the pool's nonce history.
+fn record_signed_spl_withdrawal(token_program: TokenProgram) -> solana_signature::Signature {
     let token = spl_token([4; 32].into(), token_program);
     let runtime = TestCanisterRuntime::new().with_time(20);
     mutate_state(|state| {
