@@ -9,8 +9,9 @@ use cksol_int_tests::{
 };
 use cksol_types::{
     AddSplTokenArgs, DepositSplArgs, DepositSplStatus, GetSplDepositAddressArgs, SplFeeMintStatus,
-    TxFinalizedStatus, WithdrawSplArgs, WithdrawSplStatus,
+    TxFinalizedStatus, WithdrawSplArgs, WithdrawSplOk, WithdrawSplStatus,
 };
+use cksol_types_internal::event::EventType;
 use icrc_ledger_types::icrc1::account::Account;
 use solana_address::Address;
 use solana_client::rpc_config::CommitmentConfig;
@@ -21,18 +22,49 @@ use spl_associated_token_account_interface::address::get_associated_token_addres
 use spl_token_2022_interface::{extension::ExtensionType, state::Account as TokenAccount};
 
 struct SplDeposit {
-    setup: Setup,
     funder: Keypair,
     mint: Address,
+    token_program: Address,
     treasury: Address,
     account: Account,
     ledger_id: candid::Principal,
+}
+
+struct SplWithdrawal {
+    deposit: SplDeposit,
+    amount: u64,
+    destination_ata: Address,
+    destination_rent: u64,
+    fee: u64,
+    cksol_before: u64,
+    ckspl_before: u64,
+    treasury_before: u64,
+    receipt: WithdrawSplOk,
 }
 
 /// Reuses the real deposit flow to establish treasury backing and the user's ckSPL balance.
 async fn sweep_and_mint_spl_deposit(
     validator: &SolanaTestValidator,
     nonce_accounts: Vec<String>,
+    token_program: Address,
+) -> (Setup, SplDeposit) {
+    let setup = validator
+        .setup_builder()
+        .with_pocket_ic_non_live_mode()
+        .with_nonce_accounts(nonce_accounts)
+        .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
+        .build()
+        .await;
+    validator.fund_minter(&setup).await;
+    setup.top_up_operating_balance().await;
+    let deposit = sweep_and_mint_spl_deposit_on_setup(validator, &setup, token_program).await;
+    (setup, deposit)
+}
+
+/// Funds another mint on the same minter through the existing sweep and mint flow.
+async fn sweep_and_mint_spl_deposit_on_setup(
+    validator: &SolanaTestValidator,
+    setup: &Setup,
     token_program: Address,
 ) -> SplDeposit {
     const DECIMALS: u8 = 6;
@@ -53,16 +85,8 @@ async fn sweep_and_mint_spl_deposit(
         };
 
     let http_mocks = || validator.mock_builder().with_xrc_prices(150.0, 1.0).build();
-    let setup = validator
-        .setup_builder()
-        .with_pocket_ic_non_live_mode()
-        .with_nonce_accounts(nonce_accounts)
-        .with_ledger_suite_orchestrator(Setup::DEFAULT_CALLER)
-        .build()
-        .await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
-    validator.fund_minter(&setup).await;
-    setup.top_up_operating_balance().await;
+    let operating_before = setup.minter().get_operating_balance().await.balance;
 
     let funder = Keypair::new();
     validator
@@ -167,7 +191,7 @@ async fn sweep_and_mint_spl_deposit(
     assert_eq!(setup.minter().get_minter_info().await.balance, sol_after);
     assert_eq!(
         setup.minter().get_operating_balance().await.balance,
-        Setup::OPERATING_TOP_UP - 2 * FEE_PER_SIGNATURE - rent
+        operating_before - 2 * FEE_PER_SIGNATURE - rent
     );
     let user_balance = ledger.balance_of(account).await;
     let fee_balance = ledger
@@ -189,9 +213,9 @@ async fn sweep_and_mint_spl_deposit(
     );
     SplDeposit {
         ledger_id: ledger.canister_id(),
-        setup,
         funder,
         mint,
+        token_program,
         treasury,
         account,
     }
@@ -202,88 +226,22 @@ async fn withdraw_spl_on_the_validator(token_program: Address, create_destinatio
 
     let validator = SolanaTestValidator::start().await;
     let nonce_account = validator.create_nonce_accounts(1, &MINTER_ADDRESS).await[0];
-    let SplDeposit {
-        setup,
-        funder,
-        mint,
-        treasury,
-        account,
-        ledger_id,
-    } = sweep_and_mint_spl_deposit(&validator, vec![nonce_account.to_string()], token_program)
-        .await;
-    let ledger = setup.ledger_with_id(ledger_id);
-    let destination = Keypair::new();
-    let destination_ata: Address = get_associated_token_address_with_program_id(
-        &destination.pubkey().to_bytes().into(),
-        &mint.to_bytes().into(),
-        &token_program.to_bytes().into(),
-    )
-    .to_bytes()
-    .into();
-    let destination_rent = if create_destination_account {
-        let rpc = validator.rpc_client();
-        assert!(
-            rpc.get_account_with_commitment(&destination_ata, CommitmentConfig::finalized())
-                .await
-                .unwrap()
-                .value
-                .is_none()
-        );
-        // Both ATAs use the same mint and program, so their account sizes must match.
-        let token_account_len = rpc.get_account(&treasury).await.unwrap().data.len();
-        rpc.get_minimum_balance_for_rent_exemption(token_account_len)
-            .await
-            .unwrap()
-    } else {
-        assert_eq!(
-            validator
-                .mint_to_for_program(&funder, &mint, &destination.pubkey(), 0, token_program)
-                .await,
-            destination_ata
-        );
-        assert_eq!(validator.get_token_balance(&destination_ata).await, 0);
-        0
-    };
-
-    // The native funding helper mints ckSOL to the default account; fund the token subaccount's fee.
-    let fee = Setup::DEFAULT_WITHDRAWAL_FEE + destination_rent;
-    setup
-        .ledger()
-        .transfer(account, fee + LEDGER_TRANSFER_FEE)
-        .await;
-    setup
-        .ledger()
-        .approve(account.subaccount, fee, setup.minter_account())
-        .await;
-    ledger
-        .approve(account.subaccount, AMOUNT, setup.minter_account())
-        .await;
-    let cksol_before = setup.ledger().balance_of(account).await;
-    let ckspl_before = ledger.balance_of(account).await;
-    let treasury_before = validator.get_token_balance(&treasury).await;
+    let (setup, deposit) =
+        sweep_and_mint_spl_deposit(&validator, vec![nonce_account.to_string()], token_program)
+            .await;
+    let destination = Keypair::new().pubkey();
     let sol_before = validator.get_balance(&MINTER_ADDRESS).await;
     let tracked_sol_before = setup.minter().get_minter_info().await.balance;
     let nonce_before = validator.get_nonce_value(&nonce_account).await;
-    let receipt = setup
-        .minter()
-        .withdraw_spl(WithdrawSplArgs {
-            from_subaccount: account.subaccount,
-            mint: mint.into(),
-            amount: AMOUNT,
-            address: destination.pubkey().to_string(),
-            create_destination_account,
-        })
-        .await
-        .expect("withdraw_spl should burn the fee and tokens");
-    assert_eq!(setup.ledger().balance_of(account).await, cksol_before - fee);
-    assert_eq!(ledger.balance_of(account).await, ckspl_before - AMOUNT);
-    assert_eq!(
-        setup
-            .minter()
-            .withdraw_spl_status(receipt.cksol_burn_block_index)
-            .await,
-        WithdrawSplStatus::Pending
-    );
+    let withdrawal = queue_spl_withdrawal_on_the_validator(
+        &validator,
+        &setup,
+        deposit,
+        &destination,
+        AMOUNT,
+        create_destination_account,
+    )
+    .await;
 
     // Forward RPC calls to the validator so it executes the actual nonce and SPL instructions.
     setup.advance_time(WITHDRAWAL_PROCESSING_DELAY).await;
@@ -291,11 +249,13 @@ async fn withdraw_spl_on_the_validator(token_program: Address, create_destinatio
         .execute_http_mocks(validator.mock_builder().build())
         .await;
     validator
-        .wait_for_finalized_token_balance(&destination_ata, AMOUNT)
+        .wait_for_finalized_token_balance(&withdrawal.destination_ata, AMOUNT)
         .await;
     assert_eq!(
-        validator.get_token_balance(&treasury).await,
-        treasury_before - AMOUNT
+        validator
+            .get_token_balance(&withdrawal.deposit.treasury)
+            .await,
+        withdrawal.treasury_before - AMOUNT
     );
     assert_ne!(
         validator.get_nonce_value(&nonce_account).await,
@@ -303,12 +263,12 @@ async fn withdraw_spl_on_the_validator(token_program: Address, create_destinatio
     );
     assert_eq!(
         validator.get_balance(&MINTER_ADDRESS).await,
-        sol_before - FEE_PER_SIGNATURE - destination_rent
+        sol_before - FEE_PER_SIGNATURE - withdrawal.destination_rent
     );
     if create_destination_account {
         assert_eq!(
-            validator.get_balance(&destination_ata).await,
-            destination_rent
+            validator.get_balance(&withdrawal.destination_ata).await,
+            withdrawal.destination_rent
         );
     }
 
@@ -318,7 +278,7 @@ async fn withdraw_spl_on_the_validator(token_program: Address, create_destinatio
         .await;
     let signature = match setup
         .minter()
-        .withdraw_spl_status(receipt.cksol_burn_block_index)
+        .withdraw_spl_status(withdrawal.receipt.cksol_burn_block_index)
         .await
     {
         WithdrawSplStatus::TxFinalized(TxFinalizedStatus::Success { transaction_id }) => {
@@ -339,23 +299,290 @@ async fn withdraw_spl_on_the_validator(token_program: Address, create_destinatio
     );
     assert_eq!(
         setup.minter().get_minter_info().await.balance,
-        tracked_sol_before - FEE_PER_SIGNATURE - destination_rent
+        tracked_sol_before - FEE_PER_SIGNATURE - withdrawal.destination_rent
     );
-    assert_eq!(ledger.balance_of(account).await, ckspl_before - AMOUNT);
-    assert_eq!(setup.ledger().balance_of(account).await, cksol_before - fee);
+    assert_eq!(
+        setup
+            .ledger_with_id(withdrawal.deposit.ledger_id)
+            .balance_of(withdrawal.deposit.account)
+            .await,
+        withdrawal.ckspl_before - AMOUNT
+    );
+    assert_eq!(
+        setup.ledger().balance_of(withdrawal.deposit.account).await,
+        withdrawal.cksol_before - withdrawal.fee
+    );
+    setup.drop().await;
+}
+
+/// Queues a withdrawal without advancing time, so multiple requests can enter the same batch.
+async fn queue_spl_withdrawal_on_the_validator(
+    validator: &SolanaTestValidator,
+    setup: &Setup,
+    deposit: SplDeposit,
+    destination: &Address,
+    amount: u64,
+    create_destination_account: bool,
+) -> SplWithdrawal {
+    let destination_ata: Address = get_associated_token_address_with_program_id(
+        &destination.to_bytes().into(),
+        &deposit.mint.to_bytes().into(),
+        &deposit.token_program.to_bytes().into(),
+    )
+    .to_bytes()
+    .into();
+    let destination_rent = if create_destination_account {
+        let rpc = validator.rpc_client();
+        assert!(
+            rpc.get_account_with_commitment(&destination_ata, CommitmentConfig::finalized())
+                .await
+                .unwrap()
+                .value
+                .is_none()
+        );
+        let account_len = rpc.get_account(&deposit.treasury).await.unwrap().data.len();
+        rpc.get_minimum_balance_for_rent_exemption(account_len)
+            .await
+            .unwrap()
+    } else {
+        assert_eq!(
+            validator
+                .mint_to_for_program(
+                    &deposit.funder,
+                    &deposit.mint,
+                    destination,
+                    0,
+                    deposit.token_program,
+                )
+                .await,
+            destination_ata
+        );
+        assert_eq!(validator.get_token_balance(&destination_ata).await, 0);
+        0
+    };
+    let fee = Setup::DEFAULT_WITHDRAWAL_FEE + destination_rent;
+    setup
+        .ledger()
+        .transfer(deposit.account, fee + LEDGER_TRANSFER_FEE)
+        .await;
+    setup
+        .ledger()
+        .approve(deposit.account.subaccount, fee, setup.minter_account())
+        .await;
+    let ledger = setup.ledger_with_id(deposit.ledger_id);
+    ledger
+        .approve(deposit.account.subaccount, amount, setup.minter_account())
+        .await;
+    let cksol_before = setup.ledger().balance_of(deposit.account).await;
+    let ckspl_before = ledger.balance_of(deposit.account).await;
+    let treasury_before = validator.get_token_balance(&deposit.treasury).await;
+    let receipt = setup
+        .minter()
+        .withdraw_spl(WithdrawSplArgs {
+            from_subaccount: deposit.account.subaccount,
+            mint: deposit.mint.into(),
+            amount,
+            address: destination.to_string(),
+            create_destination_account,
+        })
+        .await
+        .expect("withdraw_spl should burn the fee and tokens");
+    assert_eq!(
+        setup.ledger().balance_of(deposit.account).await,
+        cksol_before - fee
+    );
+    assert_eq!(
+        ledger.balance_of(deposit.account).await,
+        ckspl_before - amount
+    );
+    assert_eq!(
+        setup
+            .minter()
+            .withdraw_spl_status(receipt.cksol_burn_block_index)
+            .await,
+        WithdrawSplStatus::Pending
+    );
+    SplWithdrawal {
+        deposit,
+        amount,
+        destination_ata,
+        destination_rent,
+        fee,
+        cksol_before,
+        ckspl_before,
+        treasury_before,
+        receipt,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_batch_classic_spl_and_token_2022_withdrawals_on_the_validator() {
+    let validator = SolanaTestValidator::start().await;
+    let nonce_account = validator.create_nonce_accounts(1, &MINTER_ADDRESS).await[0];
+    let (setup, classic) = sweep_and_mint_spl_deposit(
+        &validator,
+        vec![nonce_account.to_string()],
+        spl_token_interface::id().to_bytes().into(),
+    )
+    .await;
+    let token_2022 = sweep_and_mint_spl_deposit_on_setup(
+        &validator,
+        &setup,
+        spl_token_2022_interface::id().to_bytes().into(),
+    )
+    .await;
+    let destination = Keypair::new().pubkey();
+    let sol_before = validator.get_balance(&MINTER_ADDRESS).await;
+    let tracked_sol_before = setup.minter().get_minter_info().await.balance;
+    let nonce_before = validator.get_nonce_value(&nonce_account).await;
+
+    // Both burns finish before the processing timer runs, so the one free nonce serves both.
+    let withdrawals = [
+        queue_spl_withdrawal_on_the_validator(
+            &validator,
+            &setup,
+            classic,
+            &destination,
+            500_000,
+            true,
+        )
+        .await,
+        queue_spl_withdrawal_on_the_validator(
+            &validator,
+            &setup,
+            token_2022,
+            &destination,
+            700_000,
+            true,
+        )
+        .await,
+    ];
+    let burn_indices: Vec<_> = withdrawals
+        .iter()
+        .map(|withdrawal| withdrawal.receipt.cksol_burn_block_index)
+        .collect();
+    assert!(burn_indices[0] < burn_indices[1]);
+    let rent: u64 = withdrawals.iter().map(|w| w.destination_rent).sum();
+
+    setup.advance_time(WITHDRAWAL_PROCESSING_DELAY).await;
+    setup
+        .execute_http_mocks(validator.mock_builder().build())
+        .await;
+    for withdrawal in &withdrawals {
+        validator
+            .wait_for_finalized_token_balance(&withdrawal.destination_ata, withdrawal.amount)
+            .await;
+        assert_eq!(
+            validator
+                .get_token_balance(&withdrawal.deposit.treasury)
+                .await,
+            withdrawal.treasury_before - withdrawal.amount
+        );
+        assert_eq!(
+            validator.get_balance(&withdrawal.destination_ata).await,
+            withdrawal.destination_rent
+        );
+    }
+    assert_ne!(
+        validator.get_nonce_value(&nonce_account).await,
+        nonce_before
+    );
+    // Both ATA rents are paid, but the two transfers share one signature fee.
+    let spent = FEE_PER_SIGNATURE + rent;
+    assert_eq!(
+        validator.get_balance(&MINTER_ADDRESS).await,
+        sol_before - spent
+    );
+
+    setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
+    setup
+        .execute_http_mocks(validator.mock_builder().build())
+        .await;
+    let mut signatures = Vec::new();
+    for withdrawal in &withdrawals {
+        let status = setup
+            .minter()
+            .withdraw_spl_status(withdrawal.receipt.cksol_burn_block_index)
+            .await;
+        let WithdrawSplStatus::TxFinalized(TxFinalizedStatus::Success { transaction_id }) = status
+        else {
+            panic!("expected a successful batched SPL withdrawal, got {status:?}");
+        };
+        signatures.push(transaction_id);
+        assert_eq!(
+            setup
+                .ledger_with_id(withdrawal.deposit.ledger_id)
+                .balance_of(withdrawal.deposit.account)
+                .await,
+            withdrawal.ckspl_before - withdrawal.amount
+        );
+    }
+    assert_eq!(signatures[0], signatures[1]);
+    let transaction = setup.minter().signed_transaction(&signatures[0]).await;
+    assert_eq!(transaction.signatures.len(), 1);
+    assert_eq!(transaction.message.header.num_required_signatures, 1);
+    assert_eq!(transaction.message.recent_blockhash, nonce_before);
+    assert_eq!(transaction.message.instructions.len(), 5); // Advance nonce, two ATA creates, two transfers.
+    let nonce_instruction = &transaction.message.instructions[0];
+    let advance_nonce = solana_system_interface::instruction::advance_nonce_account(
+        &nonce_account,
+        &MINTER_ADDRESS,
+    );
+    assert_eq!(
+        transaction.message.account_keys[nonce_instruction.program_id_index as usize],
+        advance_nonce.program_id
+    );
+    assert_eq!(nonce_instruction.data, advance_nonce.data);
+    assert_eq!(
+        transaction.message.account_keys[nonce_instruction.accounts[0] as usize],
+        nonce_account
+    );
+    for (transfer, withdrawal) in transaction.message.instructions[3..]
+        .iter()
+        .zip(&withdrawals)
+    {
+        assert_eq!(
+            transaction.message.account_keys[transfer.program_id_index as usize],
+            withdrawal.deposit.token_program
+        );
+    }
+
+    let events = setup.minter().get_all_events().await;
+    let batches: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventType::CreatedSplWithdrawalTransaction {
+                burn_indices,
+                nonce_account,
+                ..
+            } => Some((burn_indices.clone(), Address::from(nonce_account.clone()))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(batches, vec![(burn_indices, nonce_account)]);
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventType::SucceededSplWithdrawalTransaction { signature, lamports_spent }
+            if signature == &signatures[0] && *lamports_spent == spent
+    )));
+    // Finalization releases the unused individual-retry reservations back to the minter.
+    assert_eq!(
+        setup.minter().get_minter_info().await.balance,
+        tracked_sol_before - spent
+    );
     setup.drop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn should_sweep_and_mint_a_classic_spl_deposit_on_the_validator() {
     let validator = SolanaTestValidator::start().await;
-    let deposit = sweep_and_mint_spl_deposit(
+    let (setup, _) = sweep_and_mint_spl_deposit(
         &validator,
         Vec::new(),
         spl_token_interface::id().to_bytes().into(),
     )
     .await;
-    deposit.setup.drop().await;
+    setup.drop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
