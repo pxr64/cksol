@@ -8,8 +8,8 @@ use cksol_int_tests::{
     validator::{FEE_PER_SIGNATURE, SolanaTestValidator},
 };
 use cksol_types::{
-    AddSplTokenArgs, DepositSplArgs, DepositSplStatus, GetSplDepositAddressArgs, SplFeeMintStatus,
-    TxFinalizedStatus, WithdrawSplArgs, WithdrawSplOk, WithdrawSplStatus,
+    AddSplTokenArgs, DepositSplArgs, DepositSplStatus, GetSplDepositAddressArgs, Signature,
+    SplFeeMintStatus, TxFinalizedStatus, WithdrawSplArgs, WithdrawSplOk, WithdrawSplStatus,
 };
 use cksol_types_internal::event::EventType;
 use icrc_ledger_types::icrc1::account::Account;
@@ -19,7 +19,9 @@ use solana_keypair::{Keypair, Signer};
 use solana_native_token::LAMPORTS_PER_SOL;
 use solana_program_pack::Pack;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
-use spl_token_2022_interface::{extension::ExtensionType, state::Account as TokenAccount};
+use spl_token_2022_interface::{
+    error::TokenError, extension::ExtensionType, state::Account as TokenAccount,
+};
 
 struct SplDeposit {
     funder: Keypair,
@@ -415,6 +417,53 @@ async fn queue_spl_withdrawal_on_the_validator(
     }
 }
 
+/// Runs a processing round if needed and returns the request's transaction signature.
+async fn submit_pending_spl_withdrawal(
+    validator: &SolanaTestValidator,
+    setup: &Setup,
+    withdrawal: &SplWithdrawal,
+) -> Signature {
+    let id = withdrawal.receipt.cksol_burn_block_index;
+    if setup.minter().withdraw_spl_status(id).await == WithdrawSplStatus::Pending {
+        setup.advance_time(WITHDRAWAL_PROCESSING_DELAY).await;
+        setup
+            .execute_http_mocks(validator.mock_builder().build())
+            .await;
+    }
+    match setup.minter().withdraw_spl_status(id).await {
+        WithdrawSplStatus::TxSent { transaction_id }
+        | WithdrawSplStatus::TxFinalized(TxFinalizedStatus::Success { transaction_id })
+        | WithdrawSplStatus::ReimbursementPending { transaction_id, .. }
+        | WithdrawSplStatus::Reimbursed { transaction_id, .. } => transaction_id,
+        status => panic!("expected a submitted SPL withdrawal, got {status:?}"),
+    }
+}
+
+/// Checks the real validator error after the transaction's fee debit has finalized.
+async fn assert_frozen_transfer_failed_at(
+    validator: &SolanaTestValidator,
+    signature: &Signature,
+    instruction_index: usize,
+) {
+    let signature = signature.to_string().parse().unwrap();
+    let status = validator
+        .rpc_client()
+        .get_signature_statuses(&[signature])
+        .await
+        .unwrap()
+        .value
+        .pop()
+        .flatten()
+        .expect("the finalized withdrawal should have a validator status");
+    assert_eq!(
+        serde_json::to_value(status.err.expect("the frozen transfer should fail")).unwrap(),
+        serde_json::json!({"InstructionError": [
+            instruction_index,
+            {"Custom": TokenError::AccountFrozen as u32}
+        ]})
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn should_batch_classic_spl_and_token_2022_withdrawals_on_the_validator() {
     let validator = SolanaTestValidator::start().await;
@@ -569,6 +618,251 @@ async fn should_batch_classic_spl_and_token_2022_withdrawals_on_the_validator() 
     assert_eq!(
         setup.minter().get_minter_info().await.balance,
         tracked_sol_before - spent
+    );
+    setup.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn should_retry_a_failed_spl_batch_and_reimburse_only_the_failed_retry_on_the_validator() {
+    let validator = SolanaTestValidator::start().await;
+    let nonce_account = validator.create_nonce_accounts(1, &MINTER_ADDRESS).await[0];
+    let (setup, classic) = sweep_and_mint_spl_deposit(
+        &validator,
+        vec![nonce_account.to_string()],
+        spl_token_interface::id().to_bytes().into(),
+    )
+    .await;
+    let token_2022 = sweep_and_mint_spl_deposit_on_setup(
+        &validator,
+        &setup,
+        spl_token_2022_interface::id().to_bytes().into(),
+    )
+    .await;
+    let destination = Keypair::new().pubkey();
+    let valid = queue_spl_withdrawal_on_the_validator(
+        &validator,
+        &setup,
+        classic,
+        &destination,
+        500_000,
+        true,
+    )
+    .await;
+    let frozen = queue_spl_withdrawal_on_the_validator(
+        &validator,
+        &setup,
+        token_2022,
+        &destination,
+        700_000,
+        true,
+    )
+    .await;
+    let burn_indices = vec![
+        valid.receipt.cksol_burn_block_index,
+        frozen.receipt.cksol_burn_block_index,
+    ];
+    assert!(burn_indices[0] < burn_indices[1]);
+
+    // Freeze the second transfer's source after acceptance. Its individual retry will fail too.
+    validator
+        .freeze_token_account(
+            &frozen.deposit.funder,
+            &frozen.deposit.mint,
+            &frozen.deposit.treasury,
+            frozen.deposit.token_program,
+        )
+        .await;
+    let sol_before = validator.get_balance(&MINTER_ADDRESS).await;
+    let tracked_sol_before = setup.minter().get_minter_info().await.balance;
+    let nonce_before = validator.get_nonce_value(&nonce_account).await;
+    let batch_signature = submit_pending_spl_withdrawal(&validator, &setup, &valid).await;
+    assert_eq!(
+        setup
+            .minter()
+            .withdraw_spl_status(frozen.receipt.cksol_burn_block_index)
+            .await,
+        WithdrawSplStatus::TxSent {
+            transaction_id: batch_signature.clone()
+        }
+    );
+    validator
+        .wait_for_finalized_balance(&MINTER_ADDRESS, sol_before - FEE_PER_SIGNATURE)
+        .await;
+
+    // Instruction 3 transferred the classic tokens, then instruction 4 failed. Both creates
+    // and both transfers roll back, while the signature fee and nonce advancement persist.
+    assert_frozen_transfer_failed_at(&validator, &batch_signature, 4).await;
+    let batch = setup.minter().signed_transaction(&batch_signature).await;
+    assert_eq!(batch.message.instructions.len(), 5);
+    assert_eq!(batch.message.recent_blockhash, nonce_before);
+    for withdrawal in [&valid, &frozen] {
+        assert_eq!(
+            validator
+                .get_token_balance(&withdrawal.deposit.treasury)
+                .await,
+            withdrawal.treasury_before
+        );
+        assert!(
+            validator
+                .rpc_client()
+                .get_account_with_commitment(
+                    &withdrawal.destination_ata,
+                    CommitmentConfig::finalized()
+                )
+                .await
+                .unwrap()
+                .value
+                .is_none()
+        );
+    }
+    let nonce_after_batch = validator.get_nonce_value(&nonce_account).await;
+    assert_ne!(nonce_after_batch, nonce_before);
+
+    setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
+    setup
+        .execute_http_mocks(validator.mock_builder().build())
+        .await;
+    let events = setup.minter().get_all_events().await;
+    assert!(events.iter().any(|event| matches!(
+        &event.payload,
+        EventType::RetryFailedSplWithdrawalTransaction { signature } if signature == &batch_signature
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.payload, EventType::ReimbursedSplWithdrawal { .. }))
+    );
+    for withdrawal in [&valid, &frozen] {
+        assert_eq!(
+            setup
+                .ledger_with_id(withdrawal.deposit.ledger_id)
+                .balance_of(withdrawal.deposit.account)
+                .await,
+            withdrawal.ckspl_before - withdrawal.amount
+        );
+    }
+
+    // One nonce means the valid, older request retries first and creates only its own ATA.
+    let valid_signature = submit_pending_spl_withdrawal(&validator, &setup, &valid).await;
+    assert_ne!(valid_signature, batch_signature);
+    validator
+        .wait_for_finalized_token_balance(&valid.destination_ata, valid.amount)
+        .await;
+    let valid_retry = setup.minter().signed_transaction(&valid_signature).await;
+    assert_eq!(valid_retry.message.instructions.len(), 3);
+    assert_eq!(valid_retry.message.recent_blockhash, nonce_after_batch);
+    let nonce_after_valid = validator.get_nonce_value(&nonce_account).await;
+    assert_ne!(nonce_after_valid, nonce_after_batch);
+    setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
+    setup
+        .execute_http_mocks(validator.mock_builder().build())
+        .await;
+    assert_eq!(
+        setup
+            .minter()
+            .withdraw_spl_status(valid.receipt.cksol_burn_block_index)
+            .await,
+        WithdrawSplStatus::TxFinalized(TxFinalizedStatus::Success {
+            transaction_id: valid_signature.clone()
+        })
+    );
+
+    // The still-frozen retry consumes another fee and nonce, then triggers reimbursement.
+    let frozen_signature = submit_pending_spl_withdrawal(&validator, &setup, &frozen).await;
+    assert_ne!(frozen_signature, batch_signature);
+    assert_ne!(frozen_signature, valid_signature);
+    let spent = 3 * FEE_PER_SIGNATURE + valid.destination_rent;
+    validator
+        .wait_for_finalized_balance(&MINTER_ADDRESS, sol_before - spent)
+        .await;
+    assert_frozen_transfer_failed_at(&validator, &frozen_signature, 2).await;
+    let frozen_retry = setup.minter().signed_transaction(&frozen_signature).await;
+    assert_eq!(frozen_retry.message.instructions.len(), 3);
+    assert_eq!(frozen_retry.message.recent_blockhash, nonce_after_valid);
+    assert_ne!(
+        validator.get_nonce_value(&nonce_account).await,
+        nonce_after_valid
+    );
+    setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
+    setup
+        .execute_http_mocks(validator.mock_builder().build())
+        .await;
+    setup.advance_time(PROCESS_PENDING_MINTS_DELAY).await;
+    setup
+        .execute_http_mocks(validator.mock_builder().build())
+        .await;
+    let status = setup
+        .minter()
+        .withdraw_spl_status(frozen.receipt.cksol_burn_block_index)
+        .await;
+    assert!(matches!(
+        status,
+        WithdrawSplStatus::Reimbursed { transaction_id, reimbursed_amount, .. }
+            if transaction_id == frozen_signature && reimbursed_amount == frozen.amount
+    ));
+    for (withdrawal, received) in [(&valid, valid.amount), (&frozen, 0)] {
+        assert_eq!(
+            setup
+                .ledger_with_id(withdrawal.deposit.ledger_id)
+                .balance_of(withdrawal.deposit.account)
+                .await,
+            withdrawal.ckspl_before - received
+        );
+        assert_eq!(
+            validator
+                .get_token_balance(&withdrawal.deposit.treasury)
+                .await,
+            withdrawal.treasury_before - received
+        );
+        // On-chain failures reimburse ckSPL, while the quoted ckSOL fee remains burned.
+        assert_eq!(
+            setup.ledger().balance_of(withdrawal.deposit.account).await,
+            withdrawal.cksol_before - withdrawal.fee
+        );
+    }
+    assert!(
+        validator
+            .rpc_client()
+            .get_account_with_commitment(&frozen.destination_ata, CommitmentConfig::finalized())
+            .await
+            .unwrap()
+            .value
+            .is_none()
+    );
+    assert_eq!(
+        setup.minter().get_minter_info().await.balance,
+        tracked_sol_before - spent
+    );
+    let events = setup.minter().get_all_events().await;
+    let batches: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventType::CreatedSplWithdrawalTransaction {
+                burn_indices,
+                nonce_account,
+                ..
+            } => Some((burn_indices.clone(), Address::from(nonce_account.clone()))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        batches,
+        vec![
+            (burn_indices, nonce_account),
+            (vec![valid.receipt.cksol_burn_block_index], nonce_account),
+            (vec![frozen.receipt.cksol_burn_block_index], nonce_account),
+        ]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.payload,
+                EventType::ReimbursedSplWithdrawal { cksol_burn_block_index, .. }
+                    if cksol_burn_block_index == frozen.receipt.cksol_burn_block_index
+            ))
+            .count(),
+        1
     );
     setup.drop().await;
 }

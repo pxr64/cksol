@@ -19,7 +19,7 @@ use spl_associated_token_account_interface::{
     instruction::create_associated_token_account,
 };
 use spl_token_2022_interface::{
-    instruction::{initialize_mint2, mint_to},
+    instruction::{freeze_account, initialize_mint2, mint_to},
     state::Mint,
 };
 use std::time::Duration;
@@ -64,7 +64,7 @@ impl SolanaTestValidator {
         .await
     }
 
-    /// Creates a mint without extensions for either supported token program.
+    /// Creates a mint without extensions, with `funder` as mint and freeze authority.
     pub async fn create_mint_for_program(
         &self,
         funder: &Keypair,
@@ -89,7 +89,7 @@ impl SolanaTestValidator {
                 &token_program.to_bytes().into(),
                 &mint.pubkey().to_bytes().into(),
                 &funder.pubkey().to_bytes().into(),
-                None,
+                Some(&funder.pubkey().to_bytes().into()),
                 decimals,
             )
             .unwrap(),
@@ -180,6 +180,35 @@ impl SolanaTestValidator {
             .amount
             .parse()
             .unwrap()
+    }
+
+    /// Freezes a token account with its mint's freeze authority to exercise on-chain failures.
+    pub async fn freeze_token_account(
+        &self,
+        authority: &Keypair,
+        mint: &Address,
+        account: &Address,
+        token_program: Address,
+    ) {
+        let instruction = freeze_account(
+            &token_program.to_bytes().into(),
+            &account.to_bytes().into(),
+            &mint.to_bytes().into(),
+            &authority.pubkey().to_bytes().into(),
+            &[],
+        )
+        .unwrap();
+        let rpc = self.rpc_client();
+        let blockhash = rpc.get_latest_blockhash().await.unwrap();
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&authority.pubkey()),
+            &[authority],
+            blockhash,
+        );
+        let signature = rpc.send_transaction(&transaction).await.unwrap();
+        self.confirm_transaction(&signature, CommitmentConfig::finalized())
+            .await;
     }
 
     /// Waits for the real token transfer to be finalized before the minter settles it.
