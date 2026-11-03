@@ -24,12 +24,18 @@ use crate::{
         CreateTransferError, build_batch_withdrawal_message, sign_batch_withdrawal_message,
     },
     state::{
-        CreatedWithdrawalTransaction, State, TaskType, WithdrawalPlan,
+        CreatedWithdrawalTransaction, State, TaskType,
         audit::process_event,
         event::{EventType, Signer, TransactionPurpose, WithdrawalRequest},
         mutate_state, read_state,
     },
-    withdraw::nonce::read_verified_nonce,
+    withdraw::{
+        nonce::read_verified_nonce,
+        round::{
+            WithdrawalPlan, WithdrawalRound, can_create_withdrawal_transaction,
+            covers_withdrawal_batch,
+        },
+    },
 };
 
 pub const WITHDRAWAL_PROCESSING_DELAY: Duration = Duration::from_mins(1);
@@ -39,6 +45,7 @@ const _: () = assert!(MAX_CONCURRENT_SIGNATURES <= MAX_CONCURRENT_RPC_CALLS);
 
 pub mod nonce;
 mod reserved_account_keys;
+pub mod round;
 pub mod spl;
 #[cfg(test)]
 mod tests;
@@ -179,7 +186,7 @@ pub async fn process_pending_withdrawals<R: CanisterRuntime>(runtime: R) {
 
     if made_progress
         && read_state(|s| {
-            s.can_create_withdrawal_transaction() || s.has_unsigned_withdrawal_transaction()
+            can_create_withdrawal_transaction(s) || s.has_unsigned_withdrawal_transaction()
         })
     {
         runtime.set_timer(
@@ -210,7 +217,7 @@ async fn create_transactions_batch<R: CanisterRuntime>(
             state.created_withdrawal_txs().len() + state.created_spl_withdrawal_txs().len(),
         ));
         let slots = max_plans.min(state.nonce_pool().num_free_accounts());
-        let round = state.withdrawal_round(slots);
+        let round = WithdrawalRound::take_from_queue(state, slots);
         state
             .nonce_pool()
             .free_accounts()
@@ -312,7 +319,7 @@ fn create_sol_transaction<R: CanisterRuntime>(
         return false;
     }
     // An SPL sweep may have reserved part of the balance during the nonce read.
-    if !read_state(|state| state.covers_withdrawal_batch(&requests)) {
+    if !read_state(|state| covers_withdrawal_batch(state, &requests)) {
         log!(
             Priority::Info,
             "The balance no longer covers the withdrawal batch for burn indices {burn_indices:?}, skipping it this round"

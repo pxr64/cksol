@@ -2,6 +2,7 @@ use super::{
     FINALIZE_TRANSACTIONS_RETRY_DELAY, MAX_BLOCKHASH_AGE_IN_BLOCKS,
     MAX_SIGNATURES_PER_STATUS_CHECK, MIN_REBROADCAST_AGE, finalize_transactions,
 };
+use crate::withdraw::spl::fees::spl_withdrawal_reserved_cost;
 use crate::{
     address::minter_address,
     constants::{FEE_PER_SIGNATURE, MAX_CONCURRENT_RPC_CALLS},
@@ -431,7 +432,7 @@ mod withdrawal_finalization {
                 let signature = submit_signed_spl_withdrawal(token_program);
                 let balance_before = read_state(|state| state.balance());
                 let reserved =
-                    read_state(|state| state.spl_withdrawal_reserved_cost(&signature).unwrap());
+                    read_state(|state| spl_withdrawal_reserved_cost(state, &signature).unwrap());
                 let lamports_spent = FEE_PER_SIGNATURE
                     + if new_destination {
                         token_program.account_rent_exemption()
@@ -476,7 +477,7 @@ mod withdrawal_finalization {
             let signature = submit_signed_spl_withdrawal(TokenProgram::Classic);
             let balance_before = read_state(|state| state.balance());
             let reserved =
-                read_state(|state| state.spl_withdrawal_reserved_cost(&signature).unwrap());
+                read_state(|state| spl_withdrawal_reserved_cost(state, &signature).unwrap());
             let mut response = spl_withdrawal_response(&signature, lamports_spent);
             let GetTransactionResult::Consistent(Ok(Some(outcome))) = &mut response else {
                 unreachable!()

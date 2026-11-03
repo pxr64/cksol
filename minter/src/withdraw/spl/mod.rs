@@ -1,3 +1,4 @@
+use crate::withdraw::spl::fees::spl_withdrawal_transaction_cost;
 use crate::{
     address::{associated_token_address, minter_address, minter_public_key},
     constants::CKSOL_LEDGER_TRANSACTION_FEE,
@@ -15,7 +16,7 @@ use crate::{
     spl_transfer::{build_spl_withdrawal_instructions, build_spl_withdrawal_message},
     state::{
         CreatedSplWithdrawalTransaction, PendingSplWithdrawalFeeReimbursement,
-        PendingSplWithdrawalReimbursement, State, SupportedSplToken, TokenProgram,
+        PendingSplWithdrawalReimbursement, State, SupportedSplToken,
         audit::process_event,
         event::{
             EventType, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
@@ -38,8 +39,24 @@ use solana_address::Address;
 use solana_hash::Hash;
 use std::{str::FromStr, time::Duration};
 
+pub(crate) mod fees;
+pub use fees::quote_withdrawal_fee;
+
 #[cfg(test)]
 mod tests;
+
+pub fn covers_spl_withdrawal(state: &State, request: &SplWithdrawalRequest) -> bool {
+    // Retry SOL was reserved before the original batch was signed.
+    let sol_is_prepaid = state
+        .retrying_spl_withdrawal_requests()
+        .contains_key(&request.cksol_burn_block_index);
+    let has_enough_sol = sol_is_prepaid
+        || state.spendable_balance()
+            >= spl_withdrawal_transaction_cost(state, std::iter::once(&request.terms));
+    let has_enough_tokens = state.spl_treasury_balance(&request.terms.mint) >= request.terms.amount;
+
+    has_enough_sol && has_enough_tokens
+}
 
 pub fn withdrawal_status(cksol_burn_block_index: WithdrawSplId) -> WithdrawSplStatus {
     read_state(|state| state.spl_withdrawal_status(cksol_burn_block_index))
@@ -77,7 +94,7 @@ pub(super) fn create_transaction<R: CanisterRuntime>(
         return false;
     }
     // An SPL sweep may have reserved part of the balance during the nonce read.
-    if !read_state(|state| state.covers_spl_withdrawal(request)) {
+    if !read_state(|state| covers_spl_withdrawal(state, request)) {
         log!(
             Priority::Info,
             "The balance no longer covers SPL withdrawal {}, skipping it this round",
@@ -245,25 +262,6 @@ pub fn validate_destination(
         )));
     }
     Ok(destination)
-}
-
-/// Quotes the ckSOL fee in lamports using the configured withdrawal fee.
-/// Allowing destination ATA creation includes its rent even if it already exists.
-pub fn quote_withdrawal_fee(
-    withdrawal_fee: Lamport,
-    token_program: TokenProgram,
-    create_destination_account: bool,
-) -> Result<Lamport, WithdrawSplError> {
-    let rent = if create_destination_account {
-        token_program.account_rent_exemption()
-    } else {
-        0
-    };
-    withdrawal_fee.checked_add(rent).ok_or_else(|| {
-        WithdrawSplError::TemporarilyUnavailable(
-            "SPL withdrawal fee exceeds the maximum lamport amount".to_string(),
-        )
-    })
 }
 
 /// Validates a withdrawal, burns its fee and tokens, then records acceptance.

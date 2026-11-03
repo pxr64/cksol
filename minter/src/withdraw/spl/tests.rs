@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_fixtures::{init_state_with_args, nonce_account_info, valid_init_args};
+use crate::withdraw::round::{WithdrawalPlan, WithdrawalRound};
 use crate::{
     constants::LEDGER_DEDUPLICATION_WINDOW,
     guard::{TimerGuard, withdrawal_guard},
@@ -301,7 +302,7 @@ mod transaction_creation {
     use super::*;
     use crate::{
         constants::{FEE_PER_SIGNATURE, MAX_CONCURRENT_SIGNATURES, RENT_EXEMPTION_THRESHOLD},
-        state::{MinterTransaction, WithdrawalPlan, event::VersionedMessage},
+        state::{MinterTransaction, event::VersionedMessage},
         test_fixtures::{MINIMUM_WITHDRAWAL_AMOUNT, durable_nonce, events, signature},
         withdraw::{
             create_transactions_batch, process_pending_withdrawals, sign_transactions_batch,
@@ -602,7 +603,8 @@ mod transaction_creation {
         events::accept_withdrawal_at(account(1), 1, MINIMUM_WITHDRAWAL_AMOUNT, 100);
         events::accept_withdrawal_at(account(2), 100, MINIMUM_WITHDRAWAL_AMOUNT, 200);
         // SPL burn index 42 splits the SOL burn indices 1 and 100 into two batches.
-        let plans: Vec<_> = read_state(|state| state.withdrawal_round(usize::MAX).collect());
+        let plans: Vec<_> =
+            read_state(|state| WithdrawalRound::take_from_queue(state, usize::MAX).collect());
         assert!(matches!(
             plans.as_slice(),
             [
@@ -944,54 +946,6 @@ mod validation {
         assert!(matches!(withdraw_request(&runtime, &request).await,
             Err(WithdrawSplError::TemporarilyUnavailable(message)) if message.contains("symbol")));
         assert!(runtime.sent_update_calls().is_empty());
-    }
-}
-
-mod fee_quote {
-    use super::*;
-
-    #[test]
-    fn should_quote_only_the_configured_fee_when_creation_is_not_allowed() {
-        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
-            for fee in [12_345, 1_000_000, u64::MAX] {
-                assert_eq!(quote_withdrawal_fee(fee, token_program, false), Ok(fee));
-            }
-        }
-    }
-
-    #[test]
-    fn should_include_the_token_programs_ata_rent_when_creation_is_allowed() {
-        assert_eq!(
-            quote_withdrawal_fee(1_000_000, TokenProgram::Classic, true),
-            Ok(3_039_280)
-        );
-        assert_eq!(
-            quote_withdrawal_fee(1_000_000, TokenProgram::Token2022, true),
-            Ok(3_074_080)
-        );
-        assert_eq!(
-            quote_withdrawal_fee(2_000_000, TokenProgram::Classic, true),
-            Ok(4_039_280)
-        );
-    }
-
-    #[test]
-    fn should_accept_the_largest_fee_that_can_include_rent() {
-        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
-            let fee = u64::MAX - token_program.account_rent_exemption();
-            assert_eq!(quote_withdrawal_fee(fee, token_program, true), Ok(u64::MAX));
-        }
-    }
-
-    #[test]
-    fn should_reject_a_fee_that_overflows_when_rent_is_added() {
-        for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
-            let fee = u64::MAX - token_program.account_rent_exemption() + 1;
-            assert!(matches!(
-                quote_withdrawal_fee(fee, token_program, true),
-                Err(WithdrawSplError::TemporarilyUnavailable(_))
-            ));
-        }
     }
 }
 

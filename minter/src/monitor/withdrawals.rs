@@ -1,3 +1,4 @@
+use crate::withdraw::spl::fees::spl_withdrawal_reserved_cost;
 use crate::{
     address::minter_address,
     constants::MAX_CONCURRENT_RPC_CALLS,
@@ -296,7 +297,7 @@ fn successful_withdrawal_event(
     meta: &UiTransactionStatusMeta,
 ) -> Option<EventType> {
     let signature = withdrawal.signature;
-    let Some(reserved) = read_state(|state| state.spl_withdrawal_reserved_cost(&signature)) else {
+    let Some(reserved) = read_state(|state| spl_withdrawal_reserved_cost(state, &signature)) else {
         log!(Priority::Info, "Transaction {signature} finalized");
         return Some(EventType::SucceededTransaction { signature });
     };

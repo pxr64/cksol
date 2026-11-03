@@ -1,8 +1,12 @@
-use super::{PendingSplWithdrawalRequest, PendingWithdrawalRequest, State};
 use crate::{
+    constants::MAX_SPL_WITHDRAWALS_PER_NONCE_TX,
     numeric::LedgerBurnIndex,
     sol_transfer::{BATCH_WITHDRAWAL_TX_FEE, MAX_WITHDRAWALS_PER_NONCE_TX},
-    state::event::{SplWithdrawalRequest, SplWithdrawalRequestTerms, WithdrawalRequest},
+    state::{
+        PendingSplWithdrawalRequest, PendingWithdrawalRequest, State,
+        event::{SplWithdrawalRequest, SplWithdrawalRequestTerms, WithdrawalRequest},
+    },
+    withdraw::spl::fees::{spl_withdrawal_batch_budget, spl_withdrawal_transaction_cost},
 };
 use sol_rpc_types::Lamport;
 use solana_address::Address;
@@ -11,11 +15,82 @@ use std::{
     iter::Peekable,
 };
 
+#[cfg(test)]
+mod tests;
+
 /// One withdrawal transaction to create: a batch of SOL transfers or one SPL withdrawal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WithdrawalPlan {
     Sol(Vec<WithdrawalRequest>),
     Spl(SplWithdrawalRequest),
+}
+
+/// Selects fresh SPL requests in the supplied burn-index order, before the next SOL request.
+/// Unaffordable requests are skipped. A request whose fee cannot cover batching goes alone.
+/// This only calculates a selection; the caller must reserve its SOL and tokens afterward.
+pub fn select_spl_withdrawal_batch(
+    state: &State,
+    candidates: &[SplWithdrawalRequest],
+    next_sol: Option<LedgerBurnIndex>,
+    available_balance: Lamport,
+    available_tokens: &BTreeMap<Address, u64>,
+) -> Option<Vec<SplWithdrawalRequest>> {
+    let mut selected = Vec::new();
+    let mut remaining_tokens = available_tokens.clone();
+    for request in candidates {
+        if selected.len() == MAX_SPL_WITHDRAWALS_PER_NONCE_TX
+            || next_sol.is_some_and(|sol| sol <= request.cksol_burn_block_index)
+        {
+            break;
+        }
+        if state
+            .retrying_spl_withdrawal_requests()
+            .contains_key(&request.cksol_burn_block_index)
+        {
+            continue;
+        }
+        let terms = &request.terms;
+        let tokens = remaining_tokens.get(&terms.mint).copied().unwrap_or(0);
+        let Some(tokens_after) = tokens.checked_sub(terms.amount) else {
+            continue;
+        };
+        let single_cost = spl_withdrawal_transaction_cost(state, std::iter::once(terms));
+        if single_cost > available_balance {
+            continue;
+        }
+        selected.push(request.clone());
+        remaining_tokens.insert(terms.mint, tokens_after);
+    }
+    // Check the largest prefix first: a larger batch gives each request a smaller fee share.
+    // Removing only from the end preserves the order of eligible requests.
+    while selected.len() > 1 {
+        if spl_withdrawal_batch_budget(state, &selected)
+            .is_some_and(|cost| cost <= available_balance)
+        {
+            return Some(selected);
+        }
+        selected.pop();
+    }
+    // A lone request only needs its single-transaction cost, checked above.
+    if selected.is_empty() {
+        None
+    } else {
+        Some(selected)
+    }
+}
+
+pub fn can_create_withdrawal_transaction(state: &State) -> bool {
+    state.nonce_pool().num_free_accounts() > 0
+        && WithdrawalRound::take_from_queue(state, 1).next().is_some()
+}
+
+pub fn covers_withdrawal_batch(state: &State, requests: &[WithdrawalRequest]) -> bool {
+    let cost = requests
+        .iter()
+        .fold(BATCH_WITHDRAWAL_TX_FEE, |cost, request| {
+            cost.saturating_add(request.amount_to_transfer)
+        });
+    state.spendable_balance() >= cost
 }
 
 /// A bounded selection of fresh transactions and individual retries, sharing one budget.
@@ -27,11 +102,11 @@ pub struct WithdrawalRound {
 }
 
 impl WithdrawalRound {
-    pub(super) fn take_from_queue(state: &State, slots: usize) -> Self {
+    pub fn take_from_queue(state: &State, slots: usize) -> Self {
         let mut round = Self {
             retries: VecDeque::new(),
             fresh: VecDeque::new(),
-            next_is_retry: state.next_withdrawal_is_retry,
+            next_is_retry: state.next_withdrawal_is_retry(),
         };
         if slots == 0 {
             return round;
@@ -39,16 +114,16 @@ impl WithdrawalRound {
         let mut budget = WithdrawalBudget {
             state,
             available_balance: state.spendable_balance(),
-            available_tokens: state.spl_treasury_balances.clone(),
+            available_tokens: state.spl_treasury_balances().clone(),
         };
         let mut fresh = FreshWithdrawals {
-            pending_sol: state.pending_withdrawal_requests.iter().peekable(),
-            pending_spl: state.pending_spl_withdrawal_requests.iter().peekable(),
+            pending_sol: state.pending_withdrawal_requests().iter().peekable(),
+            pending_spl: state.pending_spl_withdrawal_requests().iter().peekable(),
             sol_blocked: false,
             spl_blocked: false,
         };
-        let mut retrying = state.retrying_spl_withdrawal_requests.iter();
-        let mut next_is_retry = state.next_withdrawal_is_retry;
+        let mut retrying = state.retrying_spl_withdrawal_requests().iter();
+        let mut next_is_retry = state.next_withdrawal_is_retry();
         // Reserve in processing order, so neither queue spends funds promised to the other.
         while round.retries.len() + round.fresh.len() < slots {
             if next_is_retry && round.take_spl_retry(&mut retrying, &mut budget) {
@@ -212,10 +287,13 @@ struct WithdrawalBudget<'a> {
 impl WithdrawalBudget<'_> {
     /// Fresh withdrawals need free SOL; retry SOL is already held outside this budget.
     fn reserve_spl(&mut self, terms: &SplWithdrawalRequestTerms) -> bool {
-        let Some(remaining_balance) = self.available_balance.checked_sub(
-            self.state
-                .spl_withdrawal_transaction_cost(std::iter::once(terms)),
-        ) else {
+        let Some(remaining_balance) =
+            self.available_balance
+                .checked_sub(spl_withdrawal_transaction_cost(
+                    self.state,
+                    std::iter::once(terms),
+                ))
+        else {
             return false;
         };
         if !self.reserve_tokens(terms) {
