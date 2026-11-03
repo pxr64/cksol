@@ -25,12 +25,12 @@ pub enum WithdrawalPlan {
     Spl(Vec<SplWithdrawalRequest>),
 }
 
-/// Selects fresh SPL requests in the supplied burn-index order, before the next SOL request.
-/// Unaffordable requests are skipped. Every selected group, including one request, funds its retries.
-/// This only calculates a selection; the caller must reserve its SOL and tokens afterward.
-pub fn select_spl_withdrawal_batch(
+/// Starts with an affordable SPL request before the next SOL index, then fills up to five.
+/// Example: SPL 100, SOL 101, SPL 102 -> SPL [100, 102], SOL [101].
+/// Input is ordered by burn index; the caller reserves the selected funds.
+pub fn select_spl_withdrawal_batch<'a>(
     state: &State,
-    candidates: &[SplWithdrawalRequest],
+    candidates: impl IntoIterator<Item = &'a SplWithdrawalRequest>,
     next_sol: Option<LedgerBurnIndex>,
     available_balance: Lamport,
     available_tokens: &BTreeMap<Address, u64>,
@@ -39,7 +39,8 @@ pub fn select_spl_withdrawal_batch(
     let mut remaining_tokens = available_tokens.clone();
     for request in candidates {
         if selected.len() == MAX_SPL_WITHDRAWALS_PER_NONCE_TX
-            || next_sol.is_some_and(|sol| sol <= request.cksol_burn_block_index)
+            || (selected.is_empty()
+                && next_sol.is_some_and(|sol| sol <= request.cksol_burn_block_index))
         {
             break;
         }
@@ -117,7 +118,6 @@ impl WithdrawalRound {
             pending_sol: state.pending_withdrawal_requests().iter().peekable(),
             pending_spl: state.pending_spl_withdrawal_requests().iter().peekable(),
             sol_blocked: false,
-            spl_blocked: false,
         };
         let mut retrying = state.retrying_spl_withdrawal_requests().iter();
         let mut next_is_retry = state.next_withdrawal_is_retry();
@@ -168,13 +168,12 @@ impl Iterator for WithdrawalRound {
     }
 }
 
-/// Fresh SOL and SPL requests retain their existing burn-index ordering and batching.
-/// An unaffordable head stops its own kind; the other kind can keep filling the round.
+/// Fresh transactions take turns by burn index; an SPL batch may include newer requests.
+/// An unaffordable SOL head stops SOL; SPL selection skips requests it cannot fund.
 struct FreshWithdrawals<'a> {
     pending_sol: Peekable<btree_map::Iter<'a, LedgerBurnIndex, PendingWithdrawalRequest>>,
     pending_spl: Peekable<btree_map::Iter<'a, LedgerBurnIndex, PendingSplWithdrawalRequest>>,
     sol_blocked: bool,
-    spl_blocked: bool,
 }
 
 impl FreshWithdrawals<'_> {
@@ -184,9 +183,9 @@ impl FreshWithdrawals<'_> {
             let next_spl = self.next_burn_index_of_spl();
             let plan = match (next_sol, next_spl) {
                 (None, None) => return None,
-                (Some(sol), Some(spl)) if spl < sol => self.next_spl(budget),
+                (Some(sol), Some(spl)) if spl < sol => self.next_spl_batch(next_sol, budget),
                 (Some(_), _) => self.next_sol_batch(next_spl, budget),
-                (None, Some(_)) => self.next_spl(budget),
+                (None, Some(_)) => self.next_spl_batch(None, budget),
             };
             if plan.is_some() {
                 return plan;
@@ -202,9 +201,6 @@ impl FreshWithdrawals<'_> {
     }
 
     fn next_burn_index_of_spl(&mut self) -> Option<LedgerBurnIndex> {
-        if self.spl_blocked {
-            return None;
-        }
         self.pending_spl.peek().map(|(burn_index, _)| **burn_index)
     }
 
@@ -248,15 +244,41 @@ impl FreshWithdrawals<'_> {
         }
     }
 
-    fn next_spl(&mut self, budget: &mut WithdrawalBudget<'_>) -> Option<WithdrawalPlan> {
-        let (_, pending) = self.pending_spl.peek().copied()?;
-        if !budget.reserve_spl(&pending.request) {
-            self.spl_blocked = true;
+    fn next_spl_batch(
+        &mut self,
+        next_sol: Option<LedgerBurnIndex>,
+        budget: &mut WithdrawalBudget<'_>,
+    ) -> Option<WithdrawalPlan> {
+        let candidates = self
+            .pending_spl
+            .clone()
+            .map(|(_, pending)| &pending.request);
+        let Some(requests) = select_spl_withdrawal_batch(
+            budget.state,
+            candidates,
+            next_sol,
+            budget.available_balance,
+            &budget.available_tokens,
+        ) else {
+            // These requests cannot use this round's budget. Leave them queued in state,
+            // but continue the round at the next SOL request or later SPL requests.
+            while self
+                .pending_spl
+                .next_if(|(index, _)| next_sol.is_none_or(|sol| **index < sol))
+                .is_some()
+            {}
             return None;
-        }
-        let request = pending.request.clone();
-        self.pending_spl.next();
-        Some(WithdrawalPlan::Spl(vec![request]))
+        };
+        budget.reserve_spl_batch(&requests);
+        let last = requests.last().expect("BUG: a selected SPL batch is empty");
+        // Advance past the selected prefix, including any skipped unfunded requests.
+        // Requests trimmed from the batch remain available for another transaction.
+        while self
+            .pending_spl
+            .next_if(|(index, _)| **index <= last.cksol_burn_block_index)
+            .is_some()
+        {}
+        Some(WithdrawalPlan::Spl(requests))
     }
 }
 
@@ -268,19 +290,20 @@ struct WithdrawalBudget<'a> {
 
 impl WithdrawalBudget<'_> {
     /// Fresh withdrawals need free SOL; retry SOL is already held outside this budget.
-    fn reserve_spl(&mut self, request: &SplWithdrawalRequest) -> bool {
-        let Some(reserved) = spl_withdrawal_batch_budget(self.state, std::slice::from_ref(request))
-        else {
-            return false;
-        };
-        let Some(remaining_balance) = self.available_balance.checked_sub(reserved) else {
-            return false;
-        };
-        if !self.reserve_tokens(&request.terms) {
-            return false;
+    fn reserve_spl_batch(&mut self, requests: &[SplWithdrawalRequest]) {
+        // Selection checked this exact budget without an async call in between.
+        let reserved = spl_withdrawal_batch_budget(self.state, requests)
+            .expect("BUG: selected SPL withdrawals cannot fund their retries");
+        self.available_balance = self
+            .available_balance
+            .checked_sub(reserved)
+            .expect("BUG: selected SPL withdrawals exceed the round's SOL budget");
+        for request in requests {
+            assert!(
+                self.reserve_tokens(&request.terms),
+                "BUG: selected SPL withdrawals exceed the round's token budget"
+            );
         }
-        self.available_balance = remaining_balance;
-        true
     }
 
     /// Both queues share the same available treasury tokens.
