@@ -77,7 +77,7 @@ pub(super) fn create_transaction<R: CanisterRuntime>(
         return false;
     }
     // An SPL sweep may have reserved part of the balance during the nonce read.
-    if !read_state(|state| state.covers_spl_withdrawal(&request.terms)) {
+    if !read_state(|state| state.covers_spl_withdrawal(request)) {
         log!(
             Priority::Info,
             "The balance no longer covers SPL withdrawal {}, skipping it this round",

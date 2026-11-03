@@ -925,9 +925,18 @@ impl State {
         WithdrawSplStatus::NotFound
     }
 
-    pub fn covers_spl_withdrawal(&self, request: &SplWithdrawalRequestTerms) -> bool {
-        self.spendable_balance() >= self.spl_withdrawal_transaction_cost(std::iter::once(request))
-            && self.spl_treasury_balance(&request.mint) >= request.amount
+    pub fn covers_spl_withdrawal(&self, request: &SplWithdrawalRequest) -> bool {
+        // Retry SOL was reserved before the original batch was signed.
+        let sol_is_prepaid = self
+            .retrying_spl_withdrawal_requests
+            .contains_key(&request.cksol_burn_block_index);
+        let has_enough_sol = sol_is_prepaid
+            || self.spendable_balance()
+                >= self.spl_withdrawal_transaction_cost(std::iter::once(&request.terms));
+        let has_enough_tokens =
+            self.spl_treasury_balance(&request.terms.mint) >= request.terms.amount;
+
+        has_enough_sol && has_enough_tokens
     }
 
     pub fn created_spl_withdrawal_requests(
@@ -1276,6 +1285,39 @@ impl State {
         cost
     }
 
+    /// SOL budget for a batch attempt and one individual retry per request if it fails.
+    /// Returns `None` when the size or an individual request's quoted fee disallows batching.
+    pub fn spl_withdrawal_batch_budget(
+        &self,
+        requests: &[SplWithdrawalRequest],
+    ) -> Option<Lamport> {
+        if !(2..=MAX_SPL_WITHDRAWALS_PER_NONCE_TX).contains(&requests.len()) {
+            return None;
+        }
+        // Round up so every request covers its share without borrowing another user's fee.
+        let batch_fee_share = FEE_PER_SIGNATURE.div_ceil(requests.len() as Lamport);
+        // A failed batch only spends its signature fee; its ATA creation is rolled back.
+        let mut budget = FEE_PER_SIGNATURE;
+        for request in requests {
+            let retry_cost = self.spl_withdrawal_transaction_cost(std::iter::once(&request.terms));
+            if request.terms.fee < retry_cost.checked_add(batch_fee_share)? {
+                return None;
+            }
+            // Each individual retry reserves its own rent, including when ATAs are shared.
+            budget = budget.checked_add(retry_cost)?;
+        }
+        Some(budget)
+    }
+
+    fn spl_withdrawal_reservation(&self, requests: &[SplWithdrawalRequest]) -> Lamport {
+        if let [request] = requests {
+            self.spl_withdrawal_transaction_cost(std::iter::once(&request.terms))
+        } else {
+            self.spl_withdrawal_batch_budget(requests)
+                .expect("Attempted to reserve an SPL batch its quoted fees cannot cover")
+        }
+    }
+
     fn process_spl_transaction_created(
         &mut self,
         burn_indices: &[LedgerBurnIndex],
@@ -1295,41 +1337,73 @@ impl State {
             self.retrying_spl_withdrawal_requests
                 .contains_key(burn_index)
         });
-        // A failed batch gets one individual attempt per request, never another batch.
-        assert!(
-            !is_retry || burn_indices.len() == 1,
-            "Attempted to batch an SPL withdrawal queued for individual retry"
-        );
-        let queued = if is_retry {
-            &self.retrying_spl_withdrawal_requests
+        let withdrawals = if is_retry {
+            self.prepare_spl_withdrawal_retry(burn_indices)
         } else {
-            &self.pending_spl_withdrawal_requests
+            self.prepare_fresh_spl_withdrawals(burn_indices)
         };
-        let cost = self.spl_withdrawal_transaction_cost(burn_indices.iter().map(|burn_index| {
-            &queued
-                .get(burn_index)
-                .expect(
-                    "Attempted to create a transaction for an SPL withdrawal that is not queued",
-                )
-                .request
-                .terms
-        }));
+        self.bind_spl_withdrawals(withdrawals, nonce_account, nonce_value);
+        self.next_withdrawal_is_retry = !is_retry;
+    }
+
+    fn prepare_fresh_spl_withdrawals(
+        &mut self,
+        burn_indices: &[LedgerBurnIndex],
+    ) -> Vec<PendingSplWithdrawalRequest> {
+        let requests: Vec<_> = burn_indices
+            .iter()
+            .map(|burn_index| {
+                self.pending_spl_withdrawal_requests
+                    .get(burn_index)
+                    .expect("Attempted to create a transaction for an SPL withdrawal that is not queued")
+                    .request
+                    .clone()
+            })
+            .collect();
+        let reserved = self.spl_withdrawal_reservation(&requests);
         self.balance = self
             .balance
-            .checked_sub(cost)
+            .checked_sub(reserved)
             .expect("BUG: insufficient minter balance for SPL withdrawal");
+        burn_indices
+            .iter()
+            .map(|burn_index| {
+                self.pending_spl_withdrawal_requests
+                    .remove(burn_index)
+                    .expect("BUG: a pending SPL withdrawal disappeared during transaction creation")
+            })
+            .collect()
+    }
+
+    fn prepare_spl_withdrawal_retry(
+        &mut self,
+        burn_indices: &[LedgerBurnIndex],
+    ) -> Vec<PendingSplWithdrawalRequest> {
+        assert_eq!(
+            burn_indices.len(),
+            1,
+            "Attempted to batch an SPL withdrawal queued for individual retry"
+        );
+        let withdrawal = self
+            .retrying_spl_withdrawal_requests
+            .remove(&burn_indices[0])
+            .expect("BUG: an SPL withdrawal retry disappeared during transaction creation");
+        vec![withdrawal]
+    }
+
+    fn bind_spl_withdrawals(
+        &mut self,
+        withdrawals: Vec<PendingSplWithdrawalRequest>,
+        nonce_account: &Address,
+        nonce_value: Hash,
+    ) {
+        let burn_indices = withdrawals
+            .iter()
+            .map(|withdrawal| withdrawal.request.cksol_burn_block_index)
+            .collect();
         self.nonce_pool.bind(nonce_account, nonce_value);
-
-        let queued = if is_retry {
-            &mut self.retrying_spl_withdrawal_requests
-        } else {
-            &mut self.pending_spl_withdrawal_requests
-        };
-
-        for burn_index in burn_indices {
-            let withdrawal = queued
-                .remove(burn_index)
-                .expect("BUG: a queued SPL withdrawal disappeared during transaction creation");
+        for withdrawal in withdrawals {
+            let burn_index = withdrawal.request.cksol_burn_block_index;
             let treasury = self
                 .spl_treasury_balances
                 .entry(withdrawal.request.terms.mint)
@@ -1339,7 +1413,7 @@ impl State {
                 .expect("BUG: insufficient treasury tokens for SPL withdrawal");
             assert_eq!(
                 self.created_spl_withdrawal_requests
-                    .insert(*burn_index, withdrawal),
+                    .insert(burn_index, withdrawal),
                 None,
                 "Attempted to create a transaction for an already created SPL withdrawal: {burn_index}"
             );
@@ -1349,13 +1423,12 @@ impl State {
                 *nonce_account,
                 CreatedSplWithdrawalTransaction {
                     nonce_value,
-                    burn_indices: burn_indices.to_vec(),
+                    burn_indices,
                 },
             ),
             None,
             "BUG: nonce account {nonce_account} already has a created SPL transaction"
         );
-        self.next_withdrawal_is_retry = !is_retry;
     }
 
     fn process_transaction_created(
@@ -1594,7 +1667,7 @@ impl State {
         })
     }
 
-    /// The lamports reserved for all SPL withdrawals in an in-flight transaction.
+    /// The in-flight transaction's fee and rent limit, excluding funds held for fallback retries.
     pub fn spl_withdrawal_reserved_cost(&self, signature: &Signature) -> Option<Lamport> {
         let mut requests = self
             .sent_spl_withdrawal_requests
@@ -1606,6 +1679,21 @@ impl State {
         Some(self.spl_withdrawal_transaction_cost(requests))
     }
 
+    /// Includes the fallback funds while a batch is in flight; single transactions have no fallback.
+    fn spl_withdrawal_reserved_budget(&self, signature: &Signature) -> Option<Lamport> {
+        let requests: Vec<_> = self
+            .sent_spl_withdrawal_requests
+            .values()
+            .filter(|sent| &sent.signature == signature)
+            .map(|sent| sent.request.clone())
+            .collect();
+        if requests.is_empty() {
+            None
+        } else {
+            Some(self.spl_withdrawal_reservation(&requests))
+        }
+    }
+
     fn process_spl_withdrawal_succeeded(&mut self, signature: &Signature, lamports_spent: Lamport) {
         let reserved = self
             .spl_withdrawal_reserved_cost(signature)
@@ -1614,10 +1702,13 @@ impl State {
             lamports_spent <= reserved,
             "Attempted to reconcile an SPL withdrawal spend above its reserved fee and rent"
         );
+        let budget = self
+            .spl_withdrawal_reserved_budget(signature)
+            .expect("BUG: an in-flight SPL withdrawal has a reserved budget");
         self.balance = self
             .balance
-            .checked_add(reserved - lamports_spent)
-            .expect("BUG: returning unspent SPL withdrawal rent overflows the balance");
+            .checked_add(budget - lamports_spent)
+            .expect("BUG: returning unspent SPL withdrawal funds overflows the balance");
         self.process_transaction_succeeded(signature);
     }
 
@@ -1671,6 +1762,14 @@ impl State {
             }
         }
         self.record_failed_transaction(signature, transaction);
+        if let Some(reserved) = self.spl_withdrawal_reserved_budget(signature) {
+            // A failed transaction still pays its fee. Subtract it so only unspent
+            // rent and fallback funds return to the available balance.
+            self.balance = self
+                .balance
+                .checked_add(reserved - FEE_PER_SIGNATURE)
+                .expect("BUG: returning unspent SPL withdrawal funds overflows the balance");
+        }
         for (burn_index, sent) in self.take_failed_spl_withdrawals(signature) {
             assert_eq!(
                 self.pending_spl_withdrawal_reimbursements.insert(
@@ -1709,7 +1808,8 @@ impl State {
         };
         self.nonce_pool.free(nonce_account);
         self.record_failed_transaction(signature, transaction);
-        // The failed batch moved no tokens. Keep each request executable instead of reimbursing it.
+        // The failed batch moved no tokens. Its remaining SOL reservation funds the
+        // individual retries and stays unavailable to fresh work.
         for (burn_index, sent) in self.take_failed_spl_withdrawals(signature) {
             assert_eq!(
                 self.retrying_spl_withdrawal_requests.insert(
@@ -1768,19 +1868,6 @@ impl State {
             .sent_spl_withdrawal_requests
             .extract_if(.., |_, sent| &sent.signature == signature)
             .collect();
-        if !failed_spl_withdrawals.is_empty() {
-            // Failed Solana transactions roll back ATA creation but still pay the transaction fee.
-            // Subtract the spent fee from the reservation so only unused ATA rent is returned.
-            let reserved = self.spl_withdrawal_transaction_cost(
-                failed_spl_withdrawals
-                    .iter()
-                    .map(|(_, sent)| &sent.request.terms),
-            );
-            self.balance = self
-                .balance
-                .checked_add(reserved - FEE_PER_SIGNATURE)
-                .expect("BUG: returning unspent SPL withdrawal rent overflows the balance");
-        }
         for (_, sent) in &failed_spl_withdrawals {
             let treasury = self
                 .spl_treasury_balances

@@ -51,7 +51,7 @@ impl WithdrawalRound {
         let mut next_is_retry = state.next_withdrawal_is_retry;
         // Reserve in processing order, so neither queue spends funds promised to the other.
         while round.retries.len() + round.fresh.len() < slots {
-            if next_is_retry && round.take_retry(&mut retrying, &mut budget) {
+            if next_is_retry && round.take_spl_retry(&mut retrying, &mut budget) {
                 next_is_retry = false;
                 continue;
             }
@@ -60,7 +60,7 @@ impl WithdrawalRound {
                 next_is_retry = true;
                 continue;
             }
-            if round.take_retry(&mut retrying, &mut budget) {
+            if round.take_spl_retry(&mut retrying, &mut budget) {
                 next_is_retry = false;
                 continue;
             }
@@ -70,13 +70,15 @@ impl WithdrawalRound {
     }
 
     /// Retries keep their ID order, skipping any the shared budget cannot cover.
-    fn take_retry(
+    fn take_spl_retry(
         &mut self,
         retrying: &mut btree_map::Iter<'_, LedgerBurnIndex, PendingSplWithdrawalRequest>,
         budget: &mut WithdrawalBudget<'_>,
     ) -> bool {
         for (_, pending) in retrying {
-            if budget.reserve_spl(&pending.request.terms) {
+            // The failed batch kept retry SOL reserved but released its tokens.
+            // Reserve only tokens here so the retry's SOL is not counted twice.
+            if budget.reserve_tokens(&pending.request.terms) {
                 self.retries.push_back(pending.request.clone());
                 return true;
             }
@@ -84,7 +86,7 @@ impl WithdrawalRound {
         false
     }
 
-    fn next_retry(&mut self) -> Option<WithdrawalPlan> {
+    fn next_spl_retry(&mut self) -> Option<WithdrawalPlan> {
         let request = self.retries.pop_front()?;
         self.next_is_retry = false;
         Some(WithdrawalPlan::Spl(request))
@@ -102,9 +104,9 @@ impl Iterator for WithdrawalRound {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_is_retry {
-            self.next_retry().or_else(|| self.next_fresh())
+            self.next_spl_retry().or_else(|| self.next_fresh())
         } else {
-            self.next_fresh().or_else(|| self.next_retry())
+            self.next_fresh().or_else(|| self.next_spl_retry())
         }
     }
 }
@@ -208,23 +210,28 @@ struct WithdrawalBudget<'a> {
 }
 
 impl WithdrawalBudget<'_> {
-    /// Fresh SPL withdrawals and retries reserve from the same per-round budget.
+    /// Fresh withdrawals need free SOL; retry SOL is already held outside this budget.
     fn reserve_spl(&mut self, terms: &SplWithdrawalRequestTerms) -> bool {
-        let affordable = self
-            .available_balance
-            .checked_sub(
-                self.state
-                    .spl_withdrawal_transaction_cost(std::iter::once(terms)),
-            )
-            .and_then(|balance| {
-                let tokens = self.available_tokens.get(&terms.mint).copied().unwrap_or(0);
-                Some((balance, tokens.checked_sub(terms.amount)?))
-            });
-        let Some((remaining_balance, remaining_tokens)) = affordable else {
+        let Some(remaining_balance) = self.available_balance.checked_sub(
+            self.state
+                .spl_withdrawal_transaction_cost(std::iter::once(terms)),
+        ) else {
             return false;
         };
+        if !self.reserve_tokens(terms) {
+            return false;
+        }
         self.available_balance = remaining_balance;
-        self.available_tokens.insert(terms.mint, remaining_tokens);
+        true
+    }
+
+    /// Both queues share the same available treasury tokens.
+    fn reserve_tokens(&mut self, terms: &SplWithdrawalRequestTerms) -> bool {
+        let tokens = self.available_tokens.get(&terms.mint).copied().unwrap_or(0);
+        let Some(remaining) = tokens.checked_sub(terms.amount) else {
+            return false;
+        };
+        self.available_tokens.insert(terms.mint, remaining);
         true
     }
 }

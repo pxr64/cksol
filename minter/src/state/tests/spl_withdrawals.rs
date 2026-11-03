@@ -146,6 +146,7 @@ fn setup_created_spl_withdrawal(
 fn setup_created_spl_batch() -> [SplWithdrawalRequestTerms; 2] {
     let mut first = setup_with_nonce();
     first.create_destination_account = true;
+    first.fee += TokenProgram::Classic.account_rent_exemption();
     accept(100, 7, &first);
     let mut token = spl_token([5; 32].into(), TokenProgram::Token2022);
     token.decimals = 9;
@@ -155,6 +156,7 @@ fn setup_created_spl_batch() -> [SplWithdrawalRequestTerms; 2] {
         mint: token.mint,
         ledger_id: token.ledger_id,
         amount: 123_456_789,
+        fee: request(5).fee + TokenProgram::Token2022.account_rent_exemption(),
         ..first.clone()
     };
     record(
@@ -179,6 +181,12 @@ fn setup_submitted_spl_batch(shared_destination: bool) -> (Vec<u64>, Lamport) {
             // The first request needs no creation instruction. The other four request
             // creation of the same ATA, whose rent must be reserved only once.
             request.create_destination_account = id != 100;
+            request.fee = 1_000_000
+                + if request.create_destination_account {
+                    TokenProgram::Classic.account_rent_exemption()
+                } else {
+                    0
+                };
             // Use `id` for both ledger burn indices just to keep this fixture simple.
             accept(id, id, &request);
         }
@@ -220,6 +228,22 @@ fn setup_spl_withdrawal_retries(shared_destination: bool) -> Vec<SplWithdrawalRe
         .values()
         .map(|pending| pending.request.clone())
         .collect()
+}
+
+/// Two unsubmitted requests with registered classic SPL and Token-2022 mints.
+fn setup_spl_batch_budget_requests() -> Vec<SplWithdrawalRequest> {
+    let classic = setup();
+    let token = spl_token([5; 32].into(), TokenProgram::Token2022);
+    record(EventType::AddedSplToken(token.clone()), 10);
+    let token_2022 = SplWithdrawalRequestTerms {
+        mint: token.mint,
+        ledger_id: token.ledger_id,
+        ..classic.clone()
+    };
+    vec![
+        accepted_request(100, 7, &classic),
+        accepted_request(101, 8, &token_2022),
+    ]
 }
 
 /// Records the terminal event once, rejects a repeat, and checks the shared outcome:
@@ -301,7 +325,6 @@ fn create_individual_spl_retry(
     let before = read_state(Clone::clone);
     let pending = before.retrying_spl_withdrawal_requests()[&id.into()].clone();
     let terms = &pending.request.terms;
-    let reserved = before.spl_withdrawal_transaction_cost(std::iter::once(terms));
     record(
         EventType::CreatedSplWithdrawalTransaction {
             burn_indices: vec![id.into()],
@@ -321,7 +344,8 @@ fn create_individual_spl_retry(
         vec![id.into()]
     );
     assert_eq!(bound_message(&created).recent_blockhash, nonce_value);
-    assert_eq!(created.balance(), before.balance() - reserved);
+    // Retry SOL is prepaid by the failed batch; binding does not charge free SOL again.
+    assert_eq!(created.balance(), before.balance());
     assert_eq!(
         created.spl_treasury_balance(&terms.mint),
         before.spl_treasury_balance(&terms.mint) - terms.amount
@@ -852,7 +876,7 @@ fn should_rebuild_a_mixed_mint_spl_batch_from_created_requests() {
     assert_eq!(
         state.balance(),
         balance_before
-            - FEE_PER_SIGNATURE
+            - 3 * FEE_PER_SIGNATURE
             - TokenProgram::Classic.account_rent_exemption()
             - TokenProgram::Token2022.account_rent_exemption()
     );
@@ -929,6 +953,226 @@ fn should_replay_a_submitted_spl_batch_with_all_requests_under_one_signature() {
 }
 
 #[test]
+fn should_budget_one_batch_fee_and_one_individual_retry_per_spl_withdrawal() {
+    let mut requests = setup_spl_batch_budget_requests();
+    read_state(|state| {
+        assert_eq!(
+            state.spl_withdrawal_batch_budget(&requests),
+            Some(3 * FEE_PER_SIGNATURE)
+        );
+    });
+    for request in &mut requests {
+        request.terms.create_destination_account = true;
+        request.terms.fee = u64::MAX;
+    }
+    // Both fallback transactions reserve their program's ATA rent, plus their signature fees.
+    let expected = 3 * FEE_PER_SIGNATURE
+        + TokenProgram::Classic.account_rent_exemption()
+        + TokenProgram::Token2022.account_rent_exemption();
+    let before = read_state(Clone::clone);
+    assert_eq!(
+        before.spl_withdrawal_batch_budget(&requests),
+        Some(expected)
+    );
+    read_state(|state| assert_eq!(state, &before));
+}
+
+#[test]
+fn should_budget_each_individual_retry_even_when_spl_requests_share_an_ata() {
+    let requests = setup_spl_batch_budget_requests();
+    let mut request = requests[0].clone();
+    request.terms.create_destination_account = true;
+    request.terms.fee = u64::MAX;
+    let mut second = request.clone();
+    second.cksol_burn_block_index = 102.into();
+    second.ckspl_burn_block_index = 9.into();
+    let shared_ata = vec![request, second];
+    read_state(|state| {
+        let rent = TokenProgram::Classic.account_rent_exemption();
+        assert_eq!(
+            state.spl_withdrawal_transaction_cost(shared_ata.iter().map(|request| &request.terms)),
+            FEE_PER_SIGNATURE + rent
+        );
+        // The batch only creates one ATA, but two concurrent solo retries each reserve rent.
+        assert_eq!(
+            state.spl_withdrawal_batch_budget(&shared_ata),
+            Some(3 * FEE_PER_SIGNATURE + 2 * rent)
+        );
+    });
+}
+
+#[test]
+fn should_require_each_spl_fee_to_cover_its_retry_and_share_of_the_batch_fee() {
+    let mut requests = setup_spl_batch_budget_requests();
+    for request in &mut requests {
+        request.terms.create_destination_account = true;
+        let minimum = read_state(|state| {
+            state.spl_withdrawal_transaction_cost(std::iter::once(&request.terms))
+        }) + FEE_PER_SIGNATURE / 2;
+        request.terms.fee = minimum;
+    }
+    assert!(read_state(|state| state.spl_withdrawal_batch_budget(&requests)).is_some());
+    // One large fee must not subsidize a request whose fee is one lamport short.
+    let mut too_little_for_classic = requests.clone();
+    too_little_for_classic[0].terms.fee -= 1;
+    too_little_for_classic[1].terms.fee = u64::MAX;
+    assert_eq!(
+        read_state(|state| state.spl_withdrawal_batch_budget(&too_little_for_classic)),
+        None
+    );
+    requests[0].terms.fee = u64::MAX;
+    requests[1].terms.fee -= 1;
+    assert_eq!(
+        read_state(|state| state.spl_withdrawal_batch_budget(&requests)),
+        None
+    );
+}
+
+#[test]
+fn should_round_up_the_batch_fee_share_for_three_spl_withdrawals() {
+    let mut requests = setup_spl_batch_budget_requests();
+    let mut third = requests[0].clone();
+    third.cksol_burn_block_index = 102.into();
+    third.ckspl_burn_block_index = 9.into();
+    requests.push(third);
+    // 5,000 / 3 rounds up to 1,667 for each request; its solo retry needs another 5,000.
+    for request in &mut requests {
+        request.terms.fee = 6_667;
+    }
+    assert_eq!(
+        read_state(|state| state.spl_withdrawal_batch_budget(&requests)),
+        Some(20_000)
+    );
+    requests[0].terms.fee = 6_666;
+    assert_eq!(
+        read_state(|state| state.spl_withdrawal_batch_budget(&requests)),
+        None
+    );
+}
+
+#[test]
+fn should_only_quote_spl_batch_budgets_for_two_to_five_requests() {
+    let requests = setup_spl_batch_budget_requests();
+    let mut five = requests.clone();
+    for id in 102..105 {
+        let mut request = requests[0].clone();
+        request.cksol_burn_block_index = id.into();
+        request.ckspl_burn_block_index = id.into();
+        five.push(request);
+    }
+    read_state(|state| {
+        assert_eq!(state.spl_withdrawal_batch_budget(&[]), None);
+        assert_eq!(state.spl_withdrawal_batch_budget(&requests[..1]), None);
+        assert_eq!(
+            state.spl_withdrawal_batch_budget(&five),
+            Some(6 * FEE_PER_SIGNATURE)
+        );
+    });
+    five.push(requests[0].clone());
+    assert_eq!(
+        read_state(|state| state.spl_withdrawal_batch_budget(&five)),
+        None
+    );
+}
+
+#[test]
+fn should_reject_batch_creation_when_only_the_initial_transaction_can_be_funded() {
+    let terms = setup_with(init_args_with_nonce_account());
+    record(minter_public_key_fetched_event(), 3);
+    init_balance_to(2 * FEE_PER_SIGNATURE);
+    events::fund_spl_treasury(&spl_token(terms.mint, TokenProgram::Classic), FUNDED_TOKENS);
+    accept(100, 7, &terms);
+    accept(101, 8, &terms);
+    let before = read_state(Clone::clone);
+    // There is enough SOL for one transaction, but not its two possible individual retries.
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| record(
+            spl_transaction_created(&[100, 101]),
+            30
+        )))
+        .is_err()
+    );
+    read_state(|state| assert_eq!(state, &before));
+    assert_replay_matches();
+}
+
+#[test]
+fn should_reject_batch_creation_when_a_quoted_fee_cannot_cover_fallback() {
+    let mut terms = setup_with_nonce();
+    terms.fee = FEE_PER_SIGNATURE;
+    accept(100, 7, &terms);
+    accept(101, 8, &terms);
+    let before = read_state(Clone::clone);
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| record(
+            spl_transaction_created(&[100, 101]),
+            30
+        )))
+        .is_err()
+    );
+    read_state(|state| assert_eq!(state, &before));
+    assert_replay_matches();
+}
+
+#[test]
+fn should_keep_retry_funds_unavailable_to_fresh_work_and_consume_them_only_once() {
+    let terms = setup_with(init_args_with_nonce_account());
+    record(minter_public_key_fetched_event(), 3);
+    // Leave exactly the main account's rent exemption after reserving the batch and retries.
+    init_balance_to(RENT_EXEMPTION_THRESHOLD + 3 * FEE_PER_SIGNATURE);
+    events::fund_spl_treasury(&spl_token(terms.mint, TokenProgram::Classic), FUNDED_TOKENS);
+    accept(100, 7, &terms);
+    accept(101, 8, &terms);
+    record(spl_transaction_created(&[100, 101]), 30);
+    record(submitted_spl_withdrawals(&[100, 101]), 40);
+    accept(200, 200, &terms);
+    record(
+        EventType::SplitFailedSplWithdrawalBatch {
+            signature: minter_signature(),
+        },
+        50,
+    );
+    let split = assert_replay_matches();
+    assert_eq!(split.balance(), RENT_EXEMPTION_THRESHOLD);
+    assert_eq!(
+        split.withdrawal_round(10).collect::<Vec<_>>(),
+        vec![
+            WithdrawalPlan::Spl(accepted_request(100, 7, &terms)),
+            WithdrawalPlan::Spl(accepted_request(101, 8, &terms)),
+        ]
+    );
+    assert!(split.covers_spl_withdrawal(&accepted_request(100, 7, &terms)));
+    assert!(!split.covers_spl_withdrawal(&accepted_request(200, 200, &terms)));
+
+    // A successful retry and a terminally failed retry both spend their prepaid signature fee.
+    let first = create_individual_spl_retry(100, Hash::new_from_array([19; 32]), 60);
+    let first_signature = [30; 64].into();
+    submit_individual_spl_retry(&first, first_signature, 70);
+    finalize_individual_spl_retry(&first, first_signature, true, 80);
+    let second = create_individual_spl_retry(101, Hash::new_from_array([20; 32]), 90);
+    let second_signature = [31; 64].into();
+    submit_individual_spl_retry(&second, second_signature, 100);
+    finalize_individual_spl_retry(&second, second_signature, false, 110);
+    let finalized = assert_replay_matches();
+    assert_eq!(finalized.balance(), RENT_EXEMPTION_THRESHOLD);
+    assert_eq!(
+        finalized.spl_treasury_balance(&terms.mint),
+        FUNDED_TOKENS - terms.amount
+    );
+    assert!(finalized.retrying_spl_withdrawal_requests().is_empty());
+    assert!(
+        finalized
+            .pending_spl_withdrawal_reimbursements()
+            .contains_key(&101.into())
+    );
+    assert!(
+        finalized
+            .pending_spl_withdrawal_requests()
+            .contains_key(&200.into())
+    );
+}
+
+#[test]
 fn should_reconcile_the_whole_spl_batch_reservation_on_success() {
     for shared_destination in [false, true] {
         for spend_all_rent in [false, true] {
@@ -939,7 +1183,10 @@ fn should_reconcile_the_whole_spl_batch_reservation_on_success() {
             );
             assert_eq!(
                 read_state(|state| state.balance()),
-                FUNDED_BALANCE - reserved
+                FUNDED_BALANCE
+                    - read_state(|state| state
+                        .spl_withdrawal_reserved_budget(&minter_signature())
+                        .unwrap())
             );
             let lamports_spent = if spend_all_rent {
                 reserved
@@ -1003,6 +1250,11 @@ fn should_return_each_unused_ata_rent_once_after_an_spl_batch_fails() {
 fn should_split_a_failed_spl_batch_without_reimbursing_its_requests() {
     for shared_destination in [false, true] {
         let (indices, _) = setup_submitted_spl_batch(shared_destination);
+        let reserved = read_state(|state| {
+            state
+                .spl_withdrawal_reserved_budget(&minter_signature())
+                .unwrap()
+        });
         let sent = read_state(|state| state.sent_spl_withdrawal_requests().clone());
         let mut fresh = sent.values().next().unwrap().request.terms.clone();
         fresh.create_destination_account = false;
@@ -1015,7 +1267,7 @@ fn should_split_a_failed_spl_batch_without_reimbursing_its_requests() {
         );
 
         let state = assert_replay_matches();
-        assert_eq!(state.balance(), FUNDED_BALANCE - FEE_PER_SIGNATURE);
+        assert_eq!(state.balance(), FUNDED_BALANCE - reserved);
         assert_eq!(state.nonce_pool().num_free_accounts(), 1);
         assert!(state.submitted_transactions().is_empty());
         assert!(
@@ -1241,10 +1493,16 @@ fn should_reject_spl_batch_submission_that_does_not_match_the_bound_requests() {
 }
 
 #[test]
-fn should_reserve_one_signature_and_one_rent_per_destination_in_an_spl_batch() {
+fn should_reserve_the_batch_fee_and_each_individual_retry_before_binding() {
     let mut request = setup_with_nonce();
     for id in 100..105 {
         request.create_destination_account = id != 100;
+        request.fee = 1_000_000
+            + if request.create_destination_account {
+                TokenProgram::Classic.account_rent_exemption()
+            } else {
+                0
+            };
         accept(id, id, &request);
     }
     let balance_before = read_state(|state| state.balance());
@@ -1252,7 +1510,7 @@ fn should_reserve_one_signature_and_one_rent_per_destination_in_an_spl_batch() {
     let state = assert_replay_matches();
     assert_eq!(
         state.balance(),
-        balance_before - FEE_PER_SIGNATURE - TokenProgram::Classic.account_rent_exemption()
+        balance_before - 6 * FEE_PER_SIGNATURE - 4 * TokenProgram::Classic.account_rent_exemption()
     );
     assert_eq!(
         state.spl_treasury_balance(&request.mint),
@@ -1441,48 +1699,44 @@ fn should_skip_unaffordable_spl_retries_without_blocking_other_work() {
             WithdrawalPlan::Spl(accepted_request(200, 200, &fresh)),
         ]
     );
-    // Neither retry can afford ATA rent, but the fresh request only needs a signature fee.
+    // Retry SOL is prepaid, so reducing free SOL only limits the fresh request.
     mutate_state(|state| {
         state.balance = RENT_EXEMPTION_THRESHOLD + FEE_PER_SIGNATURE;
     });
     assert_eq!(
         read_state(|state| state.withdrawal_round(usize::MAX).collect::<Vec<_>>()),
-        vec![WithdrawalPlan::Spl(accepted_request(200, 200, &fresh)),]
+        vec![
+            WithdrawalPlan::Spl(retries[1].clone()),
+            WithdrawalPlan::Spl(accepted_request(200, 200, &fresh)),
+        ]
     );
     mutate_state(|state| {
         state.balance = RENT_EXEMPTION_THRESHOLD;
     });
-    assert!(!read_state(
-        |state| state.can_create_withdrawal_transaction()
-    ));
+    assert_eq!(
+        read_state(|state| state.withdrawal_round(usize::MAX).collect::<Vec<_>>()),
+        vec![WithdrawalPlan::Spl(retries[1].clone()),]
+    );
+    assert!(read_state(|state| state.can_create_withdrawal_transaction()));
 }
 
 #[test]
-fn should_share_one_sol_and_token_budget_between_spl_retries_and_fresh_requests() {
-    for (balance, tokens) in [
-        (FUNDED_BALANCE, 2_000_000),
-        (
-            RENT_EXEMPTION_THRESHOLD + 2 * FEE_PER_SIGNATURE,
-            FUNDED_TOKENS,
-        ),
-    ] {
-        let retries = setup_spl_withdrawal_retries(true);
-        let terms = &retries[0].terms;
-        accept(200, 200, terms);
-        mutate_state(|state| {
-            state.balance = balance;
-            state.spl_treasury_balances.insert(terms.mint, tokens);
-        });
-        let before = read_state(Clone::clone);
-        assert_eq!(
-            before.withdrawal_round(usize::MAX).collect::<Vec<_>>(),
-            vec![
-                WithdrawalPlan::Spl(retries[0].clone()),
-                WithdrawalPlan::Spl(accepted_request(200, 200, terms)),
-            ]
-        );
-        read_state(|state| assert_eq!(state, &before));
-    }
+fn should_share_treasury_tokens_between_prepaid_retries_and_fresh_requests() {
+    let retries = setup_spl_withdrawal_retries(true);
+    let terms = &retries[0].terms;
+    accept(200, 200, terms);
+    mutate_state(|state| {
+        state.spl_treasury_balances.insert(terms.mint, 2_000_000);
+    });
+    let before = read_state(Clone::clone);
+    assert_eq!(
+        before.withdrawal_round(usize::MAX).collect::<Vec<_>>(),
+        vec![
+            WithdrawalPlan::Spl(retries[0].clone()),
+            WithdrawalPlan::Spl(accepted_request(200, 200, terms)),
+        ]
+    );
+    read_state(|state| assert_eq!(state, &before));
 }
 
 #[test]
