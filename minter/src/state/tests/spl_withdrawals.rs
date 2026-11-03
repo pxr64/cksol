@@ -1,10 +1,13 @@
 use crate::withdraw::round::{WithdrawalPlan, WithdrawalRound};
-use crate::withdraw::spl::covers_spl_withdrawal;
+use crate::withdraw::spl::covers_spl_withdrawals;
 use crate::withdraw::spl::fees::{spl_withdrawal_reserved_budget, spl_withdrawal_reserved_cost};
 use crate::{
     constants::{FEE_PER_SIGNATURE, RENT_EXEMPTION_THRESHOLD},
     numeric::LedgerBurnIndex,
-    spl_transfer::{build_spl_withdrawal_instructions, build_spl_withdrawal_message},
+    spl_transfer::{
+        build_spl_withdrawal_message,
+        withdrawal::{SplWithdrawalTransfer, build_batch_spl_withdrawal_instructions},
+    },
     state::{
         CompletedSplWithdrawalFeeReimbursement, MinterTransaction,
         PendingSplWithdrawalFeeReimbursement, PendingSplWithdrawalRequest, TokenProgram,
@@ -162,14 +165,22 @@ mod nonce_binding {
                 request.ledger_id = token.ledger_id;
                 request.amount = 123_456_789;
                 request.create_destination_account = create_destination_account;
+                request.fee = crate::withdraw::spl::quote_withdrawal_fee(
+                    1_000_000,
+                    token_program,
+                    create_destination_account,
+                )
+                .unwrap();
                 accept(100, 7, &request);
                 record(spl_transaction_created(&[100]), 30);
-                let instructions = build_spl_withdrawal_instructions(
+                let instructions = build_batch_spl_withdrawal_instructions(
                     &MINTER_ADDRESS,
-                    &token,
-                    &request.address,
-                    request.amount,
-                    create_destination_account,
+                    &[SplWithdrawalTransfer {
+                        token: &token,
+                        destination: &request.address,
+                        amount: request.amount,
+                        create_destination_account,
+                    }],
                 );
                 let expected = build_spl_withdrawal_message(
                     &MINTER_ADDRESS,
@@ -512,8 +523,9 @@ mod finalization {
             record(submitted_spl_withdrawal(100), 40);
             let balance_before = read_state(|state| state.balance());
 
-            let replayed = finalize(EventType::SucceededTransaction {
+            let replayed = finalize(EventType::SucceededSplWithdrawalTransaction {
                 signature: minter_signature(),
+                lamports_spent: FEE_PER_SIGNATURE + token_program.account_rent_exemption(),
             });
 
             assert_eq!(
@@ -521,7 +533,7 @@ mod finalization {
                 accepted_request(100, 7, &request)
             );
             assert!(replayed.failed_spl_withdrawal_requests().is_empty());
-            assert_eq!(replayed.balance(), balance_before);
+            assert_eq!(replayed.balance(), balance_before + FEE_PER_SIGNATURE);
         }
     }
 
@@ -532,8 +544,7 @@ mod finalization {
                 reset_state();
                 reset_events();
                 let request =
-                    setup_created_spl_withdrawal(token_program, create_destination_account);
-                record(submitted_spl_withdrawal(100), 40);
+                    setup_submitted_spl_withdrawal_retry(token_program, create_destination_account);
 
                 let replayed = finalize(EventType::FailedTransaction {
                     signature: minter_signature(),
@@ -544,7 +555,7 @@ mod finalization {
                     accepted_request(100, 7, &request)
                 );
                 assert!(replayed.successful_spl_withdrawal_requests().is_empty());
-                assert_eq!(replayed.balance(), FUNDED_BALANCE - FEE_PER_SIGNATURE);
+                assert_eq!(replayed.balance(), FUNDED_BALANCE - 2 * FEE_PER_SIGNATURE);
             }
         }
     }
@@ -585,6 +596,16 @@ mod finalization {
         record(submitted_spl_withdrawal(100), 40);
         let original = read_state(Clone::clone);
         let reserved = spl_withdrawal_reserved_cost(&original, &minter_signature()).unwrap();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                EventType::SucceededTransaction {
+                    signature: minter_signature()
+                },
+                50
+            )))
+            .is_err()
+        );
+        read_state(|state| assert_eq!(state, &original));
         for lamports_spent in [reserved + 1, u64::MAX] {
             assert!(
                 catch_unwind(AssertUnwindSafe(|| record(
@@ -604,8 +625,9 @@ mod finalization {
     fn should_not_reuse_the_index_of_a_finalized_spl_withdrawal() {
         let request = setup_created_spl_withdrawal(TokenProgram::Classic, false);
         record(submitted_spl_withdrawal(100), 40);
-        finalize(EventType::SucceededTransaction {
+        finalize(EventType::SucceededSplWithdrawalTransaction {
             signature: minter_signature(),
+            lamports_spent: FEE_PER_SIGNATURE,
         });
         assert!(catch_unwind(AssertUnwindSafe(|| accept(100, 8, &request))).is_err());
         assert!(
@@ -664,34 +686,29 @@ mod finalization {
             }
         }
     }
-
     #[test]
-    fn should_return_each_unused_ata_rent_once_after_an_spl_batch_fails() {
-        for shared_destination in [false, true] {
-            let (indices, reserved) = setup_submitted_spl_batch(shared_destination);
-            assert_eq!(
-                read_state(|state| spl_withdrawal_reserved_cost(state, &minter_signature())),
-                Some(reserved)
-            );
-            record(
-                EventType::FailedTransaction {
-                    signature: minter_signature(),
-                },
-                80,
-            );
-            let state = assert_replay_matches();
-            assert_eq!(state.balance(), FUNDED_BALANCE - FEE_PER_SIGNATURE);
-            assert_eq!(state.failed_spl_withdrawal_requests().len(), indices.len());
-            assert!(state.sent_spl_withdrawal_requests().is_empty());
-            assert_eq!(
-                spl_withdrawal_reserved_cost(&state, &minter_signature()),
-                None
-            );
-            assert_eq!(state.nonce_pool().num_free_accounts(), 1);
-            assert_eq!(state.spl_treasury_balance(&[2; 32].into()), FUNDED_TOKENS);
-            if !shared_destination {
-                assert_eq!(state.spl_treasury_balance(&[5; 32].into()), 200_000_000);
+    fn should_reject_reimbursing_a_fresh_spl_transaction_before_its_retry() {
+        for batch in [false, true] {
+            reset_state();
+            reset_events();
+            if batch {
+                setup_submitted_spl_batch(true);
+            } else {
+                setup_created_spl_withdrawal(TokenProgram::Classic, false);
+                record(submitted_spl_withdrawal(100), 40);
             }
+            let before = read_state(Clone::clone);
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| record(
+                    EventType::FailedTransaction {
+                        signature: minter_signature()
+                    },
+                    80
+                )))
+                .is_err()
+            );
+            read_state(|state| assert_eq!(state, &before));
+            assert_replay_matches();
         }
     }
 
@@ -769,7 +786,7 @@ mod reservations {
         record(submitted_spl_withdrawals(&[100, 101]), 40);
         accept(200, 200, &terms);
         record(
-            EventType::SplitFailedSplWithdrawalBatch {
+            EventType::RetryFailedSplWithdrawalTransaction {
                 signature: minter_signature(),
             },
             50,
@@ -779,17 +796,17 @@ mod reservations {
         assert_eq!(
             WithdrawalRound::take_from_queue(&split, 10).collect::<Vec<_>>(),
             vec![
-                WithdrawalPlan::Spl(accepted_request(100, 7, &terms)),
-                WithdrawalPlan::Spl(accepted_request(101, 8, &terms)),
+                WithdrawalPlan::Spl(vec![accepted_request(100, 7, &terms)]),
+                WithdrawalPlan::Spl(vec![accepted_request(101, 8, &terms)]),
             ]
         );
-        assert!(covers_spl_withdrawal(
+        assert!(covers_spl_withdrawals(
             &split,
-            &accepted_request(100, 7, &terms)
+            std::slice::from_ref(&accepted_request(100, 7, &terms))
         ));
-        assert!(!covers_spl_withdrawal(
+        assert!(!covers_spl_withdrawals(
             &split,
-            &accepted_request(200, 200, &terms)
+            std::slice::from_ref(&accepted_request(200, 200, &terms))
         ));
 
         // A successful retry and a terminally failed retry both spend their prepaid signature fee.
@@ -879,12 +896,11 @@ mod reservations {
 
     #[test]
     fn should_reserve_treasury_tokens_on_creation_and_return_them_on_failure() {
-        let request = setup_created_spl_withdrawal(TokenProgram::Classic, false);
+        let request = setup_submitted_spl_withdrawal_retry(TokenProgram::Classic, false);
         assert_eq!(
             assert_replay_matches().spl_treasury_balance(&request.mint),
             FUNDED_TOKENS - request.amount
         );
-        record(submitted_spl_withdrawal(100), 40);
         let replayed = finalize(EventType::FailedTransaction {
             signature: minter_signature(),
         });
@@ -895,8 +911,9 @@ mod reservations {
     fn should_keep_the_tokens_of_a_succeeded_spl_withdrawal_out_of_the_treasury() {
         let request = setup_created_spl_withdrawal(TokenProgram::Classic, false);
         record(submitted_spl_withdrawal(100), 40);
-        let replayed = finalize(EventType::SucceededTransaction {
+        let replayed = finalize(EventType::SucceededSplWithdrawalTransaction {
             signature: minter_signature(),
+            lamports_spent: FEE_PER_SIGNATURE,
         });
         assert_eq!(
             replayed.spl_treasury_balance(&request.mint),
@@ -916,14 +933,14 @@ mod reservations {
 
     #[test]
     fn should_reserve_the_signature_fee_from_the_balance() {
-        assert_reserves(false, FEE_PER_SIGNATURE);
+        assert_reserves(false, 2 * FEE_PER_SIGNATURE);
     }
 
     #[test]
     fn should_reserve_the_destination_rent_with_the_signature_fee() {
         assert_reserves(
             true,
-            FEE_PER_SIGNATURE + TokenProgram::Classic.account_rent_exemption(),
+            2 * FEE_PER_SIGNATURE + TokenProgram::Classic.account_rent_exemption(),
         );
     }
 
@@ -949,6 +966,60 @@ mod retries {
     use super::*;
 
     #[test]
+    fn should_replay_one_prepaid_retry_for_a_single_fresh_spl_withdrawal() {
+        for program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            for succeeds in [true, false] {
+                reset_state();
+                reset_events();
+                let terms = setup_created_spl_withdrawal(program, true);
+                record(submitted_spl_withdrawal(100), 40);
+                let fresh = assert_replay_matches();
+                assert_eq!(
+                    fresh.spl_withdrawal_attempt(&minter_signature()),
+                    Some(crate::state::SplWithdrawalAttempt::Fresh)
+                );
+                let held_balance = fresh.balance();
+                record(
+                    EventType::RetryFailedSplWithdrawalTransaction {
+                        signature: minter_signature(),
+                    },
+                    50,
+                );
+                let queued = assert_replay_matches();
+                assert_eq!(queued.balance(), held_balance);
+                assert_eq!(queued.retrying_spl_withdrawal_requests().len(), 1);
+                assert!(queued.pending_spl_withdrawal_reimbursements().is_empty());
+
+                let pending = create_individual_spl_retry(100, Hash::new_from_array([19; 32]), 60);
+                assert_eq!(
+                    read_state(|state| state.created_spl_withdrawal_txs()[&NONCE_ACCOUNT].attempt),
+                    crate::state::SplWithdrawalAttempt::Retry
+                );
+                let signature = [31; 64].into();
+                submit_individual_spl_retry(&pending, signature, 70);
+                assert_eq!(
+                    read_state(|state| state.spl_withdrawal_attempt(&signature)),
+                    Some(crate::state::SplWithdrawalAttempt::Retry)
+                );
+                finalize_individual_spl_retry(&pending, signature, succeeds, 80);
+                let finalized = assert_replay_matches();
+                assert_eq!(finalized.balance(), FUNDED_BALANCE - 2 * FEE_PER_SIGNATURE);
+                assert!(finalized.retrying_spl_withdrawal_requests().is_empty());
+                assert_eq!(
+                    finalized
+                        .pending_spl_withdrawal_reimbursements()
+                        .contains_key(&100.into()),
+                    !succeeds
+                );
+                assert_eq!(
+                    finalized.spl_treasury_balance(&terms.mint),
+                    FUNDED_TOKENS - if succeeds { terms.amount } else { 0 }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn should_split_a_failed_spl_batch_without_reimbursing_its_requests() {
         for shared_destination in [false, true] {
             let (indices, _) = setup_submitted_spl_batch(shared_destination);
@@ -960,7 +1031,7 @@ mod retries {
             fresh.create_destination_account = false;
             accept(200, 200, &fresh);
             record(
-                EventType::SplitFailedSplWithdrawalBatch {
+                EventType::RetryFailedSplWithdrawalTransaction {
                     signature: minter_signature(),
                 },
                 80,
@@ -1016,7 +1087,7 @@ mod retries {
         setup_submitted_spl_batch(false);
         let sent = read_state(|state| state.sent_spl_withdrawal_requests()[&100.into()].clone());
         record(
-            EventType::SplitFailedSplWithdrawalBatch {
+            EventType::RetryFailedSplWithdrawalTransaction {
                 signature: minter_signature(),
             },
             80,
@@ -1033,7 +1104,7 @@ mod retries {
                 reimbursed_amount: sent.request.terms.fee,
                 to: sent.request.terms.account,
             }),
-            EventType::SplitFailedSplWithdrawalBatch {
+            EventType::RetryFailedSplWithdrawalTransaction {
                 signature: minter_signature(),
             },
             EventType::FailedTransaction {
@@ -1051,27 +1122,20 @@ mod retries {
     }
 
     #[test]
-    fn should_reject_spl_withdrawal_splitting_without_a_submitted_batch() {
-        for submitted in [false, true] {
-            reset_state();
-            reset_events();
-            setup_created_spl_withdrawal(TokenProgram::Classic, false);
-            if submitted {
-                record(submitted_spl_withdrawal(100), 40);
-            }
-            let before = read_state(Clone::clone);
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| record(
-                    EventType::SplitFailedSplWithdrawalBatch {
-                        signature: minter_signature()
-                    },
-                    80
-                )))
-                .is_err()
-            );
-            read_state(|state| assert_eq!(state, &before));
-            assert_replay_matches();
-        }
+    fn should_reject_retrying_an_spl_withdrawal_that_was_not_submitted() {
+        setup_created_spl_withdrawal(TokenProgram::Classic, false);
+        let before = read_state(Clone::clone);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| record(
+                EventType::RetryFailedSplWithdrawalTransaction {
+                    signature: minter_signature()
+                },
+                80
+            )))
+            .is_err()
+        );
+        read_state(|state| assert_eq!(state, &before));
+        assert_replay_matches();
     }
 
     #[test]
@@ -1080,7 +1144,7 @@ mod retries {
         for (classic_succeeds, token_2022_succeeds) in [(true, false), (false, true)] {
             setup_submitted_spl_batch(false);
             record(
-                EventType::SplitFailedSplWithdrawalBatch {
+                EventType::RetryFailedSplWithdrawalTransaction {
                     signature: minter_signature(),
                 },
                 80,
@@ -1116,7 +1180,7 @@ mod retries {
     fn should_require_spl_withdrawal_retries_to_be_sent_alone() {
         setup_submitted_spl_batch(false);
         record(
-            EventType::SplitFailedSplWithdrawalBatch {
+            EventType::RetryFailedSplWithdrawalTransaction {
                 signature: minter_signature(),
             },
             80,
@@ -1495,8 +1559,7 @@ mod token_reimbursements {
 
     #[test]
     fn should_report_a_pending_token_reimbursement_after_a_failed_spl_transaction() {
-        setup_created_spl_withdrawal(TokenProgram::Classic, false);
-        record(submitted_spl_withdrawal(100), 40);
+        setup_submitted_spl_withdrawal_retry(TokenProgram::Classic, false);
         record(
             EventType::FailedTransaction {
                 signature: minter_signature(),
@@ -1517,8 +1580,7 @@ mod token_reimbursements {
         for quarantine in [false, true] {
             reset_state();
             reset_events();
-            let request = setup_created_spl_withdrawal(TokenProgram::Classic, true);
-            record(submitted_spl_withdrawal(100), 40);
+            let request = setup_submitted_spl_withdrawal_retry(TokenProgram::Classic, true);
             record(
                 EventType::FailedTransaction {
                     signature: minter_signature(),

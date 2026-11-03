@@ -132,9 +132,46 @@ pub(crate) fn setup_created_spl_withdrawal(
     request.mint = token.mint;
     request.ledger_id = token.ledger_id;
     request.create_destination_account = create_destination_account;
+    request.fee = crate::withdraw::spl::quote_withdrawal_fee(
+        1_000_000,
+        token_program,
+        create_destination_account,
+    )
+    .unwrap();
     accept(100, 7, &request);
     record(spl_transaction_created(&[100]), 30);
     request
+}
+
+/// Submits a real second attempt, leaving the default signature for terminal-outcome assertions.
+pub(crate) fn setup_submitted_spl_withdrawal_retry(
+    program: TokenProgram,
+    create_destination_account: bool,
+) -> SplWithdrawalRequestTerms {
+    let terms = setup_created_spl_withdrawal(program, create_destination_account);
+    let fresh_signature = [30; 64].into();
+    let mut submitted = submitted_spl_withdrawal(100);
+    let EventType::SubmittedTransaction { signature, .. } = &mut submitted else {
+        unreachable!()
+    };
+    *signature = fresh_signature;
+    record(submitted, 35);
+    record(
+        EventType::RetryFailedSplWithdrawalTransaction {
+            signature: fresh_signature,
+        },
+        36,
+    );
+    record(
+        EventType::CreatedSplWithdrawalTransaction {
+            burn_indices: vec![100.into()],
+            nonce_account: NONCE_ACCOUNT,
+            nonce_value: Hash::new_from_array([19; 32]),
+        },
+        37,
+    );
+    record(submitted_spl_withdrawal(100), 40);
+    terms
 }
 
 pub(crate) fn setup_pending_spl_batch() -> [SplWithdrawalRequestTerms; 2] {
@@ -215,7 +252,7 @@ pub(crate) fn setup_submitted_spl_batch(shared_destination: bool) -> (Vec<u64>, 
 pub(crate) fn setup_spl_withdrawal_retries(shared_destination: bool) -> Vec<SplWithdrawalRequest> {
     setup_submitted_spl_batch(shared_destination);
     record(
-        EventType::SplitFailedSplWithdrawalBatch {
+        EventType::RetryFailedSplWithdrawalTransaction {
             signature: minter_signature(),
         },
         80,
@@ -277,6 +314,12 @@ pub(crate) fn setup_with_nonce() -> SplWithdrawalRequestTerms {
 pub(crate) fn assert_reserves(create_destination_account: bool, cost: Lamport) {
     let mut request = setup_with_nonce();
     request.create_destination_account = create_destination_account;
+    request.fee = crate::withdraw::spl::quote_withdrawal_fee(
+        1_000_000,
+        TokenProgram::Classic,
+        create_destination_account,
+    )
+    .unwrap();
     accept(100, 7, &request);
     let balance_before = read_state(|state| state.balance());
     record(spl_transaction_created(&[100]), 30);
@@ -393,7 +436,7 @@ pub(crate) fn submit_individual_spl_retry(
     // An individual retry cannot be split again into further retries.
     assert!(
         catch_unwind(AssertUnwindSafe(|| record(
-            EventType::SplitFailedSplWithdrawalBatch { signature },
+            EventType::RetryFailedSplWithdrawalTransaction { signature },
             submitted_at + 5
         )))
         .is_err()

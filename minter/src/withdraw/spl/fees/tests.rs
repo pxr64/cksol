@@ -5,6 +5,22 @@ mod fee_quote {
     use super::*;
 
     #[test]
+    fn should_quote_at_least_two_signature_fees_for_a_single_fresh_withdrawal() {
+        for program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            for configured in [0, FEE_PER_SIGNATURE, 2 * FEE_PER_SIGNATURE - 1] {
+                assert_eq!(
+                    quote_withdrawal_fee(configured, program, false),
+                    Ok(2 * FEE_PER_SIGNATURE)
+                );
+                assert_eq!(
+                    quote_withdrawal_fee(configured, program, true),
+                    Ok(2 * FEE_PER_SIGNATURE + program.account_rent_exemption())
+                );
+            }
+        }
+    }
+
+    #[test]
     fn should_quote_only_the_configured_fee_when_creation_is_not_allowed() {
         for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
             for fee in [12_345, 1_000_000, u64::MAX] {
@@ -49,7 +65,7 @@ mod fee_quote {
     }
 }
 
-mod batch_budget {
+mod fresh_budget {
     use super::*;
 
     #[test]
@@ -154,7 +170,7 @@ mod batch_budget {
     }
 
     #[test]
-    fn should_only_quote_spl_batch_budgets_for_two_to_five_requests() {
+    fn should_quote_fresh_spl_budgets_for_one_to_five_requests() {
         let requests = setup_spl_batch_budget_requests();
         let mut five = requests.clone();
         for id in 102..105 {
@@ -165,7 +181,10 @@ mod batch_budget {
         }
         read_state(|state| {
             assert_eq!(spl_withdrawal_batch_budget(state, &[]), None);
-            assert_eq!(spl_withdrawal_batch_budget(state, &requests[..1]), None);
+            assert_eq!(
+                spl_withdrawal_batch_budget(state, &requests[..1]),
+                Some(2 * FEE_PER_SIGNATURE)
+            );
             assert_eq!(
                 spl_withdrawal_batch_budget(state, &five),
                 Some(6 * FEE_PER_SIGNATURE)

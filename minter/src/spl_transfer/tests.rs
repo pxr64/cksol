@@ -42,8 +42,15 @@ fn should_transfer_spl_withdrawals_from_treasury_to_destination_ata() {
     let amount = 12_345_678;
     for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
         let token = spl_token(Address::from([3; 32]), token_program);
-        let instructions =
-            build_spl_withdrawal_instructions(&MINTER_ADDRESS, &token, &destination, amount, false);
+        let instructions = build_batch_spl_withdrawal_instructions(
+            &MINTER_ADDRESS,
+            &[SplWithdrawalTransfer {
+                token: &token,
+                destination: &destination,
+                amount,
+                create_destination_account: false,
+            }],
+        );
 
         assert_eq!(instructions.len(), 1);
         let transfer = &instructions[0];
@@ -89,8 +96,15 @@ fn should_create_spl_withdrawal_destination_before_transfer() {
     let destination = Address::from([42; 32]);
     for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
         let token = spl_token(Address::from([3; 32]), token_program);
-        let instructions =
-            build_spl_withdrawal_instructions(&MINTER_ADDRESS, &token, &destination, 100, true);
+        let instructions = build_batch_spl_withdrawal_instructions(
+            &MINTER_ADDRESS,
+            &[SplWithdrawalTransfer {
+                token: &token,
+                destination: &destination,
+                amount: 100,
+                create_destination_account: true,
+            }],
+        );
 
         assert_eq!(instructions.len(), 2);
         let create = &instructions[0];
@@ -117,7 +131,15 @@ fn should_create_spl_withdrawal_destination_before_transfer() {
         );
         assert_eq!(
             &instructions[1..],
-            build_spl_withdrawal_instructions(&MINTER_ADDRESS, &token, &destination, 100, false)
+            build_batch_spl_withdrawal_instructions(
+                &MINTER_ADDRESS,
+                &[SplWithdrawalTransfer {
+                    token: &token,
+                    destination: &destination,
+                    amount: 100,
+                    create_destination_account: false
+                }],
+            )
         );
         let message = solana_transaction::Message::new(&instructions, Some(&MINTER_ADDRESS));
         assert_eq!(message.signer_keys(), vec![&MINTER_ADDRESS]);
@@ -132,12 +154,14 @@ fn should_build_spl_withdrawal_message_with_durable_nonce() {
     for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
         for create_destination_account in [false, true] {
             let token = spl_token(Address::from([3; 32]), token_program);
-            let instructions = build_spl_withdrawal_instructions(
+            let instructions = build_batch_spl_withdrawal_instructions(
                 &MINTER_ADDRESS,
-                &token,
-                &destination,
-                100,
-                create_destination_account,
+                &[SplWithdrawalTransfer {
+                    token: &token,
+                    destination: &destination,
+                    amount: 100,
+                    create_destination_account,
+                }],
             );
             let message = build_spl_withdrawal_message(
                 &MINTER_ADDRESS,
@@ -316,12 +340,14 @@ fn should_create_a_shared_destination_ata_once_before_the_batch_transfers() {
         for (instruction, transfer) in instructions[2..].iter().zip(&transfers) {
             assert_eq!(
                 *instruction,
-                build_spl_withdrawal_instructions(
+                build_batch_spl_withdrawal_instructions(
                     &MINTER_ADDRESS,
-                    transfer.token,
-                    &destination,
-                    transfer.amount,
-                    false
+                    &[SplWithdrawalTransfer {
+                        token: transfer.token,
+                        destination: &destination,
+                        amount: transfer.amount,
+                        create_destination_account: false
+                    }],
                 )[0]
             );
         }
@@ -333,12 +359,14 @@ fn should_reject_oversized_spl_withdrawal_message() {
     let token = spl_token(Address::from([3; 32]), TokenProgram::Classic);
     let instructions: Vec<_> = (40..60)
         .flat_map(|index| {
-            build_spl_withdrawal_instructions(
+            build_batch_spl_withdrawal_instructions(
                 &MINTER_ADDRESS,
-                &token,
-                &Address::from([index; 32]),
-                100,
-                true,
+                &[SplWithdrawalTransfer {
+                    token: &token,
+                    destination: &Address::from([index; 32]),
+                    amount: 100,
+                    create_destination_account: true,
+                }],
             )
         })
         .collect();

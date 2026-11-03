@@ -424,6 +424,80 @@ mod withdrawal_finalization {
     use super::*;
 
     #[tokio::test]
+    async fn should_queue_one_retry_per_request_after_any_fresh_spl_transaction_fails() {
+        for program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            for count in [1, 2, 5] {
+                reset_state();
+                reset_events();
+                setup_with_signing_key();
+                let signature = record_signed_spl_withdrawals(program, count);
+                let balance = read_state(|state| state.balance());
+                let runtime = TestCanisterRuntime::new()
+                    .with_increasing_time()
+                    .add_stub_response(nonce_read(UNSEEN_NONCE_SEED))
+                    .add_stub_response(failed_withdrawal_response(&signature));
+                finalize_transactions(runtime).await;
+                EventsAssert::from_recorded().expect_contains_event_eq(
+                    EventType::RetryFailedSplWithdrawalTransaction { signature },
+                );
+                assert!(
+                    !EventsAssert::from_recorded()
+                        .contains_event(&EventType::FailedTransaction { signature })
+                );
+                read_state(|state| {
+                    assert_eq!(state.balance(), balance);
+                    assert_eq!(state.retrying_spl_withdrawal_requests().len(), count);
+                    assert!(state.pending_spl_withdrawal_reimbursements().is_empty());
+                    assert!(state.submitted_transactions().is_empty());
+                });
+                assert_nonce_account_is_free();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn should_reimburse_a_failed_individual_spl_retry_without_queueing_another_attempt() {
+        for program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            reset_state();
+            reset_events();
+            let fresh_signature = submit_signed_spl_withdrawal(program);
+            let first = TestCanisterRuntime::new()
+                .with_increasing_time()
+                .add_stub_response(nonce_read(UNSEEN_NONCE_SEED))
+                .add_stub_response(failed_withdrawal_response(&fresh_signature));
+            finalize_transactions(first).await;
+            let retry_signature = submit_signed_spl_retry();
+            assert_ne!(retry_signature, fresh_signature);
+            let second = TestCanisterRuntime::new()
+                .with_increasing_time()
+                .add_stub_response(nonce_read(ADVANCED_RETRY_NONCE_SEED))
+                .add_stub_response(failed_withdrawal_response(&retry_signature));
+            finalize_transactions(second).await;
+            EventsAssert::from_recorded().expect_contains_event_eq(EventType::FailedTransaction {
+                signature: retry_signature,
+            });
+            assert!(!EventsAssert::from_recorded().contains_event(
+                &EventType::RetryFailedSplWithdrawalTransaction {
+                    signature: retry_signature
+                }
+            ));
+            read_state(|state| {
+                assert!(state.retrying_spl_withdrawal_requests().is_empty());
+                assert_eq!(
+                    state.pending_spl_withdrawal_reimbursements()[&100.into()]
+                        .request
+                        .terms
+                        .amount,
+                    100
+                );
+                assert_eq!(state.spl_treasury_balance(&[4; 32].into()), 1_000);
+                assert!(state.submitted_transactions().is_empty());
+            });
+            assert_nonce_account_is_free();
+        }
+    }
+
+    #[tokio::test]
     async fn should_reconcile_successful_spl_withdrawals_from_the_payer_balance() {
         for token_program in [TokenProgram::Classic, TokenProgram::Token2022] {
             for new_destination in [false, true] {
@@ -453,7 +527,10 @@ mod withdrawal_finalization {
                     },
                 );
                 read_state(|state| {
-                    assert_eq!(state.balance(), balance_before + reserved - lamports_spent);
+                    assert_eq!(
+                        state.balance(),
+                        balance_before + reserved + FEE_PER_SIGNATURE - lamports_spent
+                    );
                     assert!(
                         state
                             .successful_spl_withdrawal_requests()
@@ -497,7 +574,10 @@ mod withdrawal_finalization {
                 },
             );
             read_state(|state| {
-                assert_eq!(state.balance(), balance_before + reserved - lamports_spent);
+                assert_eq!(
+                    state.balance(),
+                    balance_before + reserved + FEE_PER_SIGNATURE - lamports_spent
+                );
                 assert!(
                     state
                         .successful_spl_withdrawal_requests()
@@ -719,7 +799,7 @@ mod withdrawal_finalization {
             // Record an earlier transaction so the pool recognizes this nonce value as stale.
             let landed = submit_signed_withdrawal_bound_to(1, STALE_NONCE_SEED);
             events::succeed_transaction(landed);
-            let signature = record_signed_spl_withdrawal(token_program);
+            let signature = record_signed_spl_withdrawals(token_program, 1);
             let original_state = read_state(Clone::clone);
             let events_before = EventsAssert::from_recorded();
             let runtime = TestCanisterRuntime::new()
@@ -856,6 +936,7 @@ mod withdrawal_finalization {
 const BOUND_NONCE_SEED: usize = 1;
 const STALE_NONCE_SEED: usize = 2;
 const UNSEEN_NONCE_SEED: usize = 3;
+const ADVANCED_RETRY_NONCE_SEED: usize = 4;
 
 fn min_rebroadcast_age_nanos() -> u64 {
     MIN_REBROADCAST_AGE.as_nanos() as u64
@@ -932,11 +1013,14 @@ fn setup_with_signing_key() {
 
 fn submit_signed_spl_withdrawal(token_program: TokenProgram) -> solana_signature::Signature {
     setup_with_signing_key();
-    record_signed_spl_withdrawal(token_program)
+    record_signed_spl_withdrawals(token_program, 1)
 }
 
 /// Records a signed SPL withdrawal in the existing state, preserving the pool's nonce history.
-fn record_signed_spl_withdrawal(token_program: TokenProgram) -> solana_signature::Signature {
+fn record_signed_spl_withdrawals(
+    token_program: TokenProgram,
+    count: usize,
+) -> solana_signature::Signature {
     let token = spl_token([4; 32].into(), token_program);
     let runtime = TestCanisterRuntime::new().with_time(20);
     mutate_state(|state| {
@@ -944,32 +1028,78 @@ fn record_signed_spl_withdrawal(token_program: TokenProgram) -> solana_signature
     });
     events::fund_spl_treasury(&token, 1_000);
     mutate_state(|state| {
-        process_event(
-            state,
-            EventType::AcceptedSplWithdrawalRequest(SplWithdrawalRequest {
-                terms: SplWithdrawalRequestTerms {
-                    account: account(1),
-                    mint: token.mint,
-                    ledger_id: token.ledger_id,
-                    address: [9; 32].into(),
-                    amount: 100,
-                    fee: state.withdrawal_fee() + token_program.account_rent_exemption(),
-                    create_destination_account: true,
-                },
-                cksol_burn_block_index: 100.into(),
-                ckspl_burn_block_index: 7.into(),
-            }),
-            &runtime,
-        );
+        for offset in 0..count {
+            process_event(
+                state,
+                EventType::AcceptedSplWithdrawalRequest(SplWithdrawalRequest {
+                    terms: SplWithdrawalRequestTerms {
+                        account: account(1),
+                        mint: token.mint,
+                        ledger_id: token.ledger_id,
+                        address: [9; 32].into(),
+                        amount: 100,
+                        fee: state.withdrawal_fee() + token_program.account_rent_exemption(),
+                        create_destination_account: true,
+                    },
+                    cksol_burn_block_index: (100 + offset as u64).into(),
+                    ckspl_burn_block_index: (7 + offset as u64).into(),
+                }),
+                &runtime,
+            );
+        }
         process_event(
             state,
             EventType::CreatedSplWithdrawalTransaction {
-                burn_indices: vec![100.into()],
+                burn_indices: (0..count)
+                    .map(|offset| (100 + offset as u64).into())
+                    .collect(),
                 nonce_account: NONCE_ACCOUNT,
                 nonce_value: durable_nonce(BOUND_NONCE_SEED),
             },
             &runtime,
         );
+    });
+    let message = read_state(|state| {
+        state
+            .bound_spl_withdrawal_message(
+                &NONCE_ACCOUNT,
+                &state.created_spl_withdrawal_txs()[&NONCE_ACCOUNT],
+            )
+            .unwrap()
+    });
+    let signature = devnet_sweep::minter_signature_of(&message);
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::SubmittedTransaction {
+                signature,
+                message: message.into(),
+                signers: vec![Signer::Minter],
+                purpose: TransactionPurpose::SplWithdrawal {
+                    burn_indices: (0..count)
+                        .map(|offset| (100 + offset as u64).into())
+                        .collect(),
+                },
+            },
+            &runtime,
+        )
+    });
+    signature
+}
+
+/// Signs the one queued retry with a new nonce value; it keeps the original withdrawal ID.
+fn submit_signed_spl_retry() -> solana_signature::Signature {
+    let runtime = TestCanisterRuntime::new().with_time(30);
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::CreatedSplWithdrawalTransaction {
+                burn_indices: vec![100.into()],
+                nonce_account: NONCE_ACCOUNT,
+                nonce_value: durable_nonce(UNSEEN_NONCE_SEED),
+            },
+            &runtime,
+        )
     });
     let message = read_state(|state| {
         state

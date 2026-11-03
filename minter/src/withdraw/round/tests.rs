@@ -100,7 +100,7 @@ mod batch_selection {
     }
 
     #[test]
-    fn should_send_low_fee_spl_requests_alone_without_bypassing_them() {
+    fn should_not_send_underfunded_fresh_spl_requests_without_a_fallback_budget() {
         for low_fee_first in [true, false] {
             reset_state();
             reset_events();
@@ -117,7 +117,11 @@ mod batch_selection {
             // The batch cannot include both 100 and 101. Do not jump over 101 to batch 100 with 102.
             assert_eq!(
                 select_pending_spl_batch(None),
-                Some(vec![accepted_request(100, 7, first)])
+                if low_fee_first {
+                    None
+                } else {
+                    Some(vec![accepted_request(100, 7, first)])
+                }
             );
             assert_replay_matches();
         }
@@ -207,13 +211,17 @@ mod batch_selection {
         let [mut classic, _] = setup_pending_spl_batch();
         classic.create_destination_account = false;
         accept(102, 9, &classic);
-        mutate_state(|state| {
-            set_balance(state, RENT_EXEMPTION_THRESHOLD + FEE_PER_SIGNATURE);
-        });
-        assert_eq!(
-            select_pending_spl_batch(None),
-            Some(vec![accepted_request(102, 9, &classic)])
-        );
+        for balance in [
+            2 * FEE_PER_SIGNATURE,
+            FEE_PER_SIGNATURE + crate::state::TokenProgram::Classic.account_rent_exemption(),
+        ] {
+            // In the second case the first transaction fits, but its required fallback does not.
+            mutate_state(|state| set_balance(state, RENT_EXEMPTION_THRESHOLD + balance));
+            assert_eq!(
+                select_pending_spl_batch(None),
+                Some(vec![accepted_request(102, 9, &classic)])
+            );
+        }
     }
 
     #[test]
@@ -260,8 +268,8 @@ mod ordering {
             plans,
             vec![
                 WithdrawalPlan::Sol(vec![sol.clone()]),
-                WithdrawalPlan::Spl(accepted_request(100, 7, &request)),
-                WithdrawalPlan::Spl(accepted_request(101, 8, &request)),
+                WithdrawalPlan::Spl(vec![accepted_request(100, 7, &request)]),
+                WithdrawalPlan::Spl(vec![accepted_request(101, 8, &request)]),
             ]
         );
 
@@ -271,7 +279,7 @@ mod ordering {
                 RENT_EXEMPTION_THRESHOLD
                     + sol.amount_to_transfer
                     + BATCH_WITHDRAWAL_TX_FEE
-                    + FEE_PER_SIGNATURE,
+                    + 2 * FEE_PER_SIGNATURE,
             );
         });
         let plans: Vec<_> =
@@ -280,7 +288,7 @@ mod ordering {
             plans,
             vec![
                 WithdrawalPlan::Sol(vec![sol]),
-                WithdrawalPlan::Spl(accepted_request(100, 7, &request)),
+                WithdrawalPlan::Spl(vec![accepted_request(100, 7, &request)]),
             ]
         );
     }
@@ -304,7 +312,7 @@ mod ordering {
             plans,
             vec![
                 WithdrawalPlan::Sol(vec![sol(90)]),
-                WithdrawalPlan::Spl(accepted_request(100, 7, &request)),
+                WithdrawalPlan::Spl(vec![accepted_request(100, 7, &request)]),
                 WithdrawalPlan::Sol(vec![sol(110)]),
             ]
         );
@@ -313,7 +321,7 @@ mod ordering {
         mutate_state(|state| {
             set_balance(
                 state,
-                RENT_EXEMPTION_THRESHOLD + 10_000 + BATCH_WITHDRAWAL_TX_FEE + FEE_PER_SIGNATURE,
+                RENT_EXEMPTION_THRESHOLD + 10_000 + BATCH_WITHDRAWAL_TX_FEE + 2 * FEE_PER_SIGNATURE,
             );
         });
         let plans: Vec<_> =
@@ -322,7 +330,7 @@ mod ordering {
             plans,
             vec![
                 WithdrawalPlan::Sol(vec![sol(90)]),
-                WithdrawalPlan::Spl(accepted_request(100, 7, &request)),
+                WithdrawalPlan::Spl(vec![accepted_request(100, 7, &request)]),
             ]
         );
     }
@@ -351,16 +359,16 @@ mod fairness {
         assert_eq!(
             plans,
             vec![
-                WithdrawalPlan::Spl(retries[0].clone()),
+                WithdrawalPlan::Spl(vec![retries[0].clone()]),
                 WithdrawalPlan::Sol(vec![sol]),
-                WithdrawalPlan::Spl(retries[1].clone()),
-                WithdrawalPlan::Spl(accepted_request(200, 200, terms)),
-                WithdrawalPlan::Spl(retries[2].clone()),
-                WithdrawalPlan::Spl(accepted_request(201, 201, terms)),
-                WithdrawalPlan::Spl(retries[3].clone()),
-                WithdrawalPlan::Spl(accepted_request(202, 202, terms)),
-                WithdrawalPlan::Spl(retries[4].clone()),
-                WithdrawalPlan::Spl(accepted_request(203, 203, terms)),
+                WithdrawalPlan::Spl(vec![retries[1].clone()]),
+                WithdrawalPlan::Spl(vec![accepted_request(200, 200, terms)]),
+                WithdrawalPlan::Spl(vec![retries[2].clone()]),
+                WithdrawalPlan::Spl(vec![accepted_request(201, 201, terms)]),
+                WithdrawalPlan::Spl(vec![retries[3].clone()]),
+                WithdrawalPlan::Spl(vec![accepted_request(202, 202, terms)]),
+                WithdrawalPlan::Spl(vec![retries[4].clone()]),
+                WithdrawalPlan::Spl(vec![accepted_request(203, 203, terms)]),
             ]
         );
         // A round may only select as many transactions as the caller has slots for.
@@ -381,10 +389,15 @@ mod fairness {
             let terms = &retries[0].terms;
             accept(200, 200, terms);
             let mut expected = vec![
-                WithdrawalPlan::Spl(retries[0].clone()),
-                WithdrawalPlan::Spl(accepted_request(200, 200, terms)),
+                WithdrawalPlan::Spl(vec![retries[0].clone()]),
+                WithdrawalPlan::Spl(vec![accepted_request(200, 200, terms)]),
             ];
-            expected.extend(retries[1..].iter().cloned().map(WithdrawalPlan::Spl));
+            expected.extend(
+                retries[1..]
+                    .iter()
+                    .cloned()
+                    .map(|request| WithdrawalPlan::Spl(vec![request])),
+            );
             assert_eq!(
                 read_state(
                     |state| WithdrawalRound::take_from_queue(state, usize::MAX).collect::<Vec<_>>()
@@ -403,12 +416,12 @@ mod fairness {
                 |state| WithdrawalRound::take_from_queue(state, usize::MAX).collect::<Vec<_>>()
             ),
             vec![
-                WithdrawalPlan::Spl(retries[0].clone()),
-                WithdrawalPlan::Spl(accepted_request(200, 200, terms)),
-                WithdrawalPlan::Spl(retries[1].clone()),
-                WithdrawalPlan::Spl(accepted_request(201, 201, terms)),
-                WithdrawalPlan::Spl(accepted_request(202, 202, terms)),
-                WithdrawalPlan::Spl(accepted_request(203, 203, terms)),
+                WithdrawalPlan::Spl(vec![retries[0].clone()]),
+                WithdrawalPlan::Spl(vec![accepted_request(200, 200, terms)]),
+                WithdrawalPlan::Spl(vec![retries[1].clone()]),
+                WithdrawalPlan::Spl(vec![accepted_request(201, 201, terms)]),
+                WithdrawalPlan::Spl(vec![accepted_request(202, 202, terms)]),
+                WithdrawalPlan::Spl(vec![accepted_request(203, 203, terms)]),
             ]
         );
     }
@@ -430,11 +443,11 @@ mod fairness {
                 WithdrawalPlan::Sol(vec![request])
             } else {
                 accept(200, 200, terms);
-                WithdrawalPlan::Spl(accepted_request(200, 200, terms))
+                WithdrawalPlan::Spl(vec![accepted_request(200, 200, terms)])
             };
             assert_eq!(
                 read_state(|state| WithdrawalRound::take_from_queue(state, usize::MAX).next()),
-                Some(WithdrawalPlan::Spl(retries[0].clone()))
+                Some(WithdrawalPlan::Spl(vec![retries[0].clone()]))
             );
             let pending = create_individual_spl_retry(100, Hash::new_from_array([19; 32]), 90);
             let signature = [30; 64].into();
@@ -467,7 +480,7 @@ mod fairness {
             assert!(replayed.next_withdrawal_is_retry());
             assert_eq!(
                 WithdrawalRound::take_from_queue(&replayed, usize::MAX).next(),
-                Some(WithdrawalPlan::Spl(retries[1].clone()))
+                Some(WithdrawalPlan::Spl(vec![retries[1].clone()]))
             );
         }
     }
@@ -492,21 +505,21 @@ mod affordability {
                 |state| WithdrawalRound::take_from_queue(state, usize::MAX).collect::<Vec<_>>()
             ),
             vec![
-                WithdrawalPlan::Spl(retries[1].clone()),
-                WithdrawalPlan::Spl(accepted_request(200, 200, &fresh)),
+                WithdrawalPlan::Spl(vec![retries[1].clone()]),
+                WithdrawalPlan::Spl(vec![accepted_request(200, 200, &fresh)]),
             ]
         );
         // Retry SOL is prepaid, so reducing free SOL only limits the fresh request.
         mutate_state(|state| {
-            set_balance(state, RENT_EXEMPTION_THRESHOLD + FEE_PER_SIGNATURE);
+            set_balance(state, RENT_EXEMPTION_THRESHOLD + 2 * FEE_PER_SIGNATURE);
         });
         assert_eq!(
             read_state(
                 |state| WithdrawalRound::take_from_queue(state, usize::MAX).collect::<Vec<_>>()
             ),
             vec![
-                WithdrawalPlan::Spl(retries[1].clone()),
-                WithdrawalPlan::Spl(accepted_request(200, 200, &fresh)),
+                WithdrawalPlan::Spl(vec![retries[1].clone()]),
+                WithdrawalPlan::Spl(vec![accepted_request(200, 200, &fresh)]),
             ]
         );
         mutate_state(|state| {
@@ -516,7 +529,7 @@ mod affordability {
             read_state(
                 |state| WithdrawalRound::take_from_queue(state, usize::MAX).collect::<Vec<_>>()
             ),
-            vec![WithdrawalPlan::Spl(retries[1].clone()),]
+            vec![WithdrawalPlan::Spl(vec![retries[1].clone()]),]
         );
         assert!(read_state(can_create_withdrawal_transaction));
     }
@@ -533,8 +546,8 @@ mod affordability {
         assert_eq!(
             WithdrawalRound::take_from_queue(&before, usize::MAX).collect::<Vec<_>>(),
             vec![
-                WithdrawalPlan::Spl(retries[0].clone()),
-                WithdrawalPlan::Spl(accepted_request(200, 200, terms)),
+                WithdrawalPlan::Spl(vec![retries[0].clone()]),
+                WithdrawalPlan::Spl(vec![accepted_request(200, 200, terms)]),
             ]
         );
         read_state(|state| assert_eq!(state, &before));
@@ -576,7 +589,9 @@ mod affordability {
             read_state(|state| WithdrawalRound::take_from_queue(state, usize::MAX).collect());
         assert_eq!(
             plans,
-            vec![WithdrawalPlan::Spl(accepted_request(100, 7, &request))]
+            vec![WithdrawalPlan::Spl(vec![accepted_request(
+                100, 7, &request
+            )])]
         );
     }
 }

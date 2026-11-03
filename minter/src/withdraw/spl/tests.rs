@@ -4,7 +4,10 @@ use crate::withdraw::round::{WithdrawalPlan, WithdrawalRound};
 use crate::{
     constants::LEDGER_DEDUPLICATION_WINDOW,
     guard::{TimerGuard, withdrawal_guard},
-    spl_transfer::{build_spl_withdrawal_instructions, build_spl_withdrawal_message},
+    spl_transfer::{
+        build_spl_withdrawal_message,
+        withdrawal::{SplWithdrawalTransfer, build_batch_spl_withdrawal_instructions},
+    },
     state::{
         TaskType, TokenProgram,
         audit::process_event,
@@ -157,6 +160,16 @@ fn queue_withdrawal(token: &SupportedSplToken, id: u64, create_destination_accou
     });
 }
 
+fn pending_spl_withdrawals() -> Vec<SplWithdrawalRequest> {
+    read_state(|state| {
+        state
+            .pending_spl_withdrawal_requests()
+            .values()
+            .map(|pending| pending.request.clone())
+            .collect()
+    })
+}
+
 fn nonce_response(authority: Address, seed: usize) -> NonceResult {
     NonceResult::Consistent(Ok(Some(nonce_account_info(authority, seed))))
 }
@@ -249,7 +262,7 @@ fn create_withdrawal(terms: SplWithdrawalRequestTerms) {
     });
 }
 
-fn submitted_withdrawal(program: TokenProgram) {
+fn submitted_withdrawal(program: TokenProgram, signature: solana_signature::Signature) {
     reset_state();
     reset_events();
     init_state();
@@ -272,7 +285,7 @@ fn submitted_withdrawal(program: TokenProgram) {
         process_event(
             state,
             EventType::SubmittedTransaction {
-                signature: minter_signature(),
+                signature,
                 message: message.into(),
                 signers: vec![Signer::Minter],
                 purpose: TransactionPurpose::SplWithdrawal {
@@ -285,7 +298,45 @@ fn submitted_withdrawal(program: TokenProgram) {
 }
 
 fn queued_token_reimbursement(program: TokenProgram) -> PendingSplWithdrawalReimbursement {
-    submitted_withdrawal(program);
+    let fresh_signature = [30; 64].into();
+    submitted_withdrawal(program, fresh_signature);
+    let runtime = TestCanisterRuntime::new().with_time(500);
+    mutate_state(|state| {
+        process_event(
+            state,
+            EventType::RetryFailedSplWithdrawalTransaction {
+                signature: fresh_signature,
+            },
+            &runtime,
+        );
+        process_event(
+            state,
+            EventType::CreatedSplWithdrawalTransaction {
+                burn_indices: vec![42.into()],
+                nonce_account: NONCE_ACCOUNT,
+                nonce_value: Hash::new_from_array([19; 32]),
+            },
+            &runtime,
+        );
+        let message = state
+            .bound_spl_withdrawal_message(
+                &NONCE_ACCOUNT,
+                &state.created_spl_withdrawal_txs()[&NONCE_ACCOUNT],
+            )
+            .unwrap();
+        process_event(
+            state,
+            EventType::SubmittedTransaction {
+                signature: minter_signature(),
+                message: message.into(),
+                signers: vec![Signer::Minter],
+                purpose: TransactionPurpose::SplWithdrawal {
+                    burn_indices: vec![42.into()],
+                },
+            },
+            &runtime,
+        );
+    });
     mutate_state(|state| {
         process_event(
             state,
@@ -302,9 +353,14 @@ mod transaction_creation {
     use super::*;
     use crate::{
         constants::{FEE_PER_SIGNATURE, MAX_CONCURRENT_SIGNATURES, RENT_EXEMPTION_THRESHOLD},
-        state::{MinterTransaction, event::VersionedMessage},
+        state::{
+            MinterTransaction,
+            event::VersionedMessage,
+            tests::helpers::{set_balance, set_spl_treasury_balance},
+        },
         test_fixtures::{MINIMUM_WITHDRAWAL_AMOUNT, durable_nonce, events, signature},
         withdraw::{
+            ReservedPlan, create_transaction as create_planned_transaction,
             create_transactions_batch, process_pending_withdrawals, sign_transactions_batch,
         },
     };
@@ -313,12 +369,164 @@ mod transaction_creation {
     type SendTransactionResult = MultiRpcResult<sol_rpc_types::Signature>;
 
     #[tokio::test]
+    async fn should_create_and_sign_one_mixed_program_spl_batch_with_one_nonce() {
+        let classic = setup_transactions(1, FUNDED_BALANCE, TokenProgram::Classic);
+        let token_2022 = spl_token([4; 32].into(), TokenProgram::Token2022);
+        mutate_state(|state| {
+            process_event(
+                state,
+                EventType::AddedSplToken(token_2022.clone()),
+                &TestCanisterRuntime::new().with_time(123),
+            )
+        });
+        events::fund_spl_treasury(&token_2022, FUNDED_TOKENS);
+        queue_withdrawal(&classic, 42, true);
+        queue_withdrawal(&token_2022, 43, true);
+        let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
+        let runtime = TestCanisterRuntime::new()
+            .with_time(999)
+            .add_stub_response(nonce_response(MINTER_ADDRESS, 1));
+        let planned = ReservedPlan {
+            nonce_account: NONCE_ACCOUNT,
+            plan: WithdrawalPlan::Spl(pending_spl_withdrawals()),
+        };
+
+        assert!(create_planned_transaction(&runtime, MINTER_ADDRESS, planned).await);
+
+        let created = read_state(Clone::clone);
+        let binding = &created.created_spl_withdrawal_txs()[&NONCE_ACCOUNT];
+        assert_eq!(binding.burn_indices, vec![42.into(), 43.into()]);
+        let message = created
+            .bound_spl_withdrawal_message(&NONCE_ACCOUNT, binding)
+            .unwrap();
+        assert_eq!(message.instructions.len(), 5); // Advance nonce, create two ATAs, transfer twice.
+        assert!(message.account_keys.contains(&classic.token_program.id()));
+        assert!(
+            message
+                .account_keys
+                .contains(&token_2022.token_program.id())
+        );
+        assert_eq!(created.created_spl_withdrawal_requests().len(), 2);
+        assert!(created.pending_spl_withdrawal_requests().is_empty());
+        assert_eq!(created.nonce_pool().num_free_accounts(), 0);
+        assert_eq!(
+            created.balance(),
+            FUNDED_BALANCE
+                - 3 * FEE_PER_SIGNATURE
+                - TokenProgram::Classic.account_rent_exemption()
+                - TokenProgram::Token2022.account_rent_exemption()
+        );
+        assert_eq!(runtime.sent_update_calls().len(), 1);
+        assert!(runtime.sent_transactions().is_empty());
+
+        let signing = TestCanisterRuntime::new()
+            .with_time(1_000)
+            .add_signer(sign_as_minter());
+        assert_eq!(
+            sign_transactions_batch(&signing, MINTER_ADDRESS)
+                .await
+                .len(),
+            1
+        );
+        let sent = read_state(Clone::clone);
+        assert_eq!(sent.sent_spl_withdrawal_requests().len(), 2);
+        assert_eq!(sent.submitted_transactions().len(), 1);
+        assert!(sent.created_spl_withdrawal_txs().is_empty());
+        assert_eq!(sent.nonce_pool().num_free_accounts(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_recheck_the_full_spl_batch_fallback_budget_after_the_nonce_read() {
+        let token = setup_transactions(
+            1,
+            RENT_EXEMPTION_THRESHOLD + 3 * FEE_PER_SIGNATURE,
+            TokenProgram::Classic,
+        );
+        queue_withdrawal(&token, 42, false);
+        queue_withdrawal(&token, 43, false);
+        let requests = pending_spl_withdrawals();
+        let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
+        let runtime =
+            TestCanisterRuntime::new().add_stub_response(nonce_response(MINTER_ADDRESS, 1));
+        let mut creation = Box::pin(create_planned_transaction(
+            &runtime,
+            MINTER_ADDRESS,
+            ReservedPlan {
+                nonce_account: NONCE_ACCOUNT,
+                plan: WithdrawalPlan::Spl(requests.clone()),
+            },
+        ));
+        assert!(futures::poll!(creation.as_mut()).is_pending());
+        // Simulate other work reserving one signature fee while the RPC call is pending.
+        mutate_state(|state| set_balance(state, RENT_EXEMPTION_THRESHOLD + 2 * FEE_PER_SIGNATURE));
+        let after_change = read_state(Clone::clone);
+        // The original transaction still fits, but its prepaid fallback budget no longer does.
+        assert!(covers_spl_withdrawals(&after_change, &requests[..1]));
+        assert!(!covers_spl_withdrawals(&after_change, &requests));
+        let events_after_change = EventsAssert::from_recorded();
+
+        assert!(!creation.await);
+
+        read_state(|state| assert_eq!(state, &after_change));
+        assert_eq!(EventsAssert::from_recorded(), events_after_change);
+    }
+
+    #[tokio::test]
+    async fn should_recheck_the_total_spl_batch_amount_per_mint_after_the_nonce_read() {
+        let token = setup_transactions(1, FUNDED_BALANCE, TokenProgram::Classic);
+        queue_withdrawal(&token, 42, false);
+        queue_withdrawal(&token, 43, false);
+        let requests = pending_spl_withdrawals();
+        let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
+        let runtime =
+            TestCanisterRuntime::new().add_stub_response(nonce_response(MINTER_ADDRESS, 1));
+        let mut creation = Box::pin(create_planned_transaction(
+            &runtime,
+            MINTER_ADDRESS,
+            ReservedPlan {
+                nonce_account: NONCE_ACCOUNT,
+                plan: WithdrawalPlan::Spl(requests.clone()),
+            },
+        ));
+        assert!(futures::poll!(creation.as_mut()).is_pending());
+        // Each request transfers 1,000 tokens; 1,500 covers either alone, but not both.
+        mutate_state(|state| set_spl_treasury_balance(state, token.mint, 1_500));
+        let after_change = read_state(Clone::clone);
+        assert!(covers_spl_withdrawals(&after_change, &requests[..1]));
+        assert!(!covers_spl_withdrawals(&after_change, &requests));
+        let events_after_change = EventsAssert::from_recorded();
+
+        assert!(!creation.await);
+
+        read_state(|state| assert_eq!(state, &after_change));
+        assert_eq!(EventsAssert::from_recorded(), events_after_change);
+    }
+
+    #[test]
+    fn should_reject_empty_oversized_and_duplicate_spl_creation_plans() {
+        let token = setup_transactions(1, FUNDED_BALANCE, TokenProgram::Classic);
+        for id in 42..48 {
+            queue_withdrawal(&token, id, false);
+        }
+        let requests = pending_spl_withdrawals();
+        let before = read_state(Clone::clone);
+        for invalid in [
+            vec![],
+            vec![requests[0].clone(), requests[0].clone()],
+            requests,
+        ] {
+            assert!(!covers_spl_withdrawals(&before, &invalid));
+        }
+        read_state(|state| assert_eq!(state, &before));
+    }
+
+    #[tokio::test]
     async fn should_bind_only_affordable_spl_requests_in_burn_index_order() {
         for program in [TokenProgram::Classic, TokenProgram::Token2022] {
             for create_destination_account in [false, true] {
                 reset_state();
                 reset_events();
-                let cost = FEE_PER_SIGNATURE
+                let cost = 2 * FEE_PER_SIGNATURE
                     + if create_destination_account {
                         program.account_rent_exemption()
                     } else {
@@ -375,7 +583,7 @@ mod transaction_creation {
             assert_eq!(state.created_spl_withdrawal_requests().len(), 2);
             assert!(state.pending_spl_withdrawal_requests().is_empty());
             assert_eq!(state.nonce_pool().num_free_accounts(), 0);
-            assert_eq!(state.balance(), FUNDED_BALANCE - 2 * FEE_PER_SIGNATURE);
+            assert_eq!(state.balance(), FUNDED_BALANCE - 4 * FEE_PER_SIGNATURE);
         });
     }
 
@@ -421,7 +629,7 @@ mod transaction_creation {
     async fn should_recheck_spl_funding_after_the_nonce_read() {
         let token = setup_transactions(
             1,
-            RENT_EXEMPTION_THRESHOLD + FEE_PER_SIGNATURE,
+            RENT_EXEMPTION_THRESHOLD + 2 * FEE_PER_SIGNATURE,
             TokenProgram::Classic,
         );
         queue_withdrawal(&token, 42, false);
@@ -556,12 +764,14 @@ mod transaction_creation {
             &MINTER_ADDRESS,
             &NONCE_ACCOUNT,
             durable_nonce(1),
-            &build_spl_withdrawal_instructions(
+            &build_batch_spl_withdrawal_instructions(
                 &MINTER_ADDRESS,
-                &token,
-                &terms.address,
-                terms.amount,
-                true,
+                &[SplWithdrawalTransfer {
+                    token: &token,
+                    destination: &terms.address,
+                    amount: terms.amount,
+                    create_destination_account: true,
+                }],
             ),
         )
         .unwrap();
@@ -1624,7 +1834,7 @@ mod token_reimbursements {
 
     #[tokio::test]
     async fn should_not_mint_tokens_before_definitive_failure_or_while_another_round_runs() {
-        submitted_withdrawal(TokenProgram::Classic);
+        submitted_withdrawal(TokenProgram::Classic, minter_signature());
         let runtime = TestCanisterRuntime::new();
         process_pending_reimbursements(runtime.clone()).await;
         assert!(runtime.sent_update_calls().is_empty());
