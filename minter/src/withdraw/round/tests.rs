@@ -83,20 +83,61 @@ mod batch_selection {
     }
 
     #[test]
-    fn should_stop_an_spl_batch_before_the_next_waiting_sol_withdrawal() {
+    fn should_fill_an_spl_batch_if_its_oldest_selected_request_precedes_sol() {
         let terms = setup_with_nonce();
         for id in [100, 102, 104] {
             accept(id, id, &terms);
         }
         assert_eq!(select_pending_spl_batch(Some(99)), None);
+        assert_eq!(select_pending_spl_batch(Some(100)), None);
         assert_eq!(
             select_pending_spl_batch(Some(103)),
             Some(vec![
                 accepted_request(100, 100, &terms),
                 accepted_request(102, 102, &terms),
+                accepted_request(104, 104, &terms),
             ])
         );
         assert_replay_matches();
+    }
+
+    #[test]
+    fn should_not_use_an_unfunded_older_spl_request_to_jump_ahead_of_sol() {
+        let terms = setup_with_nonce();
+        let unfunded = SplWithdrawalRequestTerms {
+            amount: FUNDED_TOKENS + 1,
+            ..terms.clone()
+        };
+        accept(100, 100, &unfunded);
+        accept(102, 102, &terms);
+
+        // Only request 102 is affordable, so SOL 101 must get the earlier turn.
+        assert_eq!(select_pending_spl_batch(Some(101)), None);
+        assert_eq!(
+            select_pending_spl_batch(None),
+            Some(vec![accepted_request(102, 102, &terms)])
+        );
+        assert_replay_matches();
+    }
+
+    #[test]
+    fn should_not_use_an_older_spl_request_with_unfunded_rent_to_jump_ahead_of_sol() {
+        let terms = setup_with_nonce();
+        let needs_ata = SplWithdrawalRequestTerms {
+            create_destination_account: true,
+            fee: u64::MAX,
+            ..terms.clone()
+        };
+        accept(100, 100, &needs_ata);
+        accept(102, 102, &terms);
+        // The round can fund a fresh transaction and retry, but cannot pay ATA rent.
+        mutate_state(|state| set_balance(state, RENT_EXEMPTION_THRESHOLD + 2 * FEE_PER_SIGNATURE));
+
+        assert_eq!(select_pending_spl_batch(Some(101)), None);
+        assert_eq!(
+            select_pending_spl_batch(None),
+            Some(vec![accepted_request(102, 102, &terms)])
+        );
     }
 
     #[test]
@@ -246,8 +287,194 @@ mod batch_selection {
     }
 }
 
+mod live_batches {
+    use super::*;
+
+    #[test]
+    fn should_plan_mixed_program_batches_of_at_most_five_withdrawals_per_slot() {
+        let [classic, mut token_2022] = setup_pending_spl_batch();
+        token_2022.amount = 1_000_000;
+        accept(102, 9, &classic);
+        accept(103, 10, &token_2022);
+        accept(104, 11, &classic);
+        accept(105, 12, &token_2022);
+        let before = read_state(Clone::clone);
+        let requests: Vec<_> = before
+            .pending_spl_withdrawal_requests()
+            .values()
+            .map(|pending| pending.request.clone())
+            .collect();
+        let expected = [
+            WithdrawalPlan::Spl(requests[..5].to_vec()),
+            WithdrawalPlan::Spl(requests[5..].to_vec()),
+        ];
+
+        for slots in [1, 2] {
+            assert_eq!(
+                WithdrawalRound::take_from_queue(&before, slots).collect::<Vec<_>>(),
+                expected[..slots]
+            );
+        }
+        read_state(|state| assert_eq!(state, &before));
+        assert_replay_matches();
+    }
+
+    #[test]
+    fn should_share_the_sol_budget_between_batches_and_keep_fallback_funds_reserved() {
+        let terms = setup_with_nonce();
+        for id in 100..106 {
+            accept(id, id, &terms);
+        }
+        for (fees_available, expected_sizes) in [(4, vec![3]), (7, vec![5]), (8, vec![5, 1])] {
+            // Five fresh requests reserve six fees; a separate singleton needs two more.
+            mutate_state(|state| {
+                set_balance(
+                    state,
+                    RENT_EXEMPTION_THRESHOLD + fees_available * FEE_PER_SIGNATURE,
+                )
+            });
+            let before = read_state(Clone::clone);
+            let plans: Vec<_> = WithdrawalRound::take_from_queue(&before, 2).collect();
+            let mut next_id = 100;
+            for (plan, size) in plans.iter().zip(&expected_sizes) {
+                let expected: Vec<_> = (next_id..next_id + size)
+                    .map(|id| accepted_request(id, id, &terms))
+                    .collect();
+                assert_eq!(plan, &WithdrawalPlan::Spl(expected));
+                next_id += size;
+            }
+            assert_eq!(plans.len(), expected_sizes.len());
+            read_state(|state| assert_eq!(state, &before));
+        }
+    }
+
+    #[test]
+    fn should_share_one_mints_treasury_balance_between_multiple_batches() {
+        let terms = setup_with_nonce();
+        for id in 100..108 {
+            accept(id, id, &terms);
+        }
+        // Eight requests each need one million tokens, but the round can fund only seven.
+        mutate_state(|state| set_spl_treasury_balance(state, terms.mint, 7_000_000));
+        let before = read_state(Clone::clone);
+        assert_eq!(
+            WithdrawalRound::take_from_queue(&before, 3).collect::<Vec<_>>(),
+            vec![
+                WithdrawalPlan::Spl(
+                    (100..105)
+                        .map(|id| accepted_request(id, id, &terms))
+                        .collect(),
+                ),
+                WithdrawalPlan::Spl(
+                    (105..107)
+                        .map(|id| accepted_request(id, id, &terms))
+                        .collect(),
+                ),
+            ]
+        );
+        read_state(|state| assert_eq!(state, &before));
+    }
+
+    #[test]
+    fn should_keep_planning_later_spl_batches_when_nothing_before_sol_is_affordable() {
+        let terms = setup_with_nonce();
+        let unfunded = SplWithdrawalRequestTerms {
+            amount: FUNDED_TOKENS + 1,
+            ..terms.clone()
+        };
+        accept(100, 100, &unfunded);
+        let sol = WithdrawalRequest {
+            account: terms.account,
+            solana_address: terms.address.to_bytes(),
+            burn_block_index: 150.into(),
+            burned_amount: 20_000,
+            amount_to_transfer: 10_000,
+        };
+        record(EventType::AcceptedWithdrawalRequest(sol.clone()), 30);
+        accept(160, 160, &terms);
+        accept(170, 170, &terms);
+
+        let before = read_state(Clone::clone);
+        assert_eq!(
+            WithdrawalRound::take_from_queue(&before, 3).collect::<Vec<_>>(),
+            vec![
+                WithdrawalPlan::Sol(vec![sol]),
+                WithdrawalPlan::Spl(vec![
+                    accepted_request(160, 160, &terms),
+                    accepted_request(170, 170, &terms),
+                ]),
+            ]
+        );
+        // Planning skips the unfunded request only in this round; it remains pending in state.
+        read_state(|state| assert_eq!(state, &before));
+        assert_replay_matches();
+    }
+
+    #[test]
+    fn should_skip_an_unfunded_mint_on_both_sides_of_a_sol_request() {
+        let [classic, mut token_2022] = setup_pending_spl_batch();
+        token_2022.amount = 1_000_000;
+        let sol = WithdrawalRequest {
+            account: classic.account,
+            solana_address: classic.address.to_bytes(),
+            burn_block_index: 150.into(),
+            burned_amount: 20_000,
+            amount_to_transfer: 10_000,
+        };
+        record(EventType::AcceptedWithdrawalRequest(sol.clone()), 60);
+        accept(160, 160, &classic);
+        accept(170, 170, &token_2022);
+        mutate_state(|state| set_spl_treasury_balance(state, classic.mint, 0));
+        let before = read_state(Clone::clone);
+        let first = before.pending_spl_withdrawal_requests()[&101.into()]
+            .request
+            .clone();
+
+        assert_eq!(
+            WithdrawalRound::take_from_queue(&before, 3).collect::<Vec<_>>(),
+            vec![
+                WithdrawalPlan::Spl(vec![first, accepted_request(170, 170, &token_2022)]),
+                WithdrawalPlan::Sol(vec![sol]),
+            ]
+        );
+        read_state(|state| assert_eq!(state, &before));
+    }
+}
+
 mod ordering {
     use super::*;
+
+    #[test]
+    fn should_fill_an_older_spl_batch_before_planning_the_next_sol_transaction() {
+        let terms = setup_with_nonce();
+        for id in [100, 101, 200, 201] {
+            accept(id, id, &terms);
+        }
+        let sol = WithdrawalRequest {
+            account: terms.account,
+            solana_address: terms.address.to_bytes(),
+            burn_block_index: 150.into(),
+            burned_amount: 20_000,
+            amount_to_transfer: 10_000,
+        };
+        record(EventType::AcceptedWithdrawalRequest(sol.clone()), 30);
+
+        let before = read_state(Clone::clone);
+        assert_eq!(
+            WithdrawalRound::take_from_queue(&before, 3).collect::<Vec<_>>(),
+            vec![
+                WithdrawalPlan::Spl(vec![
+                    accepted_request(100, 100, &terms),
+                    accepted_request(101, 101, &terms),
+                    accepted_request(200, 200, &terms),
+                    accepted_request(201, 201, &terms),
+                ]),
+                WithdrawalPlan::Sol(vec![sol]),
+            ]
+        );
+        read_state(|state| assert_eq!(state, &before));
+        assert_replay_matches();
+    }
 
     #[test]
     fn should_plan_withdrawals_of_both_kinds_in_burn_index_order_within_one_budget() {
@@ -268,8 +495,10 @@ mod ordering {
             plans,
             vec![
                 WithdrawalPlan::Sol(vec![sol.clone()]),
-                WithdrawalPlan::Spl(vec![accepted_request(100, 7, &request)]),
-                WithdrawalPlan::Spl(vec![accepted_request(101, 8, &request)]),
+                WithdrawalPlan::Spl(vec![
+                    accepted_request(100, 7, &request),
+                    accepted_request(101, 8, &request),
+                ]),
             ]
         );
 
@@ -351,8 +580,12 @@ mod fairness {
             amount_to_transfer: 10_000,
         };
         record(EventType::AcceptedWithdrawalRequest(sol.clone()), 85);
-        for id in 200..204 {
-            accept(id, id, terms);
+        let fresh_terms = SplWithdrawalRequestTerms {
+            amount: 500_000,
+            ..terms.clone()
+        };
+        for id in 200..206 {
+            accept(id, id, &fresh_terms);
         }
         let before = read_state(Clone::clone);
         let plans: Vec<_> = WithdrawalRound::take_from_queue(&before, usize::MAX).collect();
@@ -362,20 +595,22 @@ mod fairness {
                 WithdrawalPlan::Spl(vec![retries[0].clone()]),
                 WithdrawalPlan::Sol(vec![sol]),
                 WithdrawalPlan::Spl(vec![retries[1].clone()]),
-                WithdrawalPlan::Spl(vec![accepted_request(200, 200, terms)]),
+                WithdrawalPlan::Spl(
+                    (200..205)
+                        .map(|id| accepted_request(id, id, &fresh_terms))
+                        .collect(),
+                ),
                 WithdrawalPlan::Spl(vec![retries[2].clone()]),
-                WithdrawalPlan::Spl(vec![accepted_request(201, 201, terms)]),
+                WithdrawalPlan::Spl(vec![accepted_request(205, 205, &fresh_terms)]),
                 WithdrawalPlan::Spl(vec![retries[3].clone()]),
-                WithdrawalPlan::Spl(vec![accepted_request(202, 202, terms)]),
                 WithdrawalPlan::Spl(vec![retries[4].clone()]),
-                WithdrawalPlan::Spl(vec![accepted_request(203, 203, terms)]),
             ]
         );
         // A round may only select as many transactions as the caller has slots for.
         for slots in [0, 1, 2, 3, 10] {
             assert_eq!(
                 WithdrawalRound::take_from_queue(&before, slots).collect::<Vec<_>>(),
-                plans[..slots]
+                plans[..slots.min(plans.len())]
             );
         }
         read_state(|state| assert_eq!(state, &before));
@@ -408,7 +643,7 @@ mod fairness {
         // Once both retries are planned, fresh transactions can use every remaining slot.
         let retries = setup_spl_withdrawal_retries(false);
         let terms = &retries[0].terms;
-        for id in 200..204 {
+        for id in 200..206 {
             accept(id, id, terms);
         }
         assert_eq!(
@@ -417,11 +652,13 @@ mod fairness {
             ),
             vec![
                 WithdrawalPlan::Spl(vec![retries[0].clone()]),
-                WithdrawalPlan::Spl(vec![accepted_request(200, 200, terms)]),
+                WithdrawalPlan::Spl(
+                    (200..205)
+                        .map(|id| accepted_request(id, id, terms))
+                        .collect(),
+                ),
                 WithdrawalPlan::Spl(vec![retries[1].clone()]),
-                WithdrawalPlan::Spl(vec![accepted_request(201, 201, terms)]),
-                WithdrawalPlan::Spl(vec![accepted_request(202, 202, terms)]),
-                WithdrawalPlan::Spl(vec![accepted_request(203, 203, terms)]),
+                WithdrawalPlan::Spl(vec![accepted_request(205, 205, terms)]),
             ]
         );
     }
@@ -443,7 +680,11 @@ mod fairness {
                 WithdrawalPlan::Sol(vec![request])
             } else {
                 accept(200, 200, terms);
-                WithdrawalPlan::Spl(vec![accepted_request(200, 200, terms)])
+                accept(201, 201, terms);
+                WithdrawalPlan::Spl(vec![
+                    accepted_request(200, 200, terms),
+                    accepted_request(201, 201, terms),
+                ])
             };
             assert_eq!(
                 read_state(|state| WithdrawalRound::take_from_queue(state, usize::MAX).next()),
@@ -469,7 +710,7 @@ mod fairness {
                 }
             } else {
                 EventType::CreatedSplWithdrawalTransaction {
-                    burn_indices: vec![200.into()],
+                    burn_indices: vec![200.into(), 201.into()],
                     nonce_account: NONCE_ACCOUNT,
                     nonce_value,
                 }
@@ -570,7 +811,13 @@ mod affordability {
         record(EventType::AcceptedWithdrawalRequest(sol.clone()), 15);
         let plans: Vec<_> =
             read_state(|state| WithdrawalRound::take_from_queue(state, usize::MAX).collect());
-        assert_eq!(plans, vec![WithdrawalPlan::Sol(vec![sol])]);
+        assert_eq!(
+            plans,
+            vec![
+                WithdrawalPlan::Spl(vec![accepted_request(101, 8, &request)]),
+                WithdrawalPlan::Sol(vec![sol]),
+            ]
+        );
     }
 
     #[test]

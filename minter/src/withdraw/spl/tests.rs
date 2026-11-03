@@ -369,7 +369,7 @@ mod transaction_creation {
     type SendTransactionResult = MultiRpcResult<sol_rpc_types::Signature>;
 
     #[tokio::test]
-    async fn should_create_and_sign_one_mixed_program_spl_batch_with_one_nonce() {
+    async fn should_select_create_and_sign_one_mixed_program_spl_batch_with_one_nonce() {
         let classic = setup_transactions(1, FUNDED_BALANCE, TokenProgram::Classic);
         let token_2022 = spl_token([4; 32].into(), TokenProgram::Token2022);
         mutate_state(|state| {
@@ -386,12 +386,7 @@ mod transaction_creation {
         let runtime = TestCanisterRuntime::new()
             .with_time(999)
             .add_stub_response(nonce_response(MINTER_ADDRESS, 1));
-        let planned = ReservedPlan {
-            nonce_account: NONCE_ACCOUNT,
-            plan: WithdrawalPlan::Spl(pending_spl_withdrawals()),
-        };
-
-        assert!(create_planned_transaction(&runtime, MINTER_ADDRESS, planned).await);
+        assert_eq!(create_transactions_batch(&runtime, MINTER_ADDRESS).await, 1);
 
         let created = read_state(Clone::clone);
         let binding = &created.created_spl_withdrawal_txs()[&NONCE_ACCOUNT];
@@ -565,10 +560,11 @@ mod transaction_creation {
     }
 
     #[tokio::test]
-    async fn should_bind_concurrent_spl_requests_to_distinct_nonces() {
+    async fn should_bind_concurrent_spl_batches_to_distinct_nonces() {
         let token = setup_transactions(2, FUNDED_BALANCE, TokenProgram::Classic);
-        queue_withdrawal(&token, 42, false);
-        queue_withdrawal(&token, 43, false);
+        for id in 42..48 {
+            queue_withdrawal(&token, id, false);
+        }
         let _guard = TimerGuard::new(TaskType::WithdrawalProcessing).unwrap();
         let runtime = TestCanisterRuntime::new()
             .with_time(999)
@@ -580,10 +576,17 @@ mod transaction_creation {
         assert_eq!(runtime.sent_update_calls().len(), 2);
         read_state(|state| {
             assert_eq!(state.created_spl_withdrawal_txs().len(), 2);
-            assert_eq!(state.created_spl_withdrawal_requests().len(), 2);
+            assert_eq!(state.created_spl_withdrawal_requests().len(), 6);
+            let mut batch_sizes: Vec<_> = state
+                .created_spl_withdrawal_txs()
+                .values()
+                .map(|created| created.burn_indices.len())
+                .collect();
+            batch_sizes.sort_unstable();
+            assert_eq!(batch_sizes, vec![1, 5]);
             assert!(state.pending_spl_withdrawal_requests().is_empty());
             assert_eq!(state.nonce_pool().num_free_accounts(), 0);
-            assert_eq!(state.balance(), FUNDED_BALANCE - 4 * FEE_PER_SIGNATURE);
+            assert_eq!(state.balance(), FUNDED_BALANCE - 8 * FEE_PER_SIGNATURE);
         });
     }
 
@@ -735,7 +738,8 @@ mod transaction_creation {
                 state.created_withdrawal_txs().len(),
                 MAX_CONCURRENT_SIGNATURES - 1
             );
-            assert_eq!(state.pending_spl_withdrawal_requests().len(), 2);
+            assert!(state.pending_spl_withdrawal_requests().is_empty());
+            assert_eq!(state.created_spl_withdrawal_requests().len(), 3);
         });
     }
 
