@@ -12,7 +12,7 @@ use solana_transaction::Transaction;
 mod tests;
 pub mod withdrawal;
 
-pub use withdrawal::{build_spl_withdrawal_instructions, build_spl_withdrawal_message};
+pub use withdrawal::build_spl_withdrawal_message;
 
 /// Creates the associated token account of `owner` for `mint` unless it exists.
 pub fn create_associated_token_account_instruction(

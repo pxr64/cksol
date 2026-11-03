@@ -1,7 +1,7 @@
 use crate::{
     constants::{FEE_PER_SIGNATURE, MAX_SPL_WITHDRAWALS_PER_NONCE_TX},
     state::{
-        State, TokenProgram,
+        SplWithdrawalAttempt, State, TokenProgram,
         event::{SplWithdrawalRequest, SplWithdrawalRequestTerms},
     },
 };
@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 mod tests;
 
-/// Quotes the ckSOL fee in lamports using the configured withdrawal fee.
+/// Quotes the configured ckSOL fee, with a minimum covering the fresh attempt and one retry.
 /// Allowing destination ATA creation includes its rent even if it already exists.
 pub fn quote_withdrawal_fee(
     withdrawal_fee: Lamport,
@@ -25,11 +25,14 @@ pub fn quote_withdrawal_fee(
     } else {
         0
     };
-    withdrawal_fee.checked_add(rent).ok_or_else(|| {
-        WithdrawSplError::TemporarilyUnavailable(
-            "SPL withdrawal fee exceeds the maximum lamport amount".to_string(),
-        )
-    })
+    withdrawal_fee
+        .max(2 * FEE_PER_SIGNATURE)
+        .checked_add(rent)
+        .ok_or_else(|| {
+            WithdrawSplError::TemporarilyUnavailable(
+                "SPL withdrawal fee exceeds the maximum lamport amount".to_string(),
+            )
+        })
 }
 
 /// One signature fee plus rent for each distinct destination ATA the transaction may create.
@@ -55,13 +58,13 @@ pub(crate) fn spl_withdrawal_transaction_cost<'a>(
     cost
 }
 
-/// SOL budget for a batch attempt and one individual retry per request if it fails.
-/// Returns `None` when the size or an individual request's quoted fee disallows batching.
+/// SOL budget for any fresh SPL transaction and one individual retry per request if it fails.
+/// Returns `None` when the size or quoted fees cannot cover the fresh attempt and fallback.
 pub(crate) fn spl_withdrawal_batch_budget(
     state: &State,
     requests: &[SplWithdrawalRequest],
 ) -> Option<Lamport> {
-    if !(2..=MAX_SPL_WITHDRAWALS_PER_NONCE_TX).contains(&requests.len()) {
+    if !(1..=MAX_SPL_WITHDRAWALS_PER_NONCE_TX).contains(&requests.len()) {
         return None;
     }
     // Round up so every request covers its share without borrowing another user's fee.
@@ -79,18 +82,6 @@ pub(crate) fn spl_withdrawal_batch_budget(
     Some(budget)
 }
 
-pub(crate) fn spl_withdrawal_reservation(
-    state: &State,
-    requests: &[SplWithdrawalRequest],
-) -> Lamport {
-    if let [request] = requests {
-        spl_withdrawal_transaction_cost(state, std::iter::once(&request.terms))
-    } else {
-        spl_withdrawal_batch_budget(state, requests)
-            .expect("Attempted to reserve an SPL batch its quoted fees cannot cover")
-    }
-}
-
 /// The in-flight transaction's fee and rent limit, excluding funds held for fallback retries.
 pub(crate) fn spl_withdrawal_reserved_cost(
     state: &State,
@@ -106,20 +97,23 @@ pub(crate) fn spl_withdrawal_reserved_cost(
     Some(spl_withdrawal_transaction_cost(state, requests))
 }
 
-/// Includes the fallback funds while a batch is in flight; single transactions have no fallback.
+/// Fresh attempts include fallback funds; an individual retry only has its transaction cost.
 pub(crate) fn spl_withdrawal_reserved_budget(
     state: &State,
     signature: &Signature,
 ) -> Option<Lamport> {
+    let attempt = state.spl_withdrawal_attempt(signature)?;
     let requests: Vec<_> = state
         .sent_spl_withdrawal_requests()
         .values()
         .filter(|sent| &sent.signature == signature)
         .map(|sent| sent.request.clone())
         .collect();
-    if requests.is_empty() {
-        None
-    } else {
-        Some(spl_withdrawal_reservation(state, &requests))
-    }
+    Some(match attempt {
+        SplWithdrawalAttempt::Fresh => spl_withdrawal_batch_budget(state, &requests)
+            .expect("BUG: a created fresh SPL transaction has a funded fallback budget"),
+        SplWithdrawalAttempt::Retry => {
+            spl_withdrawal_transaction_cost(state, requests.iter().map(|request| &request.terms))
+        }
+    })
 }

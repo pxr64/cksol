@@ -6,7 +6,7 @@ use crate::{
     rpc::{FetchedTransaction, get_transaction, submit_transaction_skipping_preflight},
     runtime::CanisterRuntime,
     state::{
-        MinterTransaction, NonceRead,
+        MinterTransaction, NonceRead, SplWithdrawalAttempt,
         audit::process_event,
         event::{EventType, VersionedMessage},
         fee_payer_lamports_spent, mutate_state, read_state,
@@ -256,7 +256,13 @@ async fn finalize_landed_withdrawal<R: CanisterRuntime>(
                     Priority::Error,
                     "Transaction {signature} finalized with on-chain error: {error:?}"
                 );
-                EventType::FailedTransaction { signature }
+                if read_state(|state| state.spl_withdrawal_attempt(&signature))
+                    == Some(SplWithdrawalAttempt::Fresh)
+                {
+                    EventType::RetryFailedSplWithdrawalTransaction { signature }
+                } else {
+                    EventType::FailedTransaction { signature }
+                }
             }
         },
         Ok(Some(FetchedTransaction { meta: None, .. })) => {

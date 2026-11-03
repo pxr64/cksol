@@ -36,6 +36,10 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
             state.process_transaction_submitted(signature, message, signers, purpose, timestamp);
         }
         EventType::SucceededTransaction { signature } => {
+            assert!(
+                state.spl_withdrawal_attempt(signature).is_none(),
+                "SPL withdrawal success requires actual-spend reconciliation"
+            );
             state.process_transaction_succeeded(signature);
         }
         EventType::SucceededSplWithdrawalTransaction {
@@ -47,8 +51,8 @@ fn apply_state_transition(state: &mut State, payload: &EventType, timestamp: u64
         EventType::FailedTransaction { signature } => {
             state.process_transaction_failed(signature, timestamp);
         }
-        EventType::SplitFailedSplWithdrawalBatch { signature } => {
-            state.process_split_failed_spl_withdrawal_batch(signature)
+        EventType::RetryFailedSplWithdrawalTransaction { signature } => {
+            state.process_retry_failed_spl_withdrawal_transaction(signature)
         }
         EventType::SplitFailedSplSweep { signature } => {
             state.process_split_failed_spl_sweep(signature)

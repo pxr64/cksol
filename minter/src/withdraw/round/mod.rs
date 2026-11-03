@@ -1,5 +1,5 @@
 use crate::{
-    constants::MAX_SPL_WITHDRAWALS_PER_NONCE_TX,
+    constants::{FEE_PER_SIGNATURE, MAX_SPL_WITHDRAWALS_PER_NONCE_TX},
     numeric::LedgerBurnIndex,
     sol_transfer::{BATCH_WITHDRAWAL_TX_FEE, MAX_WITHDRAWALS_PER_NONCE_TX},
     state::{
@@ -18,15 +18,15 @@ use std::{
 #[cfg(test)]
 mod tests;
 
-/// One withdrawal transaction to create: a batch of SOL transfers or one SPL withdrawal.
+/// One withdrawal transaction to create, containing only SOL transfers or only SPL transfers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WithdrawalPlan {
     Sol(Vec<WithdrawalRequest>),
-    Spl(SplWithdrawalRequest),
+    Spl(Vec<SplWithdrawalRequest>),
 }
 
 /// Selects fresh SPL requests in the supplied burn-index order, before the next SOL request.
-/// Unaffordable requests are skipped. A request whose fee cannot cover batching goes alone.
+/// Unaffordable requests are skipped. Every selected group, including one request, funds its retries.
 /// This only calculates a selection; the caller must reserve its SOL and tokens afterward.
 pub fn select_spl_withdrawal_batch(
     state: &State,
@@ -54,8 +54,14 @@ pub fn select_spl_withdrawal_batch(
         let Some(tokens_after) = tokens.checked_sub(terms.amount) else {
             continue;
         };
-        let single_cost = spl_withdrawal_transaction_cost(state, std::iter::once(terms));
-        if single_cost > available_balance {
+        // A group containing this request must cover its retry and the fresh signature fee.
+        let Some(minimum_fresh_cost) =
+            spl_withdrawal_transaction_cost(state, std::iter::once(terms))
+                .checked_add(FEE_PER_SIGNATURE)
+        else {
+            continue;
+        };
+        if minimum_fresh_cost > available_balance {
             continue;
         }
         selected.push(request.clone());
@@ -63,7 +69,7 @@ pub fn select_spl_withdrawal_batch(
     }
     // Check the largest prefix first: a larger batch gives each request a smaller fee share.
     // Removing only from the end preserves the order of eligible requests.
-    while selected.len() > 1 {
+    while !selected.is_empty() {
         if spl_withdrawal_batch_budget(state, &selected)
             .is_some_and(|cost| cost <= available_balance)
         {
@@ -71,12 +77,7 @@ pub fn select_spl_withdrawal_batch(
         }
         selected.pop();
     }
-    // A lone request only needs its single-transaction cost, checked above.
-    if selected.is_empty() {
-        None
-    } else {
-        Some(selected)
-    }
+    None
 }
 
 pub fn can_create_withdrawal_transaction(state: &State) -> bool {
@@ -93,20 +94,16 @@ pub fn covers_withdrawal_batch(state: &State, requests: &[WithdrawalRequest]) ->
     state.spendable_balance() >= cost
 }
 
-/// A bounded selection of fresh transactions and individual retries, sharing one budget.
-/// Processing alternates between the two queues; either may use the other's spare slots.
+/// A bounded selection of fresh transactions and individual retries, in processing order.
+/// Selection alternates between the two queues using one shared budget; either may use spare slots.
 pub struct WithdrawalRound {
-    retries: VecDeque<SplWithdrawalRequest>,
-    fresh: VecDeque<WithdrawalPlan>,
-    next_is_retry: bool,
+    plans: VecDeque<WithdrawalPlan>,
 }
 
 impl WithdrawalRound {
     pub fn take_from_queue(state: &State, slots: usize) -> Self {
         let mut round = Self {
-            retries: VecDeque::new(),
-            fresh: VecDeque::new(),
-            next_is_retry: state.next_withdrawal_is_retry(),
+            plans: VecDeque::new(),
         };
         if slots == 0 {
             return round;
@@ -125,13 +122,13 @@ impl WithdrawalRound {
         let mut retrying = state.retrying_spl_withdrawal_requests().iter();
         let mut next_is_retry = state.next_withdrawal_is_retry();
         // Reserve in processing order, so neither queue spends funds promised to the other.
-        while round.retries.len() + round.fresh.len() < slots {
+        while round.plans.len() < slots {
             if next_is_retry && round.take_spl_retry(&mut retrying, &mut budget) {
                 next_is_retry = false;
                 continue;
             }
             if let Some(plan) = fresh.take_next(&mut budget) {
-                round.fresh.push_back(plan);
+                round.plans.push_back(plan);
                 next_is_retry = true;
                 continue;
             }
@@ -151,26 +148,15 @@ impl WithdrawalRound {
         budget: &mut WithdrawalBudget<'_>,
     ) -> bool {
         for (_, pending) in retrying {
-            // The failed batch kept retry SOL reserved but released its tokens.
+            // The failed fresh transaction kept retry SOL reserved but released its tokens.
             // Reserve only tokens here so the retry's SOL is not counted twice.
             if budget.reserve_tokens(&pending.request.terms) {
-                self.retries.push_back(pending.request.clone());
+                self.plans
+                    .push_back(WithdrawalPlan::Spl(vec![pending.request.clone()]));
                 return true;
             }
         }
         false
-    }
-
-    fn next_spl_retry(&mut self) -> Option<WithdrawalPlan> {
-        let request = self.retries.pop_front()?;
-        self.next_is_retry = false;
-        Some(WithdrawalPlan::Spl(request))
-    }
-
-    fn next_fresh(&mut self) -> Option<WithdrawalPlan> {
-        let plan = self.fresh.pop_front()?;
-        self.next_is_retry = true;
-        Some(plan)
     }
 }
 
@@ -178,11 +164,7 @@ impl Iterator for WithdrawalRound {
     type Item = WithdrawalPlan;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_is_retry {
-            self.next_spl_retry().or_else(|| self.next_fresh())
-        } else {
-            self.next_fresh().or_else(|| self.next_spl_retry())
-        }
+        self.plans.pop_front()
     }
 }
 
@@ -268,13 +250,13 @@ impl FreshWithdrawals<'_> {
 
     fn next_spl(&mut self, budget: &mut WithdrawalBudget<'_>) -> Option<WithdrawalPlan> {
         let (_, pending) = self.pending_spl.peek().copied()?;
-        if !budget.reserve_spl(&pending.request.terms) {
+        if !budget.reserve_spl(&pending.request) {
             self.spl_blocked = true;
             return None;
         }
         let request = pending.request.clone();
         self.pending_spl.next();
-        Some(WithdrawalPlan::Spl(request))
+        Some(WithdrawalPlan::Spl(vec![request]))
     }
 }
 
@@ -286,17 +268,15 @@ struct WithdrawalBudget<'a> {
 
 impl WithdrawalBudget<'_> {
     /// Fresh withdrawals need free SOL; retry SOL is already held outside this budget.
-    fn reserve_spl(&mut self, terms: &SplWithdrawalRequestTerms) -> bool {
-        let Some(remaining_balance) =
-            self.available_balance
-                .checked_sub(spl_withdrawal_transaction_cost(
-                    self.state,
-                    std::iter::once(terms),
-                ))
+    fn reserve_spl(&mut self, request: &SplWithdrawalRequest) -> bool {
+        let Some(reserved) = spl_withdrawal_batch_budget(self.state, std::slice::from_ref(request))
         else {
             return false;
         };
-        if !self.reserve_tokens(terms) {
+        let Some(remaining_balance) = self.available_balance.checked_sub(reserved) else {
+            return false;
+        };
+        if !self.reserve_tokens(&request.terms) {
             return false;
         }
         self.available_balance = remaining_balance;

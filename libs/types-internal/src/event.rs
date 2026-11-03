@@ -300,8 +300,8 @@ pub enum EventType {
         /// The ckSOL fee burn index identifying the withdrawal.
         cksol_burn_block_index: u64,
     },
-    /// A definitively failed SPL batch was split into individual withdrawal retries.
-    SplitFailedSplWithdrawalBatch { signature: Signature },
+    /// A definitively failed fresh SPL transaction was queued for individual withdrawal retries.
+    RetryFailedSplWithdrawalTransaction { signature: Signature },
 }
 
 /// The mint enqueued for one deposit of a `CreditedSweep` event.

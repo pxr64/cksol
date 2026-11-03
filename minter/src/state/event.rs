@@ -371,9 +371,9 @@ pub enum EventType {
         #[cbor(n(0), with = "cbor::id")]
         cksol_burn_block_index: LedgerBurnIndex,
     },
-    /// A definitively failed SPL batch was split into individual withdrawal retries.
+    /// A definitively failed fresh SPL transaction was queued for individual withdrawal retries.
     #[n(33)]
-    SplitFailedSplWithdrawalBatch {
+    RetryFailedSplWithdrawalTransaction {
         #[cbor(n(0), with = "cbor::signature")]
         signature: Signature,
     },

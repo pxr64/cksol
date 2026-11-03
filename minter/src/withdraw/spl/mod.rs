@@ -1,7 +1,7 @@
-use crate::withdraw::spl::fees::spl_withdrawal_transaction_cost;
+use crate::withdraw::spl::fees::spl_withdrawal_batch_budget;
 use crate::{
     address::{associated_token_address, minter_address, minter_public_key},
-    constants::CKSOL_LEDGER_TRANSACTION_FEE,
+    constants::{CKSOL_LEDGER_TRANSACTION_FEE, MAX_SPL_WITHDRAWALS_PER_NONCE_TX},
     deposit::mint::{MintQueue, mint_pending, process_pending_mints_round},
     guard::{GuardError, withdrawal_guard},
     ledger::{
@@ -13,7 +13,10 @@ use crate::{
     queue_cursor::QueueCursors,
     runtime::CanisterRuntime,
     sol_transfer::CreateTransferError,
-    spl_transfer::{build_spl_withdrawal_instructions, build_spl_withdrawal_message},
+    spl_transfer::{
+        build_spl_withdrawal_message,
+        withdrawal::{SplWithdrawalTransfer, build_batch_spl_withdrawal_instructions},
+    },
     state::{
         CreatedSplWithdrawalTransaction, PendingSplWithdrawalFeeReimbursement,
         PendingSplWithdrawalReimbursement, State, SupportedSplToken,
@@ -37,7 +40,12 @@ use icrc_ledger_types::{
 use sol_rpc_types::Lamport;
 use solana_address::Address;
 use solana_hash::Hash;
-use std::{str::FromStr, time::Duration};
+use solana_message::Message;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+    time::Duration,
+};
 
 pub(crate) mod fees;
 pub use fees::quote_withdrawal_fee;
@@ -45,17 +53,54 @@ pub use fees::quote_withdrawal_fee;
 #[cfg(test)]
 mod tests;
 
-pub fn covers_spl_withdrawal(state: &State, request: &SplWithdrawalRequest) -> bool {
-    // Retry SOL was reserved before the original batch was signed.
-    let sol_is_prepaid = state
-        .retrying_spl_withdrawal_requests()
-        .contains_key(&request.cksol_burn_block_index);
-    let has_enough_sol = sol_is_prepaid
-        || state.spendable_balance()
-            >= spl_withdrawal_transaction_cost(state, std::iter::once(&request.terms));
-    let has_enough_tokens = state.spl_treasury_balance(&request.terms.mint) >= request.terms.amount;
+pub fn covers_spl_withdrawals(state: &State, requests: &[SplWithdrawalRequest]) -> bool {
+    if !(1..=MAX_SPL_WITHDRAWALS_PER_NONCE_TX).contains(&requests.len())
+        || requests
+            .iter()
+            .map(|request| request.cksol_burn_block_index)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != requests.len()
+    {
+        return false;
+    }
+    let contains_retry = requests.iter().any(|request| {
+        state
+            .retrying_spl_withdrawal_requests()
+            .contains_key(&request.cksol_burn_block_index)
+    });
+    if contains_retry {
+        covers_spl_withdrawal_retry(state, requests)
+    } else {
+        covers_fresh_spl_withdrawals(state, requests)
+    }
+}
 
-    has_enough_sol && has_enough_tokens
+fn covers_spl_withdrawal_retry(state: &State, requests: &[SplWithdrawalRequest]) -> bool {
+    // A retry must go alone. Its SOL is prepaid, so only treasury tokens need checking.
+    requests.len() == 1 && covers_spl_treasury_tokens(state, requests)
+}
+
+fn covers_fresh_spl_withdrawals(state: &State, requests: &[SplWithdrawalRequest]) -> bool {
+    let Some(reserved) = spl_withdrawal_batch_budget(state, requests) else {
+        return false;
+    };
+    let has_enough_sol = state.spendable_balance() >= reserved;
+    has_enough_sol && covers_spl_treasury_tokens(state, requests)
+}
+
+fn covers_spl_treasury_tokens(state: &State, requests: &[SplWithdrawalRequest]) -> bool {
+    let mut required_tokens = BTreeMap::<Address, u64>::new();
+    for request in requests {
+        let amount = required_tokens.entry(request.terms.mint).or_default();
+        let Some(total) = amount.checked_add(request.terms.amount) else {
+            return false;
+        };
+        *amount = total;
+    }
+    required_tokens
+        .iter()
+        .all(|(mint, amount)| state.spl_treasury_balance(mint) >= *amount)
 }
 
 pub fn withdrawal_status(cksol_burn_block_index: WithdrawSplId) -> WithdrawSplStatus {
@@ -69,36 +114,27 @@ pub(super) fn create_transaction<R: CanisterRuntime>(
     minter_address: &Address,
     nonce_account: Address,
     nonce_value: Hash,
-    request: &SplWithdrawalRequest,
+    requests: &[SplWithdrawalRequest],
 ) -> bool {
-    let instructions = read_state(|state| {
-        let token = state
-            .supported_spl_token(&request.terms.mint)
-            .expect("BUG: an accepted SPL withdrawal has a registered mint");
-        build_spl_withdrawal_instructions(
-            minter_address,
-            token,
-            &request.terms.address,
-            request.terms.amount,
-            request.terms.create_destination_account,
-        )
-    });
-    if let Err(error) =
-        build_spl_withdrawal_message(minter_address, &nonce_account, nonce_value, &instructions)
-    {
+    let burn_indices = requests
+        .iter()
+        .map(|request| request.cksol_burn_block_index)
+        .collect::<Vec<_>>();
+    // A sweep may have reserved SOL, or another transaction tokens, during the nonce read.
+    if !read_state(|state| covers_spl_withdrawals(state, requests)) {
         log!(
-            Priority::Error,
-            "Failed to build SPL withdrawal transaction for burn index {}: {error}",
-            request.cksol_burn_block_index,
+            Priority::Info,
+            "The balance no longer covers SPL withdrawals {burn_indices:?}, skipping them this round"
         );
         return false;
     }
-    // An SPL sweep may have reserved part of the balance during the nonce read.
-    if !read_state(|state| covers_spl_withdrawal(state, request)) {
+    let message = read_state(|state| {
+        build_withdrawal_message(state, minter_address, &nonce_account, nonce_value, requests)
+    });
+    if let Err(error) = message {
         log!(
-            Priority::Info,
-            "The balance no longer covers SPL withdrawal {}, skipping it this round",
-            request.cksol_burn_block_index,
+            Priority::Error,
+            "Failed to build SPL withdrawal transaction for burn indices {burn_indices:?}: {error}"
         );
         return false;
     }
@@ -106,7 +142,7 @@ pub(super) fn create_transaction<R: CanisterRuntime>(
         process_event(
             state,
             EventType::CreatedSplWithdrawalTransaction {
-                burn_indices: vec![request.cksol_burn_block_index],
+                burn_indices,
                 nonce_account,
                 nonce_value,
             },
@@ -114,6 +150,32 @@ pub(super) fn create_transaction<R: CanisterRuntime>(
         )
     });
     true
+}
+
+/// Uses the same request-to-message conversion for creation and rebuilding before signing.
+pub(crate) fn build_withdrawal_message<'a>(
+    state: &'a State,
+    minter_address: &Address,
+    nonce_account: &Address,
+    nonce_value: Hash,
+    requests: impl IntoIterator<Item = &'a SplWithdrawalRequest>,
+) -> Result<Message, CreateTransferError> {
+    let transfers: Vec<_> = requests
+        .into_iter()
+        .map(|request| {
+            let token = state
+                .supported_spl_token(&request.terms.mint)
+                .expect("BUG: an accepted SPL withdrawal has a registered mint");
+            SplWithdrawalTransfer {
+                token,
+                destination: &request.terms.address,
+                amount: request.terms.amount,
+                create_destination_account: request.terms.create_destination_account,
+            }
+        })
+        .collect();
+    let instructions = build_batch_spl_withdrawal_instructions(minter_address, &transfers);
+    build_spl_withdrawal_message(minter_address, nonce_account, nonce_value, &instructions)
 }
 
 /// Rebuilds the created transaction from state for signing.

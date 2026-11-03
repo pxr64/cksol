@@ -34,26 +34,6 @@ pub fn build_spl_withdrawal_message(
     )
 }
 
-/// Transfers tokens from the minter's treasury ATA to the destination owner's ATA,
-/// optionally creating the destination ATA at the minter's expense first.
-pub fn build_spl_withdrawal_instructions(
-    minter_address: &Address,
-    token: &SupportedSplToken,
-    destination: &Address,
-    amount: u64,
-    create_destination_account: bool,
-) -> Vec<Instruction> {
-    build_batch_spl_withdrawal_instructions(
-        minter_address,
-        &[SplWithdrawalTransfer {
-            token,
-            destination,
-            amount,
-            create_destination_account,
-        }],
-    )
-}
-
 /// Creates each requested destination ATA once, then transfers tokens in request order.
 /// Different mints and token programs can share the minter's signature and durable nonce.
 pub fn build_batch_spl_withdrawal_instructions(

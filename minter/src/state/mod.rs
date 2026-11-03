@@ -11,17 +11,17 @@ use crate::{
         BATCH_WITHDRAWAL_TX_FEE, CreateTransferError, MAX_SIGNATURES,
         build_batch_withdrawal_message,
     },
-    spl_transfer::{
-        build_spl_withdrawal_message,
-        withdrawal::{SplWithdrawalTransfer, build_batch_spl_withdrawal_instructions},
-    },
     state::event::{
         CreditedDeposit, Signer, SplWithdrawalFeeReimbursementRequest, SplWithdrawalRequest,
         SplWithdrawalRequestTerms, TransactionPurpose, VersionedMessage, WithdrawalRequest,
     },
     utils::insertion_ordered_map::InsertionOrderedMap,
-    withdraw::spl::fees::{
-        spl_withdrawal_reservation, spl_withdrawal_reserved_budget, spl_withdrawal_reserved_cost,
+    withdraw::spl::{
+        build_withdrawal_message,
+        fees::{
+            spl_withdrawal_batch_budget, spl_withdrawal_reserved_budget,
+            spl_withdrawal_reserved_cost,
+        },
     },
 };
 use candid::Principal;
@@ -929,6 +929,13 @@ impl State {
         &self.created_spl_withdrawal_txs
     }
 
+    pub fn spl_withdrawal_attempt(&self, signature: &Signature) -> Option<SplWithdrawalAttempt> {
+        self.sent_spl_withdrawal_requests
+            .values()
+            .find(|sent| &sent.signature == signature)
+            .map(|sent| sent.attempt)
+    }
+
     pub fn sent_spl_withdrawal_requests(
         &self,
     ) -> &BTreeMap<LedgerBurnIndex, SentSplWithdrawalRequest> {
@@ -1258,12 +1265,18 @@ impl State {
             self.retrying_spl_withdrawal_requests
                 .contains_key(burn_index)
         });
-        let withdrawals = if is_retry {
-            self.prepare_spl_withdrawal_retry(burn_indices)
+        let (withdrawals, attempt) = if is_retry {
+            (
+                self.prepare_spl_withdrawal_retry(burn_indices),
+                SplWithdrawalAttempt::Retry,
+            )
         } else {
-            self.prepare_fresh_spl_withdrawals(burn_indices)
+            (
+                self.prepare_fresh_spl_withdrawals(burn_indices),
+                SplWithdrawalAttempt::Fresh,
+            )
         };
-        self.bind_spl_withdrawals(withdrawals, nonce_account, nonce_value);
+        self.bind_spl_withdrawals(withdrawals, nonce_account, nonce_value, attempt);
         self.next_withdrawal_is_retry = !is_retry;
     }
 
@@ -1281,7 +1294,8 @@ impl State {
                     .clone()
             })
             .collect();
-        let reserved = spl_withdrawal_reservation(self, &requests);
+        let reserved = spl_withdrawal_batch_budget(self, &requests)
+            .expect("Attempted to reserve fresh SPL withdrawals their quoted fees cannot cover");
         self.balance = self
             .balance
             .checked_sub(reserved)
@@ -1317,6 +1331,7 @@ impl State {
         withdrawals: Vec<PendingSplWithdrawalRequest>,
         nonce_account: &Address,
         nonce_value: Hash,
+        attempt: SplWithdrawalAttempt,
     ) {
         let burn_indices = withdrawals
             .iter()
@@ -1344,6 +1359,7 @@ impl State {
                 *nonce_account,
                 CreatedSplWithdrawalTransaction {
                     nonce_value,
+                    attempt,
                     burn_indices,
                 },
             ),
@@ -1441,6 +1457,7 @@ impl State {
                         request: pending.request,
                         signature: *signature,
                         created_at: pending.created_at,
+                        attempt: created.attempt,
                     },
                 ),
                 None,
@@ -1515,37 +1532,24 @@ impl State {
         nonce_account: &Address,
         created: &CreatedSplWithdrawalTransaction,
     ) -> Result<Message, CreateTransferError> {
-        let transfers: Vec<_> = created
-            .burn_indices
-            .iter()
-            .map(|burn_index| {
-                let request = &self
-                    .created_spl_withdrawal_requests
-                    .get(burn_index)
-                    .unwrap_or_else(|| {
-                        panic!("BUG: SPL withdrawal request {burn_index} of a created transaction is not in the created bucket")
-                    })
-                    .request;
-                let token = self
-                    .supported_spl_token(&request.terms.mint)
-                    .expect("BUG: an accepted SPL withdrawal has a registered mint");
-                SplWithdrawalTransfer {
-                    token,
-                    destination: &request.terms.address,
-                    amount: request.terms.amount,
-                    create_destination_account: request.terms.create_destination_account,
-                }
-            })
-            .collect();
+        let requests = created.burn_indices.iter().map(|burn_index| {
+            &self
+                .created_spl_withdrawal_requests
+                .get(burn_index)
+                .unwrap_or_else(|| {
+                    panic!("BUG: SPL withdrawal request {burn_index} of a created transaction is not in the created bucket")
+                })
+                .request
+        });
         let minter_address = minter_address(self.minter_public_key.as_ref().expect(
             "BUG: an SPL withdrawal message was rebuilt before the minter public key was recorded",
         ));
-        let instructions = build_batch_spl_withdrawal_instructions(&minter_address, &transfers);
-        build_spl_withdrawal_message(
+        build_withdrawal_message(
+            self,
             &minter_address,
             nonce_account,
             created.nonce_value,
-            &instructions,
+            requests,
         )
     }
 
@@ -1642,6 +1646,11 @@ impl State {
     }
 
     fn process_transaction_failed(&mut self, signature: &Signature, failed_at: u64) {
+        assert_ne!(
+            self.spl_withdrawal_attempt(signature),
+            Some(SplWithdrawalAttempt::Fresh),
+            "Attempted to reimburse a fresh SPL withdrawal before its individual retry"
+        );
         let transaction = self.take_failed_transaction(signature);
         match &transaction {
             MinterTransaction::SweepDeposit { .. } => self.deposits.drop_swept(signature),
@@ -1685,14 +1694,11 @@ impl State {
         self.record_failed_transaction(signature, transaction);
     }
 
-    fn process_split_failed_spl_withdrawal_batch(&mut self, signature: &Signature) {
-        assert!(
-            self.sent_spl_withdrawal_requests
-                .values()
-                .filter(|sent| &sent.signature == signature)
-                .count()
-                > 1,
-            "Attempted to split a transaction that is not an SPL withdrawal batch"
+    fn process_retry_failed_spl_withdrawal_transaction(&mut self, signature: &Signature) {
+        assert_eq!(
+            self.spl_withdrawal_attempt(signature),
+            Some(SplWithdrawalAttempt::Fresh),
+            "Attempted to retry an SPL transaction that is not a fresh withdrawal"
         );
         let transaction = self.take_failed_transaction(signature);
         let MinterTransaction::Withdrawal { nonce_account, .. } = &transaction else {
@@ -1700,7 +1706,7 @@ impl State {
         };
         self.nonce_pool.free(nonce_account);
         self.record_failed_transaction(signature, transaction);
-        // The failed batch moved no tokens. Its remaining SOL reservation funds the
+        // The failed fresh transaction moved no tokens. Its remaining SOL reservation funds the
         // individual retries and stays unavailable to fresh work.
         for (burn_index, sent) in self.take_failed_spl_withdrawals(signature) {
             assert_eq!(
@@ -1932,9 +1938,17 @@ fn assert_bound_withdrawal(
     );
 }
 
+/// Whether an SPL transaction is the original attempt or its one prepaid individual retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplWithdrawalAttempt {
+    Fresh,
+    Retry,
+}
+
 /// SPL withdrawals bound to one durable nonce, waiting to be signed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatedSplWithdrawalTransaction {
+    pub attempt: SplWithdrawalAttempt,
     pub nonce_value: Hash,
     /// The ckSOL fee burn indices identifying the requests in transaction order.
     pub burn_indices: Vec<LedgerBurnIndex>,
@@ -1950,6 +1964,7 @@ pub struct PendingSplWithdrawalRequest {
 /// An SPL withdrawal recorded as submitted to Solana.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SentSplWithdrawalRequest {
+    pub attempt: SplWithdrawalAttempt,
     pub request: SplWithdrawalRequest,
     pub signature: Signature,
     pub created_at: u64,

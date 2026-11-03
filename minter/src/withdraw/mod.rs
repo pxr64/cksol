@@ -258,9 +258,13 @@ async fn create_transaction<R: CanisterRuntime>(
                 .map(|request| request.burn_block_index)
                 .collect::<Vec<_>>()
         ),
-        WithdrawalPlan::Spl(request) => {
-            format!("SPL withdrawal {}", request.cksol_burn_block_index)
-        }
+        WithdrawalPlan::Spl(requests) => format!(
+            "SPL withdrawal batch for burn indices {:?}",
+            requests
+                .iter()
+                .map(|request| request.cksol_burn_block_index)
+                .collect::<Vec<_>>()
+        ),
     };
     let nonce_value = match read_verified_nonce(runtime, nonce_account, minter_address).await {
         Ok(nonce_value) => nonce_value,
@@ -287,12 +291,12 @@ async fn create_transaction<R: CanisterRuntime>(
             nonce_value,
             requests,
         ),
-        WithdrawalPlan::Spl(request) => spl::create_transaction(
+        WithdrawalPlan::Spl(requests) => spl::create_transaction(
             runtime,
             &minter_address,
             nonce_account,
             nonce_value,
-            &request,
+            &requests,
         ),
     }
 }
