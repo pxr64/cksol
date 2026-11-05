@@ -1395,6 +1395,7 @@ mod operating_top_up_tests {
     #[tokio::test]
     async fn should_burn_the_top_up_account_into_the_operating_balance() {
         let setup = SetupBuilder::new()
+            .with_proxy_canister()
             .with_initial_ledger_balances(vec![(DEFAULT_CALLER_ACCOUNT, Nat::from(10 * TOP_UP))])
             .build()
             .await;
@@ -1402,6 +1403,20 @@ mod operating_top_up_tests {
         beef[30] = 0xbe;
         beef[31] = 0xef;
         let top_up_account = setup.minter().get_operating_balance().await.top_up_account;
+        for received in [0, Setup::OPERATING_TOP_UP_CYCLES - 1] {
+            assert_eq!(
+                setup
+                    .minter()
+                    .process_operating_top_up_with_cycles(received)
+                    .await,
+                Err(ProcessOperatingTopUpError::InsufficientCycles(
+                    cksol_types::InsufficientCyclesError {
+                        expected: Setup::OPERATING_TOP_UP_CYCLES,
+                        received,
+                    }
+                ))
+            );
+        }
         assert_eq!(
             top_up_account,
             Account {

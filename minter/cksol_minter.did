@@ -509,6 +509,8 @@ type OperatingTopUp = record {
 };
 
 type ProcessOperatingTopUpError = variant {
+    // Insufficient cycles attached to pay for the processing attempt.
+    InsufficientCycles : InsufficientCyclesError;
     // Another call is processing the top-up account.
     AlreadyProcessing;
     // The top-up account holds no ckSOL.

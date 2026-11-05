@@ -179,6 +179,7 @@ impl Setup {
     pub const DEFAULT_DEPOSIT_SPL_REQUIRED_CYCLES: u128 = 1_000_000_000_000;
     pub const FUNDED_BALANCE: Lamport = fixtures::DEPOSIT_AMOUNT - validator::FEE_PER_SIGNATURE;
     pub const OPERATING_TOP_UP: Lamport = 100_000_000; // 0.1 SOL
+    pub const OPERATING_TOP_UP_CYCLES: u128 = 1_000_000_000;
     pub const DEFAULT_MINIMUM_WITHDRAWAL_AMOUNT: Lamport = 2_000_000; // 0.002 SOL
     pub const DEFAULT_AUTOMATIC_DEPOSIT_FEE: Lamport = 2_000_000; // 0.002 SOL
     pub const DEFAULT_CALLER: Principal =
@@ -855,7 +856,16 @@ impl<'a> CkSolMinter<'a> {
     pub async fn process_operating_top_up(
         &self,
     ) -> Result<OperatingTopUp, ProcessOperatingTopUpError> {
-        self.update_call("process_operating_top_up", (), 0).await
+        self.process_operating_top_up_with_cycles(Setup::OPERATING_TOP_UP_CYCLES)
+            .await
+    }
+
+    pub async fn process_operating_top_up_with_cycles(
+        &self,
+        cycles: u128,
+    ) -> Result<OperatingTopUp, ProcessOperatingTopUpError> {
+        self.update_call("process_operating_top_up", (), cycles)
+            .await
     }
 
     pub async fn state(&self) -> MinterState {

@@ -428,7 +428,7 @@ pub enum WatchDepositAddressError {
 }
 
 /// Insufficient cycles attached by the caller to complete the call.
-#[derive(Debug, Clone, PartialEq, CandidType, Deserialize, Error)]
+#[derive(Debug, Clone, Eq, PartialEq, CandidType, Deserialize, Error)]
 #[error("Insufficient cycles attached, expected {expected} but got {received}")]
 pub struct InsufficientCyclesError {
     /// The amount of cycles the call requires.
@@ -484,6 +484,8 @@ pub struct OperatingTopUp {
 /// The error result of a `process_operating_top_up` call.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
 pub enum ProcessOperatingTopUpError {
+    /// The caller must attach enough cycles to pay for the processing attempt.
+    InsufficientCycles(InsufficientCyclesError),
     /// Another call is processing the top-up account.
     AlreadyProcessing,
     /// The top-up account holds no ckSOL.

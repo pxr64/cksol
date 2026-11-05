@@ -1,6 +1,6 @@
 use super::{operating_top_up_account, process_operating_top_up};
 use crate::{
-    constants::OPERATING_TOP_UP_SUBACCOUNT,
+    constants::{OPERATING_TOP_UP_CYCLES, OPERATING_TOP_UP_SUBACCOUNT},
     guard::operating_top_up_guard,
     numeric::LedgerBurnIndex,
     state::{event::EventType, read_state, reset_state},
@@ -11,7 +11,9 @@ use crate::{
     },
 };
 use candid::Nat;
-use cksol_types::{BurnMemo, Memo, OperatingTopUp, ProcessOperatingTopUpError};
+use cksol_types::{
+    BurnMemo, InsufficientCyclesError, Memo, OperatingTopUp, ProcessOperatingTopUpError,
+};
 use ic_canister_runtime::IcError;
 use icrc_ledger_types::icrc1::{
     account::Account,
@@ -26,7 +28,53 @@ fn top_up_account() -> Account {
 }
 
 fn runtime_with_top_up_balance() -> TestCanisterRuntime {
-    TestCanisterRuntime::new().add_stub_response(Nat::from(TOP_UP))
+    funded_runtime().add_stub_response(Nat::from(TOP_UP))
+}
+
+fn funded_runtime() -> TestCanisterRuntime {
+    TestCanisterRuntime::new()
+        .expecting_charges()
+        .add_msg_cycles_available(OPERATING_TOP_UP_CYCLES)
+}
+
+#[tokio::test]
+async fn should_reject_unfunded_calls_before_contacting_the_ledger() {
+    init_state();
+    for received in [0, OPERATING_TOP_UP_CYCLES - 1] {
+        let runtime = TestCanisterRuntime::new()
+            .add_msg_cycles_available(received)
+            .add_stub_response(Nat::from(0_u8));
+        assert_eq!(
+            process_operating_top_up(&runtime).await,
+            Err(ProcessOperatingTopUpError::InsufficientCycles(
+                InsufficientCyclesError {
+                    expected: OPERATING_TOP_UP_CYCLES,
+                    received,
+                }
+            ))
+        );
+        assert!(runtime.sent_update_calls().is_empty());
+        assert!(runtime.msg_cycles_accepted().is_empty());
+        EventsAssert::assert_no_events_recorded();
+        read_state(|state| assert_eq!(state.operating_balance(), 0));
+        assert!(operating_top_up_guard(top_up_account()).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn should_charge_only_the_fixed_fee_when_excess_cycles_are_attached() {
+    init_state();
+    let runtime = TestCanisterRuntime::new()
+        .expecting_charges()
+        .add_msg_cycles_available(2 * OPERATING_TOP_UP_CYCLES)
+        .add_stub_response(Nat::from(0_u8));
+
+    assert_eq!(
+        process_operating_top_up(&runtime).await,
+        Err(ProcessOperatingTopUpError::NoFunds)
+    );
+    assert_eq!(runtime.msg_cycles_accepted(), vec![OPERATING_TOP_UP_CYCLES]);
+    assert_eq!(runtime.sent_update_calls().len(), 1);
 }
 
 #[tokio::test]
@@ -45,6 +93,7 @@ async fn should_burn_the_top_up_balance_into_the_operating_balance() {
     );
 
     let calls = runtime.sent_update_calls();
+    assert_eq!(runtime.msg_cycles_accepted(), vec![OPERATING_TOP_UP_CYCLES]);
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].canister_id, ledger_canister_id());
     assert_eq!(calls[0].method, "icrc1_balance_of");
@@ -77,7 +126,7 @@ async fn should_burn_the_top_up_balance_into_the_operating_balance() {
 #[tokio::test]
 async fn should_not_burn_an_empty_top_up_account() {
     init_state();
-    let runtime = TestCanisterRuntime::new().add_stub_response(Nat::from(0_u8));
+    let runtime = funded_runtime().add_stub_response(Nat::from(0_u8));
 
     assert_eq!(
         process_operating_top_up(&runtime).await,
@@ -85,12 +134,13 @@ async fn should_not_burn_an_empty_top_up_account() {
     );
 
     assert_eq!(runtime.sent_update_calls().len(), 1);
+    assert_eq!(runtime.msg_cycles_accepted(), vec![OPERATING_TOP_UP_CYCLES]);
     EventsAssert::assert_no_events_recorded();
 }
 
 #[tokio::test]
 async fn should_record_nothing_when_the_ledger_fails() {
-    let balance_read_fails = TestCanisterRuntime::new().add_stub_error(IcError::CallPerformFailed);
+    let balance_read_fails = funded_runtime().add_stub_error(IcError::CallPerformFailed);
     let burn_call_fails = runtime_with_top_up_balance().add_stub_error(IcError::CallPerformFailed);
     let burn_rejected = runtime_with_top_up_balance().add_stub_response(Err::<Nat, TransferError>(
         TransferError::TemporarilyUnavailable,
@@ -119,6 +169,7 @@ async fn should_record_nothing_when_the_ledger_fails() {
         );
 
         EventsAssert::assert_no_events_recorded();
+        assert_eq!(runtime.msg_cycles_accepted(), vec![OPERATING_TOP_UP_CYCLES]);
         read_state(|state| assert_eq!(state.operating_balance(), 0));
         assert!(operating_top_up_guard(top_up_account()).is_ok());
     }
@@ -136,4 +187,5 @@ async fn should_reject_a_concurrent_top_up() {
     );
 
     assert!(runtime.sent_update_calls().is_empty());
+    assert!(runtime.msg_cycles_accepted().is_empty());
 }

@@ -177,14 +177,15 @@ flowchart LR
 An operator funds the operating balance with ckSOL:
 
 1. Send ckSOL with `icrc1_transfer` to the top-up account. `get_operating_balance` returns this account.
-2. Call `process_operating_top_up`. Any caller can call it. It has no arguments.
+2. Call `process_operating_top_up` through a canister or cycles wallet, attaching at least 1,000,000,000 cycles. It has no arguments. The minter accepts exactly this fixed processing fee before contacting the ledger; excess attached cycles remain unaccepted. Ordinary ingress calls cannot attach cycles.
 3. The minter reads the balance of the top-up account and burns all of it with `BurnMemo::TopUp`. It records `ToppedUpOperatingBalance` with the burn index and the amount, and it returns both.
 
 The burn removes the claim of ckSOL holders on SOL that is already on `Main`. No SOL moves, and the tracked balance does not change. Only the operating balance increases.
 
-- If the top-up account is empty, the call fails with `NoFunds`.
-- If the ledger fails, the ckSOL stays in the top-up account for a later call.
-- A guard on the top-up account lets only one call run at a time.
+- An underfunded call returns `InsufficientCycles` without accepting cycles or contacting the ledger.
+- If the top-up account is empty, the call fails with `NoFunds` and retains the processing fee.
+- If the ledger fails, the processing fee is retained. A definitive burn rejection leaves the ckSOL in the top-up account for a later call.
+- A guard on the top-up account lets only one call run at a time. Concurrent calls return `AlreadyProcessing` without accepting cycles.
 - If the burn succeeds but its reply is lost, the operating balance does not get the amount.
 
 An operator who has SOL deposits it with `deposit_sol` first, and then sends the minted ckSOL to the top-up account.

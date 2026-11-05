@@ -1,5 +1,6 @@
 use crate::{
-    constants::OPERATING_TOP_UP_SUBACCOUNT,
+    constants::{OPERATING_TOP_UP_CYCLES, OPERATING_TOP_UP_SUBACCOUNT},
+    cycles::{charge_caller_cycles, check_caller_available_cycles},
     guard::operating_top_up_guard,
     ledger::burn_from_subaccount,
     runtime::CanisterRuntime,
@@ -24,12 +25,17 @@ pub fn operating_top_up_account(minter: Principal) -> Account {
 }
 
 /// Burns all ckSOL of the top-up account and adds the amount to the operating balance.
+/// Charges the fixed processing fee before reading the ledger, even if no funds
+/// are available or a ledger call fails.
 pub async fn process_operating_top_up<R: CanisterRuntime>(
     runtime: &R,
 ) -> Result<OperatingTopUp, ProcessOperatingTopUpError> {
     let minter = runtime.canister_self();
     let top_up_account = operating_top_up_account(minter);
     let _guard = operating_top_up_guard(top_up_account)?;
+    check_caller_available_cycles(runtime, OPERATING_TOP_UP_CYCLES)
+        .map_err(ProcessOperatingTopUpError::InsufficientCycles)?;
+    charge_caller_cycles(runtime, OPERATING_TOP_UP_CYCLES);
     let balance = read_state(|state| state.ledger_client(runtime.inter_canister_call_runtime()))
         .balance_of(top_up_account)
         .await

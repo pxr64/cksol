@@ -21,6 +21,10 @@ pub const OPERATING_TOP_UP_SUBACCOUNT: [u8; 32] = {
     subaccount
 };
 
+/// Fixed upfront charge for an operating top-up processing attempt, including
+/// an empty account or a ledger failure. Excess attached cycles are not accepted.
+pub const OPERATING_TOP_UP_CYCLES: u128 = 1_000_000_000;
+
 /// Maximum number of concurrent calls to the SOL RPC canister.
 pub const MAX_CONCURRENT_RPC_CALLS: usize = 10;
 
