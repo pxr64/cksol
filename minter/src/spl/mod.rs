@@ -1,4 +1,5 @@
 use crate::{
+    ledger::client::LedgerClient,
     rpc::{decode_program_account, get_account_info},
     runtime::CanisterRuntime,
     spl_fee::{XrcAssetError, check_xrc_asset},
@@ -20,7 +21,7 @@ const MAX_CK_TOKEN_SYMBOL_NUM_BYTES: usize = 20;
 #[cfg(test)]
 mod tests;
 
-/// Registers a token after checking its finalized Solana mint account.
+/// Registers a token after checking its finalized Solana mint and ledger minting account.
 /// The canister endpoint restricts this operation to the configured ledger suite
 /// orchestrator before any RPC call.
 pub async fn add_spl_token<R: CanisterRuntime>(
@@ -41,6 +42,22 @@ pub async fn add_spl_token<R: CanisterRuntime>(
                 AddSplTokenError::TemporarilyUnavailable(message)
             }
         })?;
+
+    let minting_account = LedgerClient::new(runtime.inter_canister_call_runtime(), token.ledger_id)
+        .minting_account()
+        .await
+        .map_err(|error| {
+            AddSplTokenError::TemporarilyUnavailable(format!(
+                "Failed to read the minting account of ledger {}: {error}",
+                token.ledger_id,
+            ))
+        })?;
+    if minting_account != Some(runtime.canister_self().into()) {
+        return Err(AddSplTokenError::InvalidToken(format!(
+            "Ledger {} must use the minter's default account as its minting account",
+            token.ledger_id,
+        )));
+    }
 
     // Recheck after the external calls: another registration may have claimed the mint
     // or ledger while this request was suspended. No await separates check and write.

@@ -36,7 +36,7 @@ The minter controls `D`, `A`, `Main` and `T`. The SPL tokens move from the sende
 
 ## 3. Token registry
 
-The configured ledger suite orchestrator registers each token with `add_spl_token`. The minter reads the finalized mint account before it records the token.
+The configured ledger suite orchestrator registers each token with `add_spl_token`. Before recording the token, the minter reads the finalized Solana mint account and checks that the ledger's `icrc1_minting_account` is its own default account.
 
 | Field | Description |
 |---|---|
@@ -52,8 +52,9 @@ The minter rejects these registrations:
 - A mint that is already registered (`AlreadySupported`).
 - A ledger that serves another mint, or the ckSOL ledger (`LedgerAlreadyUsed`).
 - An empty XRC symbol, or a symbol that XRC does not quote (`InvalidToken`).
+- A ledger without a minting account, or with a minting account other than the minter's default account (`InvalidToken`).
 
-If XRC is not available, the registration fails with `TemporarilyUnavailable`. The registry does not store a fee. The `QueuedSplDeposit` event records the quote of each deposit.
+If XRC or the ledger minting-account call is not available, the registration fails with `TemporarilyUnavailable`. The minting-account check validates configuration at registration; it does not authenticate the ledger or prevent later changes through a ledger upgrade. The registry does not store a fee. The `QueuedSplDeposit` event records the quote of each deposit.
 
 ## 4. Deposit sequence
 
