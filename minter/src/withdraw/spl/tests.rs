@@ -1107,6 +1107,36 @@ mod validation {
     }
 
     #[tokio::test]
+    async fn should_reject_an_empty_nonce_pool_before_either_burn() {
+        for program in [TokenProgram::Classic, TokenProgram::Token2022] {
+            reset_state();
+            reset_events();
+            init_state_with_args(valid_init_args());
+            init_schnorr_master_key();
+            let token = register_token(program);
+            let request = withdrawal_terms(&token);
+            let before = read_state(Clone::clone);
+            let events_before = EventsAssert::from_recorded();
+            let runtime = TestCanisterRuntime::new()
+                .with_increasing_time_from(123)
+                .add_stub_response(Ok::<Nat, TransferFromError>(42_u64.into()))
+                .add_stub_response(Ok::<Nat, TransferFromError>(7_u64.into()));
+
+            assert_eq!(
+                withdraw_request(&runtime, &request).await,
+                Err(WithdrawSplError::TemporarilyUnavailable(
+                    "The durable nonce account pool is empty, no withdrawal can be processed"
+                        .to_string()
+                ))
+            );
+            assert!(runtime.sent_update_calls().is_empty());
+            read_state(|state| assert_eq!(state, &before));
+            assert_eq!(EventsAssert::from_recorded(), events_before);
+            assert!(withdrawal_guard(request.account).is_ok());
+        }
+    }
+
+    #[tokio::test]
     async fn should_reject_invalid_withdrawals_before_either_burn() {
         init_state();
         init_schnorr_master_key();

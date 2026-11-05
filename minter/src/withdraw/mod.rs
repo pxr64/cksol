@@ -150,9 +150,9 @@ fn validate_destination(destination: &Address) -> Result<(), DestinationError> {
     Ok(())
 }
 
-fn validate_nonce_pool_not_empty() -> Result<(), WithdrawSolError> {
+fn validate_nonce_pool_not_empty() -> Result<(), DestinationError> {
     if read_state(|s| s.nonce_pool().is_empty()) {
-        return Err(WithdrawSolError::TemporarilyUnavailable(
+        return Err(DestinationError::TemporarilyUnavailable(
             "The durable nonce account pool is empty, no withdrawal can be processed".to_string(),
         ));
     }

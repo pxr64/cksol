@@ -339,6 +339,7 @@ pub async fn withdraw<R: CanisterRuntime>(
     let _guard = withdrawal_guard(account)?;
     let token = validate_token(mint, amount)?;
     let address = validate_destination(&token, address)?;
+    super::validate_nonce_pool_not_empty()?;
     let fee = quote_withdrawal_fee(
         read_state(|state| state.withdrawal_fee()),
         token.token_program,
