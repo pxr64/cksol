@@ -57,3 +57,21 @@ impl PriceOracle for NoPriceOracle {
         Err("No price oracle is configured".to_string())
     }
 }
+
+/// A fixed deposit fee in the SPL token's smallest units.
+/// A zero fee is the no-op policy. SOL cost and exchange prices do not affect it.
+pub struct FixedFeeProvider {
+    fee: u64,
+}
+
+impl FixedFeeProvider {
+    pub fn new(fee: u64) -> Self {
+        Self { fee }
+    }
+}
+
+impl PriceOracle for FixedFeeProvider {
+    async fn sol_to_spl(&self, _amount: Lamport, _mint: Address) -> Result<u64, String> {
+        Ok(self.fee)
+    }
+}

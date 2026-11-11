@@ -226,7 +226,7 @@ type DepositSplStatus = variant {
     Queued : record {
         // The recorded balance that will be swept, in the mint's smallest units.
         balance: nat64;
-        // The fee quoted at acceptance, in the mint's smallest units.
+        // The fee recorded at acceptance, in the mint's smallest units.
         fee: nat64;
     };
     // A Solana transaction sweeping the token account to the treasury has been
@@ -270,7 +270,7 @@ type DepositSplStatus = variant {
 
 // The outcome of the fee mint of a minted SPL deposit.
 type SplFeeMintStatus = variant {
-    // The deposit was quoted a zero fee, so there is no fee mint.
+    // The deposit has a zero fee, so there is no fee mint.
     None;
     // The fee mint is queued on the token ledger.
     Pending;
@@ -292,8 +292,8 @@ type AddSplTokenArgs = record {
     ledger_id: principal;
     minimum_deposit_amount: nat64;
     paused: bool;
-    // The symbol of the underlying asset on the exchange rate canister, such as `USDC`.
-    xrc_symbol: text;
+    // The fixed deposit fee in the token's smallest units; zero disables it.
+    deposit_fee: nat64;
     token_symbol: opt text;
 };
 type AddSplTokenError = variant {
@@ -431,7 +431,9 @@ type MinterArg = variant {
 //
 // *WARNING*: Backwards-compatibility is not guaranteed. Fields may be added,
 // removed, or renamed across releases.
+type SplDepositFee = record { mint: text; deposit_fee: nat64 };
 type UpgradeArgs = record {
+    spl_deposit_fees: opt vec SplDepositFee;
     // Sets or replaces the orchestrator. If absent, preserves the current setting.
     ledger_suite_orchestrator_id: opt principal;
     sol_rpc_canister_id : opt principal;
@@ -804,8 +806,8 @@ type EventType = variant {
       mint : text;
       // The IC ledger assigned to the mint.
       ledger_id : principal;
-      // The underlying asset symbol used for XRC requests.
-      xrc_symbol : text;
+      // The fixed deposit fee in the token's smallest units; zero disables it.
+      deposit_fee : nat64;
       // The minimum deposit in the token's smallest units.
       minimum_deposit_amount : nat64;
       // The program owning the mint.
@@ -1079,10 +1081,10 @@ service : (MinterArg) -> {
     deposit_sol: (DepositSolArgs) -> (DepositSolResult);
 
     // Queues a finalized SPL balance for sweeping to the minter and minting on its token ledger.
-    // The token fee quoted at acceptance is deducted from the ledger mint.
+    // The token fee recorded at acceptance is deducted from the ledger mint.
     // Once the user mint succeeds, that fee is minted into the minter's fee subaccount.
-    // New deposits cover two account reads, an XRC quote and a consolidation fee in cycles;
-    // the fee is charged only when the account checks and quoted net minimum succeed. Repeated requests for
+    // New deposits cover two account reads and a consolidation fee in cycles;
+    // the fee is charged only when the account checks and net minimum succeed. Repeated requests for
     // an in-flight account and mint return the existing ID without a charge, also when paused.
     deposit_spl: (DepositSplArgs) -> (DepositSplResult);
 
@@ -1095,8 +1097,7 @@ service : (MinterArg) -> {
     get_spl_deposit_address: (GetSplDepositAddressArgs) -> (GetSplDepositAddressResult);
 
     // Registers an SPL token and its IC ledger. Only the configured orchestrator can
-    // call it, and Token-2022 mints with extensions are rejected. The exchange rate
-    // canister must quote SOL in the token's symbol.
+    // call it, and Token-2022 mints with extensions are rejected.
     add_spl_token: (AddSplTokenArgs) -> (AddSplTokenResult);
 
     // Returns the status of the deposit with the given identifier,

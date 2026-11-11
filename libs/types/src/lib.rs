@@ -203,7 +203,7 @@ pub enum DepositSplStatus {
     Queued {
         /// The recorded balance that will be swept, in the mint's smallest units.
         balance: u64,
-        /// The fee quoted at acceptance, in the mint's smallest units.
+        /// The fee recorded at acceptance, in the mint's smallest units.
         fee: u64,
     },
     /// A Solana transaction sweeping the token account to the treasury has been submitted
@@ -248,7 +248,7 @@ pub enum DepositSplStatus {
 /// The outcome of the fee mint of a minted SPL deposit.
 #[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize, Serialize)]
 pub enum SplFeeMintStatus {
-    /// The deposit was quoted a zero fee, so there is no fee mint.
+    /// The deposit has a zero fee, so there is no fee mint.
     None,
     /// The fee mint is queued on the token ledger.
     Pending,
@@ -277,10 +277,9 @@ pub struct AddSplTokenArgs {
     pub minimum_deposit_amount: u64,
     /// Whether deposits should initially be paused.
     pub paused: bool,
-    /// The symbol of the underlying asset on the exchange rate canister, such as `USDC`.
-    /// Registration fails when the canister has no SOL rate in that symbol.
-    pub xrc_symbol: String,
-    /// The ckSPL ledger symbol, distinct from the underlying XRC asset symbol.
+    /// The fixed deposit fee in the token's smallest units; zero disables it.
+    pub deposit_fee: u64,
+    /// The ckSPL ledger symbol.
     /// Required for withdrawals; omission preserves compatibility with deposit-only registrations.
     pub token_symbol: Option<String>,
 }

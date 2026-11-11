@@ -2,7 +2,6 @@ use crate::{
     ledger::client::LedgerClient,
     rpc::{decode_program_account, get_account_info},
     runtime::CanisterRuntime,
-    spl_fee::{XrcAssetError, check_xrc_asset},
     state::{
         SupportedSplToken, TokenProgram, audit::process_event, event::EventType, mutate_state,
         read_state,
@@ -34,15 +33,6 @@ pub async fn add_spl_token<R: CanisterRuntime>(
 
     let data = get_finalized_mint_data(runtime, &token).await?;
     validate_mint_data(&data, &token)?;
-    check_xrc_asset(runtime, &token.xrc_symbol)
-        .await
-        .map_err(|error| match error {
-            XrcAssetError::UnknownAsset(_) => AddSplTokenError::InvalidToken(error.to_string()),
-            XrcAssetError::Unavailable(message) => {
-                AddSplTokenError::TemporarilyUnavailable(message)
-            }
-        })?;
-
     let minting_account = LedgerClient::new(runtime.inter_canister_call_runtime(), token.ledger_id)
         .minting_account()
         .await
@@ -98,9 +88,13 @@ fn validate_config(
             "The ledger token symbol must be non-empty ASCII and at most 20 bytes".to_string(),
         ));
     }
-    if token.xrc_symbol.trim().is_empty() {
+    if token
+        .minimum_deposit_amount
+        .checked_add(token.deposit_fee)
+        .is_none()
+    {
         return Err(AddSplTokenError::InvalidToken(
-            "The XRC symbol must not be empty".to_string(),
+            "Minimum deposit amount plus deposit fee exceeds u64".to_string(),
         ));
     }
     if [

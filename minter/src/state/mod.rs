@@ -518,8 +518,42 @@ impl State {
             deposit_sol_fee,
             nonce_accounts_to_add,
             automatic_deposit_fee,
+            spl_deposit_fees,
         }: UpgradeArgs,
     ) -> Result<(), InvalidStateError> {
+        // Validate the entire list before applying any fee updates.
+        let mut fees = BTreeMap::new();
+        for update in spl_deposit_fees.unwrap_or_default() {
+            let mint = update.mint.parse::<Address>().map_err(|error| {
+                InvalidStateError::InvalidSplDepositFee(format!(
+                    "Invalid mint {}: {error}",
+                    update.mint
+                ))
+            })?;
+            let token = self.supported_spl_token(&mint).ok_or_else(|| {
+                InvalidStateError::InvalidSplDepositFee(format!("Unsupported SPL mint: {mint}"))
+            })?;
+            if token
+                .minimum_deposit_amount
+                .checked_add(update.deposit_fee)
+                .is_none()
+            {
+                return Err(InvalidStateError::InvalidSplDepositFee(format!(
+                    "Minimum deposit amount plus fee exceeds u64 for {mint}"
+                )));
+            }
+            if fees.insert(mint, update.deposit_fee).is_some() {
+                return Err(InvalidStateError::InvalidSplDepositFee(format!(
+                    "Duplicate SPL mint: {mint}"
+                )));
+            }
+        }
+        for (mint, fee) in fees {
+            self.supported_spl_tokens
+                .get_mut(&mint)
+                .expect("validated mint")
+                .deposit_fee = fee;
+        }
         if let Some(id) = ledger_suite_orchestrator_id {
             self.ledger_suite_orchestrator_id = Some(id);
         }
@@ -1781,6 +1815,7 @@ impl State {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InvalidStateError {
+    InvalidSplDepositFee(String),
     InvalidCanisterId(String),
     InvalidMinimumDepositAmount {
         minimum_deposit_amount: u64,

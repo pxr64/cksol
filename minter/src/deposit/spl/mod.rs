@@ -1,11 +1,11 @@
 use crate::{
     address::{account_address, associated_token_address, minter_address, minter_public_key},
-    constants::{FEE_PER_SIGNATURE, GET_ACCOUNT_INFO_CYCLES, XRC_REQUEST_CYCLES},
+    constants::{FEE_PER_SIGNATURE, GET_ACCOUNT_INFO_CYCLES},
     cycles::{RpcCallCharge, charge_caller_cycles, charge_rpc_call, check_caller_available_cycles},
     guard::deposit_spl_guard,
     rpc::{get_spl_token_account, get_spl_token_balance},
     runtime::CanisterRuntime,
-    spl_fee::{FeeEstimator, XrcPriceOracle, estimate_sol_cost},
+    spl_fee::{FeeEstimator, FixedFeeProvider, estimate_sol_cost},
     state::{
         InFlightSplDeposit, QueuedSplDeposit, SchnorrPublicKey, State, SupportedSplToken,
         audit::process_event, event::EventType, mutate_state, read_state,
@@ -48,10 +48,7 @@ pub async fn deposit_spl<R: CanisterRuntime>(
     }
     let token = assert_valid_deposit_token(&mint)?;
     let consolidation_fee = read_state(|state| state.deposit_sol_fee());
-    check_caller_available_cycles(
-        runtime,
-        2 * GET_ACCOUNT_INFO_CYCLES + XRC_REQUEST_CYCLES + consolidation_fee,
-    )?;
+    check_caller_available_cycles(runtime, 2 * GET_ACCOUNT_INFO_CYCLES + consolidation_fee)?;
     let master_key =
         minter_public_key().map_err(|e| DepositSplError::TemporarilyUnavailable(e.to_string()))?;
     let latest_id_before = read_state(|state| state.spl_deposits().latest_id(&account, &mint));
@@ -103,7 +100,7 @@ async fn read_and_quote_deposit<R: CanisterRuntime>(
     let address = associated_token_address(&owner, &token.mint, &token.token_program.id());
     let balance = read_deposit_balance(runtime, token, address, owner).await?;
     let rent = read_destination_rent(runtime, token, minter_address(master_key)).await?;
-    let fee = quote_deposit_fee(runtime, token, balance, rent).await?;
+    let fee = quote_deposit_fee(token, balance, rent).await?;
     Ok(QueuedSplDeposit {
         account,
         mint: token.mint,
@@ -160,38 +157,23 @@ fn charge_account_read<R: CanisterRuntime, T>(runtime: &R, result: &Result<T, De
     );
 }
 
-/// Quotes the fee and checks the net minimum, charging the actual XRC call cost.
-async fn quote_deposit_fee<R: CanisterRuntime>(
-    runtime: &R,
+/// Applies the configured fixed fee and checks the net minimum. No oracle call is made.
+async fn quote_deposit_fee(
     token: &SupportedSplToken,
     balance: u64,
     rent: Lamport,
 ) -> Result<u64, DepositSplError> {
-    // Quote a standalone sweep; batching can reduce its actual cost.
+    // Keep the estimator interface; the fixed provider ignores the SOL cost.
     let cost = estimate_sol_cost(2 * FEE_PER_SIGNATURE, rent);
-    let oracle = XrcPriceOracle::new(
-        runtime.clone(),
-        token.mint,
-        token.xrc_symbol.clone(),
-        token.decimals,
-    );
-    let result = FeeEstimator::new(oracle)
+    let oracle = FixedFeeProvider::new(token.deposit_fee);
+    FeeEstimator::new(oracle)
         .estimate_fee(token.mint, cost)
         .await
         .map_err(DepositSplError::TemporarilyUnavailable)
         .and_then(|fee| {
             balance_above_minimum(balance, token.minimum_deposit_amount, fee)?;
             Ok(fee)
-        });
-    charge_rpc_call(
-        runtime,
-        RpcCallCharge {
-            attached_cycles: XRC_REQUEST_CYCLES,
-            fee_on_success: 0,
-        },
-        &result,
-    );
-    result
+        })
 }
 
 /// Queues the deposit under the next deposit id, which both `deposit_spl` and a balance

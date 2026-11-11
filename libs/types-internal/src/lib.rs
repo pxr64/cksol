@@ -102,6 +102,22 @@ pub struct UpgradeArgs {
     /// If absent, the existing configuration is preserved.
     #[cfg_attr(feature = "event", n(8), cbor(with = "icrc_cbor::principal::option"))]
     pub ledger_suite_orchestrator_id: Option<Principal>,
+    /// Updates fees for registered SPL mints. Omission leaves all fees unchanged.
+    /// Each mint may occur only once. Queued deposits retain their recorded fees.
+    #[cfg_attr(feature = "event", n(9))]
+    pub spl_deposit_fees: Option<Vec<SplDepositFee>>,
+}
+
+/// A fixed SPL deposit fee update. Amounts use the token's smallest units.
+#[derive(Clone, Eq, PartialEq, Debug, CandidType, Deserialize)]
+#[cfg_attr(feature = "event", derive(minicbor::Encode, minicbor::Decode))]
+pub struct SplDepositFee {
+    /// The base58 address of an already registered Solana mint.
+    #[cfg_attr(feature = "event", n(0))]
+    pub mint: String,
+    /// The new fee; zero disables deposit fees for this mint.
+    #[cfg_attr(feature = "event", n(1))]
+    pub deposit_fee: u64,
 }
 
 /// The Solana network to connect to via the SOL RPC canister.

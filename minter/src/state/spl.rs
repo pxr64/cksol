@@ -64,9 +64,9 @@ pub struct SupportedSplToken {
     pub minimum_deposit_amount: u64,
     #[n(5)]
     pub paused: bool,
-    /// The underlying asset symbol used for XRC requests.
+    /// The fixed deposit fee in the token's smallest units; zero disables it.
     #[n(6)]
-    pub xrc_symbol: String,
+    pub deposit_fee: u64,
     /// The ckSPL ledger symbol; absent in legacy deposit-only registrations.
     #[n(7)]
     pub token_symbol: Option<String>,
@@ -83,7 +83,7 @@ impl TryFrom<AddSplTokenArgs> for SupportedSplToken {
             ledger_id: args.ledger_id,
             minimum_deposit_amount: args.minimum_deposit_amount,
             paused: args.paused,
-            xrc_symbol: args.xrc_symbol,
+            deposit_fee: args.deposit_fee,
             token_symbol: args.token_symbol,
         })
     }

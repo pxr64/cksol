@@ -2,7 +2,7 @@
 
 > **Status:** Implementation in progress. The minter registers tokens, accepts deposits, sweeps and settles them, and mints the user amount and the fee. Burned ckSOL top-ups pay the SOL cost of the sweeps. Unit, PocketIC and validator tests cover these steps. The dashboard does not show SPL deposits.
 >
-> **Scope:** SPL deposits. The deposit fee uses XRC prices. The conversion of the collected fees into SOL is follow-up work.
+> **Scope:** SPL deposits. Each token has a configured fixed deposit fee, which may be zero. The conversion of the collected fees into SOL is follow-up work.
 
 **Ledger model:** Each registered ckSPL ledger belongs to the ckSOL minter and uses its default account as the minting account. Deposits and fees mint with `icrc1_transfer`; the Ethereum ckUSDC/ckUSDT ledgers remain separate.
 
@@ -12,11 +12,11 @@ SPL deposits use the balance-based sweep flow:
 
 1. Each IC account has a derived Solana deposit address. SOL deposits and SPL deposits use the same address.
 2. A wallet or an exchange sends SPL tokens to the token account of that address.
-3. The user calls `deposit_spl`. The minter reads the finalized balance, records a fee quote and returns a deposit ID.
+3. The user calls `deposit_spl`. The minter reads the finalized balance, records the configured fee and returns a deposit ID.
 4. The minter sweeps the full recorded balance into its treasury token account. Then it validates the finalized transaction.
 5. The minter mints `balance − fee` to the IC account of the user. After that mint, it mints a nonzero fee into its own fee subaccount on the same ledger.
 
-The user does not need ckSOL to pay the deposit fee. The caller attaches cycles for the account reads, the XRC quote and the consolidation fee.
+The user does not need ckSOL to pay the deposit fee. The caller attaches cycles for the account reads and the consolidation fee.
 
 ## 2. Addresses and ledger accounts
 
@@ -41,7 +41,7 @@ The configured ledger suite orchestrator registers each token with `add_spl_toke
 | Field | Description |
 |---|---|
 | `mint`, `token_program`, `decimals` | The minter checks them against the finalized mint account. The program must be the classic SPL Token program or Token-2022 |
-| `xrc_symbol` | The symbol in which XRC must quote SOL. The minter checks it with XRC at registration |
+| `deposit_fee` | Fixed fee in the token's smallest units; zero disables deposit fees |
 | `ledger_id` | The ledger on which the minter mints ckSPL. Each ledger serves one mint and must use the ckSOL minter's default account as its minting account |
 | `minimum_deposit_amount` | The minimum amount that the user receives after the fee, in the smallest units of the mint. It must not be zero |
 | `paused` | Rejects new deposits. A deposit in flight continues |
@@ -51,10 +51,10 @@ The minter rejects these registrations:
 - A Token-2022 mint with extensions.
 - A mint that is already registered (`AlreadySupported`).
 - A ledger that serves another mint, or the ckSOL ledger (`LedgerAlreadyUsed`).
-- An empty XRC symbol, or a symbol that XRC does not quote (`InvalidToken`).
+- A minimum deposit plus fee that exceeds `u64` (`InvalidToken`).
 - A ledger without a minting account, or with a minting account other than the minter's default account (`InvalidToken`).
 
-If XRC or the ledger minting-account call is not available, the registration fails with `TemporarilyUnavailable`. The minting-account check validates configuration at registration; it does not authenticate the ledger or prevent later changes through a ledger upgrade. The registry does not store a fee. The `QueuedSplDeposit` event records the quote of each deposit.
+If the mint-account read or ledger minting-account call is not available, the registration fails with `TemporarilyUnavailable`. The minting-account check validates configuration at registration; it does not authenticate the ledger or prevent later changes through a ledger upgrade. The registry stores the fixed deposit fee. The `QueuedSplDeposit` event records the fee of each deposit.
 
 ## 4. Deposit sequence
 
@@ -65,7 +65,6 @@ sequenceDiagram
     participant RPC as SOL RPC canister
     participant Minter as ckSOL Minter
     participant Ledger as Token Ledger
-    participant XRC as Exchange Rate Canister
 
     User->>Minter: get_spl_deposit_address(owner, subaccount, mint)
     Minter-->>User: token account A = ATA(D, mint)
@@ -75,9 +74,7 @@ sequenceDiagram
     RPC-->>Minter: Source token account and balance
     Minter->>RPC: getAccountInfo(T, finalized)
     RPC-->>Minter: Destination token account, or absent
-    Minter->>XRC: get_exchange_rate(SOL, stored token symbol)
-    XRC-->>Minter: Rate and decimal scale
-    Note over Minter: Quote fee and check net minimum<br/>Record balance and fee
+    Note over Minter: Apply configured fee and check net minimum<br/>Record balance and fee
     Minter-->>User: Ok(deposit_id)
 
     Note over Minter,Solana: Queued sweeps are processed asynchronously
@@ -100,19 +97,19 @@ sequenceDiagram
 
 `deposit_spl` does these checks in this order:
 
-1. The owner must not be anonymous or the minter. The owner may differ from the caller, as in `deposit_sol`, so that a frontend or another canister can pay for the deposit of a user. The caller pays the cycles, and the owner only gets the sweep that the funds on the token account wait for. The deposit fee that the owner pays is bounded by the quote, and a repeated call for a pair in flight queues nothing. A free SPL scan must not accept another owner, because the scan would let any caller force sweeps and fees on the account of a victim.
+1. The owner must not be anonymous or the minter. The owner may differ from the caller, as in `deposit_sol`, so that a frontend or another canister can pay for the deposit of a user. The caller pays the cycles, and the owner only gets the sweep that the funds on the token account wait for. The deposit fee that the owner pays is fixed at acceptance, and a repeated call for a pair in flight queues nothing. A free SPL scan must not accept another owner, because the scan would let any caller force sweeps and fees on the account of a victim.
 2. A concurrent request for the same account and mint fails with `AlreadyProcessing`.
-3. If a deposit for the account and mint is in flight, the call makes no quote, no RPC call and no cycle charge. A deposit that is queued, swept, finalized or waiting for a mint makes the call return its ID. A quarantined deposit makes the call fail with `Quarantined` and its ID. The pair stays rejected until a minter upgrade resolves the deposit, so a new deposit needs a different subaccount. This step also applies when the token is paused.
+3. If a deposit for the account and mint is in flight, the call makes no RPC call and no cycle charge. A deposit that is queued, swept, finalized or waiting for a mint makes the call return its ID. A quarantined deposit makes the call fail with `Quarantined` and its ID. The pair stays rejected until a minter upgrade resolves the deposit, so a new deposit needs a different subaccount. This step also applies when the token is paused.
 4. The mint must be registered (`UnsupportedToken`) and not paused (`TokenPaused`).
-5. The caller must attach cycles for two account reads, one XRC request and the consolidation fee (`InsufficientCycles`).
+5. The caller must attach cycles for two account reads and the consolidation fee (`InsufficientCycles`).
 6. The source account `A` must have the expected token program, mint and owner, and it must not be frozen. A Token-2022 account can have only the `ImmutableOwner` and `MemoTransfer` extensions. A missing account has a zero balance. The minter rejects a balance below the configured minimum before it makes more calls.
 7. If `T` exists, the minter validates it. The sweep creates `T` if it is absent, or if it is a prefunded system account without data.
-8. The minter quotes the fee through XRC with the stored symbol and decimals of the token. If the quote fails, the call fails with `TemporarilyUnavailable`.
+8. The minter uses the token's configured fixed deposit fee.
 9. The balance must be at least `minimum_deposit_amount + fee` (`ValueTooSmall`). Thus the net mint of the user is at least the configured minimum.
 
 A failed check of a token account fails with `InvalidTokenAccount` and the reason. The minter charges the actual cost of each external call. It keeps the consolidation fee only when it queues the deposit.
 
-After both account reads and the fee quote, or when one of these steps fails, the minter checks whether a scan queued a deposit for the same account and mint while it waited. If so, it returns the ID of that deposit, or `Quarantined` if the deposit is quarantined, even if an external call failed. It charges only the calls it made, without the consolidation fee, and queues no new deposit. A deposit that has already been minted or dropped still returns its ID.
+After both account reads, or when one of these steps fails, the minter checks whether a scan queued a deposit for the same account and mint while it waited. If so, it returns the ID of that deposit, or `Quarantined` if the deposit is quarantined, even if an external call failed. It charges only the calls it made, without the consolidation fee, and queues no new deposit. A deposit that has already been minted or dropped still returns its ID.
 
 ## 5. Fees and accounting
 
@@ -120,8 +117,8 @@ There are three separate costs:
 
 | Cost | Currency | Who pays |
 |---|---|---|
-| Deposit fee | SPL token units | The user. The minter quotes it at acceptance, deducts it from the user mint and mints it into the fee IC account |
-| Account reads, XRC quote and consolidation fee | IC cycles | The caller. The minter refunds unused call cycles. It keeps the consolidation fee only when it queues the deposit |
+| Deposit fee | SPL token units | The user. The minter records it at acceptance, deducts it from the user mint and mints it into the fee IC account |
+| Account reads and consolidation fee | IC cycles | The caller. The minter refunds unused call cycles. It keeps the consolidation fee only when it queues the deposit |
 | Sweep transaction fee and rent of new treasury accounts | SOL lamports | The minter, from its operating balance |
 
 For a recorded balance `b` and a fee `f`:
@@ -150,11 +147,13 @@ flowchart LR
 
 The full accepted balance reaches `T`, which includes the fee part. While the fee mint is pending or quarantined, no ckSPL represents that part. The fee mint creates that ckSPL. It does not need a Solana transfer.
 
-### Fee quote
+### Fixed deposit fee
 
-The quote estimates the cost of a sweep with one deposit: two signatures, plus the rent of `T` when `T` is missing, plus a 20% margin. The rent of a classic token account is 2,039,280 lamports. The rent of a Token-2022 token account is 2,074,080 lamports. A prefunded `T` without data also gets the full rent estimate. A batch can cost less. Deposits that arrive before `T` exists can each get a rent estimate.
+`FeeEstimator` keeps its `PriceOracle` abstraction. The active implementation is `FixedFeeProvider`, which returns the registered `deposit_fee` in the token's smallest units. The XRC provider remains available in the code but is not used for deposits or registration. A fee of zero is the no-op policy: the entire swept balance is minted to the user and no fee mint is queued. The fee is independent of exchange prices, token-account rent, and batching.
 
-`FeeEstimator` converts the SOL estimate into token units with the SOL rate from XRC. It applies the decimals of the token and of the rate, and it rounds up. The minter rejects a rate that is more than five minutes from its own time, a zero rate, a different asset pair and a fee above `u64`. The recorded quote does not change in sweep retries, ledger retries or event replay.
+Set the fee at token registration. An upgrade can change fees with `spl_deposit_fees = opt vec { record { mint = "<base58 mint>"; deposit_fee = 0 : nat64 } }`. Omission preserves existing fees. Every mint must already be registered, appear only once, and have a fee whose sum with the minimum deposit fits in `u64`; invalid updates reject the upgrade.
+
+The fee recorded on a queued deposit does not change during sweep retries, ledger retries, upgrades, or event replay. Fee changes apply to new deposits. Collected fees stay in the token's fee account; conversion to (ck)SOL is deferred.
 
 ### Operating balance
 
@@ -226,7 +225,7 @@ If a batch fails on chain, the minter splits it into individual retries. Each re
 | Event | Effect |
 |---|---|
 | `AddedSplToken` | Registers a token and its ledger |
-| `QueuedSplDeposit` | Records the account, the mint, the source address, the full balance and the fee quote |
+| `QueuedSplDeposit` | Records the account, the mint, the source address, the full balance and the fixed fee |
 | `SubmittedTransaction` / `SucceededTransaction` | Track the sweep from submission to finalization |
 | `ExpiredTransaction` | Drops the deposits of a sweep with an expired blockhash and releases their pairs |
 | `SplitFailedSplSweep` | Requeues the deposits of a failed batch as individual retries and debits the fee |

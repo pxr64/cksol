@@ -226,8 +226,8 @@ pub enum EventType {
         minimum_deposit_amount: u64,
         /// Whether deposits are initially paused.
         paused: bool,
-        /// The underlying asset symbol used for XRC requests.
-        xrc_symbol: String,
+        /// The fixed deposit fee in the token's smallest units; zero disables it.
+        deposit_fee: u64,
         /// The configured ckSPL ledger symbol, absent in legacy registrations.
         token_symbol: Option<String>,
     },

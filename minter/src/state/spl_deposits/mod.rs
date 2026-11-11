@@ -478,7 +478,7 @@ pub struct QueuedSplDeposit {
     pub address: Address,
     /// The token-account balance when the deposit was queued, in the mint's smallest units.
     pub balance: u64,
-    /// The fee quoted at acceptance, deducted from the ledger mint in the mint's smallest units.
+    /// The fee recorded at acceptance, deducted from the ledger mint in the mint's smallest units.
     pub fee: u64,
 }
 
