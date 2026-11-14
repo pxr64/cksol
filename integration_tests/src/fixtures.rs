@@ -1,6 +1,6 @@
 use crate::{
     CanisterHttpReply, CanisterHttpRequest, CanisterHttpResponse, MockCanisterHttpResponse, Setup,
-    validator::FEE_PER_SIGNATURE, xrc,
+    validator::FEE_PER_SIGNATURE,
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -72,6 +72,9 @@ const SUBMITTED_NONCE_SEED: [u8; 32] = [0x4E; 32];
 /// Seed of the nonce value the mocked nonce account stores once the submitted withdrawal
 /// transaction has advanced it.
 const ADVANCED_NONCE_SEED: [u8; 32] = [0x4F; 32];
+/// Seed of the nonce value the mocked nonce account stores once a retry of the withdrawal
+/// has advanced it again.
+const RETRIED_NONCE_SEED: [u8; 32] = [0x50; 32];
 /// Blockhash the mocks report for a block a timer only reads the height of.
 const IGNORED_BLOCKHASH: &str = "CzBVNFJkh7WkQDfJUiDjLc7kPrJd8kR2yiCvwBUhSe7Y";
 
@@ -102,16 +105,11 @@ impl SharedMockHttpOutcalls {
 /// Answers mocked HTTP requests and can forward Solana RPC calls to a local validator.
 pub struct HttpMocks {
     inner: MockHttpOutcalls,
-    sol_price: f64,
-    spl_price: f64,
     solana_rpc_url: Option<String>,
 }
 
 impl HttpMocks {
     async fn response(&self, request: &CanisterHttpRequest) -> CanisterHttpResponse {
-        if let Some(response) = xrc::http_response(request, self.sol_price, self.spl_price) {
-            return response;
-        }
         if let Some(url) = &self.solana_rpc_url
             && request.url.trim_end_matches('/') == url.trim_end_matches('/')
         {
@@ -137,7 +135,7 @@ impl HttpMocks {
 #[async_trait]
 impl ExecuteHttpOutcallMocks for HttpMocks {
     async fn execute_http_outcall_mocks(&mut self, env: &PocketIc) {
-        if self.solana_rpc_url.is_none() && !env.canister_exists(xrc::CANISTER_ID).await {
+        if self.solana_rpc_url.is_none() {
             self.inner.execute_http_outcall_mocks(env).await;
             return;
         }
@@ -214,8 +212,6 @@ impl ExecuteHttpOutcallMocks for SharedMockHttpOutcalls {
 pub struct MockBuilder {
     inner: MockHttpOutcallsBuilder,
     next_id: u64,
-    sol_price: f64,
-    spl_price: f64,
     solana_rpc_url: Option<String>,
 }
 
@@ -238,18 +234,8 @@ impl MockBuilder {
         Self {
             inner: MockHttpOutcallsBuilder::new(),
             next_id: id,
-            // These synthetic prices quote a one-unit deposit fee by default.
-            sol_price: 0.000_000_001,
-            spl_price: 1.0,
             solana_rpc_url: None,
         }
-    }
-
-    /// Sets the SOL and SPL prices in USD/USDT returned by the mocked exchanges.
-    pub fn with_xrc_prices(mut self, sol_price: f64, spl_price: f64) -> Self {
-        self.sol_price = sol_price;
-        self.spl_price = spl_price;
-        self
     }
 
     /// Forwards requests for this URL to the local validator, preserving its real RPC responses.
@@ -273,8 +259,6 @@ impl MockBuilder {
     pub fn build(self) -> HttpMocks {
         HttpMocks {
             inner: self.inner.build(),
-            sol_price: self.sol_price,
-            spl_price: self.spl_price,
             solana_rpc_url: self.solana_rpc_url,
         }
     }
@@ -329,6 +313,22 @@ impl MockBuilder {
         self.expect(
             get_account_info_request(),
             get_account_info_nonce_response(ADVANCED_NONCE_SEED),
+        )
+    }
+
+    /// Mocks for the withdrawal timer submitting a retry on the advanced nonce value.
+    pub fn submit_withdrawal_retry_transaction(self) -> Self {
+        self.get_advanced_nonce_account().expect(
+            send_transaction_request(),
+            send_transaction_response(SUBMITTED_SIGNATURE),
+        )
+    }
+
+    /// Reads the nonce account after the retry advanced its stored nonce value again.
+    pub fn get_retried_nonce_account(self) -> Self {
+        self.expect(
+            get_account_info_request(),
+            get_account_info_nonce_response(RETRIED_NONCE_SEED),
         )
     }
 

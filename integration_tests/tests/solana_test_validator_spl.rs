@@ -71,22 +71,15 @@ async fn sweep_and_mint_spl_deposit_on_setup(
 ) -> SplDeposit {
     const DECIMALS: u8 = 6;
     const DEPOSIT_AMOUNT: u64 = 10_000_000;
-    // Two signatures plus the program's ATA rent, with a 20% margin,
-    // converted at 150 SPL per SOL and rounded up to six decimal places.
-    let (token_account_len, expected_fee) =
-        if token_program == spl_token_interface::id().to_bytes().into() {
-            (TokenAccount::LEN, 368_871)
-        } else {
-            (
-                ExtensionType::try_calculate_account_len::<TokenAccount>(&[
-                    ExtensionType::ImmutableOwner,
-                ])
-                .unwrap(),
-                375_135,
-            )
-        };
+    const DEPOSIT_FEE: u64 = 1_800;
+    let token_account_len = if token_program == spl_token_interface::id().to_bytes().into() {
+        TokenAccount::LEN
+    } else {
+        ExtensionType::try_calculate_account_len::<TokenAccount>(&[ExtensionType::ImmutableOwner])
+            .unwrap()
+    };
 
-    let http_mocks = || validator.mock_builder().with_xrc_prices(150.0, 1.0).build();
+    let http_mocks = || validator.mock_builder().build();
     let ledger = setup.install_spl_ledger(DECIMALS).await;
     let operating_before = setup.minter().get_operating_balance().await.balance;
 
@@ -107,7 +100,7 @@ async fn sweep_and_mint_spl_deposit_on_setup(
             ledger_id: ledger.canister_id(),
             minimum_deposit_amount: 1_000_000,
             paused: false,
-            xrc_symbol: "SPL".to_string(),
+            deposit_fee: DEPOSIT_FEE,
             token_symbol: Some("ckSPL".to_string()),
         })
         .await
@@ -164,12 +157,12 @@ async fn sweep_and_mint_spl_deposit_on_setup(
             mint: mint.into(),
         })
         .await
-        .expect("deposit_spl should read the real source balance and quote the fee");
+        .expect("deposit_spl should read the real source balance and apply the fixed fee");
     assert_eq!(
         setup.minter().deposit_spl_status(deposit_id).await,
         DepositSplStatus::Queued {
             balance: DEPOSIT_AMOUNT,
-            fee: expected_fee,
+            fee: DEPOSIT_FEE,
         }
     );
     assert_eq!(ledger.balance_of(account).await, 0);
@@ -202,14 +195,14 @@ async fn sweep_and_mint_spl_deposit_on_setup(
             subaccount: Some(FEE_COLLECTOR_SUBACCOUNT),
         })
         .await;
-    assert_eq!(user_balance, DEPOSIT_AMOUNT - expected_fee);
-    assert_eq!(fee_balance, expected_fee);
+    assert_eq!(user_balance, DEPOSIT_AMOUNT - DEPOSIT_FEE);
+    assert_eq!(fee_balance, DEPOSIT_FEE);
     assert_eq!(user_balance + fee_balance, DEPOSIT_AMOUNT);
     assert_eq!(
         setup.minter().deposit_spl_status(deposit_id).await,
         DepositSplStatus::Minted {
             block_index: 0,
-            minted_amount: DEPOSIT_AMOUNT - expected_fee,
+            minted_amount: DEPOSIT_AMOUNT - DEPOSIT_FEE,
             fee: SplFeeMintStatus::Minted { block_index: 1 },
         }
     );

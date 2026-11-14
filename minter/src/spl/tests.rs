@@ -4,9 +4,7 @@ use crate::{
     lifecycle,
     state::{audit::replay_events, event::Event},
     storage::{total_event_count, with_event_iter},
-    test_fixtures::{
-        deposit::DEPOSITOR_ACCOUNT, runtime::TestCanisterRuntime, valid_init_args, xrc_rate,
-    },
+    test_fixtures::{deposit::DEPOSITOR_ACCOUNT, runtime::TestCanisterRuntime, valid_init_args},
 };
 use assert_matches::assert_matches;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -32,7 +30,7 @@ fn args() -> AddSplTokenArgs {
         ledger_id: Principal::from_slice(&[42, 1]),
         minimum_deposit_amount: 1_000_000,
         paused: false,
-        xrc_symbol: "USDC".to_string(),
+        deposit_fee: 1,
         token_symbol: Some("solUSDC".to_string()),
     }
 }
@@ -65,16 +63,11 @@ fn with_mint(runtime: TestCanisterRuntime, account: Option<AccountInfo>) -> Test
     runtime.add_stub_response(MultiRpcResult::Consistent(Ok(account)))
 }
 
-/// A runtime that answers the mint read, XRC probe and ledger minting account check.
+/// A runtime that answers the mint read and ledger minting account check.
 fn registration_runtime() -> TestCanisterRuntime {
-    let runtime =
-        with_mint(init(), Some(mint_account(&mint_data()))).add_stub_response(usdc_rate());
+    let runtime = with_mint(init(), Some(mint_account(&mint_data())));
     let minting_account = Some(Account::from(runtime.canister_self()));
     runtime.add_stub_response(minting_account)
-}
-
-fn usdc_rate() -> ic_xrc_types::GetExchangeRateResult {
-    xrc_rate("USDC", 150_000_000_000)
 }
 
 fn expected_token(args: AddSplTokenArgs) -> SupportedSplToken {
@@ -122,14 +115,9 @@ async fn should_register_and_replay_the_token_from_stable_events() {
     assert_matches!(&events[1].payload, EventType::AddedSplToken(token) if cksol_types::Address::from(token.mint) == args.mint);
     let replayed = replay_events(events);
     read_state(|state| assert_eq!(state, &replayed));
-    assert_eq!(runtime.sent_update_calls().len(), 3);
+    assert_eq!(runtime.sent_update_calls().len(), 2);
     assert_eq!(runtime.sent_update_calls()[0].method, "getAccountInfo");
-    assert_eq!(runtime.sent_update_calls()[1].method, "get_exchange_rate");
-    assert_eq!(
-        runtime.sent_update_calls()[1].canister_id.to_text(),
-        "uf6dk-hyaaa-aaaaq-qaaaq-cai"
-    );
-    let call = &runtime.sent_update_calls()[2];
+    let call = &runtime.sent_update_calls()[1];
     assert_eq!(call.method, "icrc1_minting_account");
     assert_eq!(call.canister_id, args.ledger_id);
     let (): () = call.args_tuple();
@@ -137,8 +125,8 @@ async fn should_register_and_replay_the_token_from_stable_events() {
         replayed
             .supported_spl_token(&args.mint.into())
             .unwrap()
-            .xrc_symbol,
-        "USDC"
+            .deposit_fee,
+        1
     );
 }
 
@@ -155,7 +143,6 @@ async fn should_reject_missing_or_incorrect_ledger_minting_accounts() {
         }),
     ] {
         let runtime = with_mint(runtime.clone(), Some(mint_account(&mint_data())))
-            .add_stub_response(usdc_rate())
             .add_stub_response(minting_account);
 
         assert_matches!(
@@ -168,8 +155,7 @@ async fn should_reject_missing_or_incorrect_ledger_minting_accounts() {
 
 #[tokio::test]
 async fn should_accept_an_explicit_zero_minting_subaccount() {
-    let runtime =
-        with_mint(init(), Some(mint_account(&mint_data()))).add_stub_response(usdc_rate());
+    let runtime = with_mint(init(), Some(mint_account(&mint_data())));
     let minting_account = Some(Account {
         owner: runtime.canister_self(),
         subaccount: Some([0; 32]),
@@ -189,9 +175,8 @@ async fn should_leave_registry_unchanged_when_the_minting_account_call_fails() {
             message: "malformed minting account reply".to_string(),
         },
     ] {
-        let runtime = with_mint(runtime.clone(), Some(mint_account(&mint_data())))
-            .add_stub_response(usdc_rate())
-            .add_stub_error(error);
+        let runtime =
+            with_mint(runtime.clone(), Some(mint_account(&mint_data()))).add_stub_error(error);
 
         assert_matches!(
             add_spl_token(&runtime, args()).await,
@@ -287,7 +272,7 @@ async fn should_reject_duplicate_mint_and_ledger_without_overwriting_config() {
             ledger_id: original.ledger_id
         })
     );
-    assert_eq!(runtime.sent_update_calls().len(), 3);
+    assert_eq!(runtime.sent_update_calls().len(), 2);
     assert_eq!(total_event_count(), 2);
     assert_eq!(
         read_state(|state| state
@@ -302,9 +287,7 @@ async fn should_recheck_registration_after_concurrent_rpc_calls() {
     let runtime = with_mint(
         with_mint(init(), Some(mint_account(&mint_data()))),
         Some(mint_account(&mint_data())),
-    )
-    .add_stub_response(usdc_rate())
-    .add_stub_response(usdc_rate());
+    );
     let minting_account = Some(Account::from(runtime.canister_self()));
     let runtime = runtime
         .add_stub_response(minting_account)
@@ -370,8 +353,7 @@ async fn should_leave_registry_unchanged_when_rpc_results_are_inconsistent() {
 
 #[tokio::test]
 async fn should_register_and_replay_token_2022_without_extensions() {
-    let runtime = with_mint(init(), Some(token_2022_mint_account(&mint_data())))
-        .add_stub_response(usdc_rate());
+    let runtime = with_mint(init(), Some(token_2022_mint_account(&mint_data())));
     let minting_account = Some(Account::from(runtime.canister_self()));
     let runtime = runtime.add_stub_response(minting_account);
     let args = token_2022_args();
@@ -387,51 +369,7 @@ async fn should_register_and_replay_token_2022_without_extensions() {
     let replayed = with_event_iter(|events| replay_events(events));
     read_state(|state| assert_eq!(state, &replayed));
     assert_eq!(total_event_count(), 2);
-    assert_eq!(runtime.sent_update_calls().len(), 3);
-}
-
-#[tokio::test]
-async fn should_leave_registry_unchanged_when_the_xrc_call_fails() {
-    let runtime = with_mint(init(), Some(mint_account(&mint_data())))
-        .add_stub_error(ic_canister_runtime::IcError::CallPerformFailed);
-
-    assert_matches!(
-        add_spl_token(&runtime, args()).await,
-        Err(AddSplTokenError::TemporarilyUnavailable(_))
-    );
-    assert_not_registered(&args().mint);
-}
-
-#[tokio::test]
-async fn should_reject_a_symbol_the_xrc_does_not_quote() {
-    let runtime = with_mint(init(), Some(mint_account(&mint_data()))).add_stub_response(
-        ic_xrc_types::GetExchangeRateResult::Err(
-            ic_xrc_types::ExchangeRateError::CryptoQuoteAssetNotFound,
-        ),
-    );
-
-    assert_matches!(
-        add_spl_token(&runtime, args()).await,
-        Err(AddSplTokenError::InvalidToken(reason)) if reason.contains("no SOL rate")
-    );
-    assert_not_registered(&args().mint);
-}
-
-#[tokio::test]
-async fn should_reject_an_empty_xrc_symbol_before_any_call() {
-    let runtime = init();
-    let args = AddSplTokenArgs {
-        xrc_symbol: " ".to_string(),
-
-        ..args()
-    };
-
-    assert_matches!(
-        add_spl_token(&runtime, args.clone()).await,
-        Err(AddSplTokenError::InvalidToken(reason)) if reason.contains("XRC symbol")
-    );
-    assert!(runtime.sent_update_calls().is_empty());
-    assert_not_registered(&args.mint);
+    assert_eq!(runtime.sent_update_calls().len(), 2);
 }
 
 #[tokio::test]
@@ -544,5 +482,27 @@ async fn should_reject_invalid_ledger_symbols_before_any_call() {
             Err(AddSplTokenError::InvalidToken(_))
         ));
     }
+    assert!(runtime.sent_update_calls().is_empty());
+}
+
+#[tokio::test]
+async fn should_allow_zero_fees_and_reject_an_unrepresentable_net_minimum() {
+    let runtime = registration_runtime();
+    let zero_fee = AddSplTokenArgs {
+        deposit_fee: 0,
+        ..args()
+    };
+    assert_eq!(add_spl_token(&runtime, zero_fee.clone()).await, Ok(()));
+    assert_eq!(
+        read_state(|state| state
+            .supported_spl_token(&zero_fee.mint.into())
+            .unwrap()
+            .deposit_fee),
+        0
+    );
+    let runtime = TestCanisterRuntime::new();
+    assert_matches!(add_spl_token(&runtime, AddSplTokenArgs {
+        minimum_deposit_amount: u64::MAX, deposit_fee: 1, ..args()
+    }).await, Err(AddSplTokenError::InvalidToken(reason)) if reason.contains("exceeds u64"));
     assert!(runtime.sent_update_calls().is_empty());
 }

@@ -35,7 +35,7 @@ pub const MINT: Address = address!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 pub const OTHER_MINT: Address = address!("So11111111111111111111111111111111111111112");
 pub const DECIMALS: u8 = 6;
 pub const MINIMUM_DEPOSIT_AMOUNT: u64 = 1_000_000;
-/// Fee in the token's smallest units, quoted from the mocked exchange prices.
+/// Fixed fee in the token's smallest units.
 pub const DEPOSIT_FEE: u64 = 1;
 pub const BALANCE_ABOVE_MINIMUM: u64 = MINIMUM_DEPOSIT_AMOUNT + DEPOSIT_FEE;
 pub const RENT_EXEMPT_LAMPORTS: Lamport = 2_039_280;
@@ -147,7 +147,7 @@ pub fn add_spl_token_args(ledger_id: Principal, token_program: Address) -> AddSp
         ledger_id,
         minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
         paused: false,
-        xrc_symbol: "SPL".to_string(),
+        deposit_fee: DEPOSIT_FEE,
         token_symbol: Some("ckSPL".to_string()),
     }
 }
@@ -339,7 +339,7 @@ pub async fn queue_deposit_for_caller(token_program: Address, extensions: &[Exte
                         ledger_id: ledger.canister_id(),
                         minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
                         paused: false,
-                        xrc_symbol: "SPL".to_string(),
+                        deposit_fee: DEPOSIT_FEE,
                         token_symbol: Some("ckSPL".to_string()),
                     },
                     EventType::QueuedSplDeposit {

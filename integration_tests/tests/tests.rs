@@ -208,6 +208,7 @@ mod lifecycle {
                 nonce_accounts_to_add: None,
                 ledger_suite_orchestrator_id: None,
                 automatic_deposit_fee: Some(NEW_AUTOMATIC_DEPOSIT_FEE),
+                spl_deposit_fees: None,
             })
             .await
             .expect("upgrade failed");

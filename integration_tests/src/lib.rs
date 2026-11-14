@@ -53,7 +53,6 @@ pub mod fixtures;
 pub mod ledger_init_args;
 mod snapshot;
 pub mod validator;
-pub mod xrc;
 
 #[derive(Default)]
 pub enum PocketIcMode {
@@ -196,7 +195,6 @@ impl Setup {
     ) -> Self {
         let env = PocketIcBuilder::new()
             .with_nns_subnet() //make_live requires NNS subnet.
-            .with_ii_subnet() // XRC uses this system subnet.
             .with_fiduciary_subnet()
             .build_async()
             .await;
@@ -438,7 +436,6 @@ impl Setup {
     /// Installs a separate SPL ledger with the minter as its minting account.
     pub async fn install_spl_ledger(&self, decimals: u8) -> Ledger<'_> {
         let env = self.env.as_ref().unwrap();
-        xrc::install(env).await;
         let ledger_canister_id = env
             .create_canister_with_settings(
                 None,

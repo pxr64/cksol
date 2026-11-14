@@ -175,20 +175,14 @@ async fn should_drop_frozen_single_sweep_and_allow_a_new_deposit_request() {
     let runtime = TestCanisterRuntime::new()
         .with_increasing_time()
         .expecting_charges()
-        .add_msg_cycles_available(
-            2 * crate::constants::GET_ACCOUNT_INFO_CYCLES
-                + crate::constants::XRC_REQUEST_CYCLES
-                + fee,
-        )
+        .add_msg_cycles_available(2 * crate::constants::GET_ACCOUNT_INFO_CYCLES + fee)
         .add_msg_cycles_refunded(crate::constants::GET_ACCOUNT_INFO_CYCLES / 2)
         .add_msg_cycles_refunded(crate::constants::GET_ACCOUNT_INFO_CYCLES / 2)
-        .add_msg_cycles_refunded(crate::constants::XRC_REQUEST_CYCLES / 2)
         .add_stub_response(MultiRpcResult::Consistent(Ok(Some(source_account(
             &deposit,
             AccountState::Initialized,
         )))))
-        .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
-        .add_stub_response(crate::test_fixtures::unit_xrc_rate());
+        .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
     let result =
         crate::deposit::spl::deposit_spl(&runtime, deposit.account, deposit.mint.into()).await;
     assert_eq!(result, Ok(1));

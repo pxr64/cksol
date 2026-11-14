@@ -24,18 +24,17 @@ use sol_rpc_types::{
 };
 use solana_address::Address;
 use spl_token_2022_interface::extension::ExtensionType;
-use std::time::Duration;
 use tokio::join;
 
 mod fixtures;
 
 use fixtures::spl::{
-    BALANCE_ABOVE_MINIMUM, DECIMALS, DEPOSIT_FEE, MINIMUM_DEPOSIT_AMOUNT, MINT, OTHER_MINT,
-    RENT_EXEMPT_LAMPORTS, account_info, add_spl_token_args, associated_token_address,
-    finalize_sweep, finalize_sweep_with_amount, frozen_token_account_data, queue_deposit,
-    queue_deposit_for_caller, register_token, run_mint_timer, setup_with_registered_mint,
-    sweep_queued_deposit, sweep_transaction_response, token_account_data,
-    token_account_data_with_amount, try_register_token,
+    BALANCE_ABOVE_MINIMUM, DECIMALS, DEPOSIT_FEE, MINT, OTHER_MINT, RENT_EXEMPT_LAMPORTS,
+    account_info, add_spl_token_args, associated_token_address, finalize_sweep,
+    finalize_sweep_with_amount, frozen_token_account_data, queue_deposit, queue_deposit_for_caller,
+    register_token, run_mint_timer, setup_with_registered_mint, sweep_queued_deposit,
+    sweep_transaction_response, token_account_data, token_account_data_with_amount,
+    try_register_token,
 };
 
 #[tokio::test]
@@ -53,10 +52,8 @@ async fn should_sweep_finalize_and_mint_token_2022_deposit_after_timers() {
 }
 
 #[tokio::test]
-async fn should_quote_and_mint_the_spl_deposit_fee_using_xrc() {
+async fn should_mint_the_configured_fixed_spl_deposit_fee() {
     const DEPOSIT_BALANCE: u64 = 10_000_000;
-    // Two signatures cost 10,000 lamports. With a 20% margin, SOL at $150
-    // and SPL at $1, the fee is 0.0018 SPL, or 1,800 units at six decimals.
     const EXPECTED_FEE: u64 = 1_800;
 
     let token_program: Address = spl_token_interface::id().to_bytes().into();
@@ -69,8 +66,17 @@ async fn should_quote_and_mint_the_spl_deposit_fee_using_xrc() {
     setup.top_up_operating_balance().await;
     let ledger = setup.install_spl_ledger(DECIMALS).await;
     register_token(&setup, ledger.canister_id(), token_program, 32).await;
-    // Move past the cached registration quote so XRC fetches the new prices.
-    setup.advance_time(Duration::from_secs(120)).await;
+    setup
+        .minter()
+        .upgrade(UpgradeArgs {
+            spl_deposit_fees: Some(vec![cksol_types_internal::SplDepositFee {
+                mint: MINT.to_string(),
+                deposit_fee: EXPECTED_FEE,
+            }]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     let account = Account {
         owner: setup.proxy_canister_id(),
         subaccount: Some([1; 32]),
@@ -82,7 +88,6 @@ async fn should_quote_and_mint_the_spl_deposit_fee_using_xrc() {
         .minter()
         .with_http_mocks(
             MockBuilder::with_start_id(36)
-                .with_xrc_prices(150.0, 1.0)
                 .get_account_info(
                     &source,
                     Some(account_info(
@@ -90,7 +95,7 @@ async fn should_quote_and_mint_the_spl_deposit_fee_using_xrc() {
                         token_program,
                     )),
                 )
-                // The treasury ATA already exists, so its rent is not part of the quote.
+                // The fixed fee also applies when the treasury ATA already exists.
                 .get_account_info(
                     &destination,
                     Some(account_info(
@@ -106,7 +111,7 @@ async fn should_quote_and_mint_the_spl_deposit_fee_using_xrc() {
             mint: MINT.into(),
         })
         .await
-        .expect("deposit_spl should quote the fee and queue the deposit");
+        .expect("deposit_spl should apply the fixed fee and queue the deposit");
     assert_eq!(
         setup.minter().deposit_spl_status(deposit_id).await,
         DepositSplStatus::Queued {
@@ -834,8 +839,6 @@ mod cycles {
     async fn should_charge_both_reads_and_the_consolidation_fee() {
         let token_program: Address = spl_token_interface::id().to_bytes().into();
         let setup = setup_with_registered_mint(token_program).await;
-        // Registration quoted the same pair, so leave the XRC cache window for a fresh lookup.
-        setup.advance_time(Duration::from_secs(120)).await;
         let owner: Address = DEFAULT_CALLER_DEPOSIT_ADDRESS.parse().unwrap();
         let source = associated_token_address(&owner, &token_program);
         let destination = associated_token_address(&MINTER_ADDRESS, &token_program);
@@ -862,7 +865,7 @@ mod cycles {
         let (caller_after, minter_after) = cycle_balances(&setup).await;
         assert_eq!(
             caller_before - caller_after,
-            reads_cost + cksol_int_tests::xrc::REQUEST_COST + Setup::DEFAULT_DEPOSIT_SOL_FEE
+            reads_cost + Setup::DEFAULT_DEPOSIT_SOL_FEE
         );
         assert_eq!(minter_after - minter_before, Setup::DEFAULT_DEPOSIT_SOL_FEE);
         setup.drop().await;
@@ -922,7 +925,7 @@ mod cycles {
                     .get_account_info(
                         &source,
                         Some(account_info(
-                            token_account_data_with_amount(&owner, MINIMUM_DEPOSIT_AMOUNT - 1),
+                            token_account_data_with_amount(&owner, BALANCE_ABOVE_MINIMUM - 1),
                             token_program,
                         )),
                     )
@@ -934,8 +937,8 @@ mod cycles {
         assert_eq!(
             result,
             Err(DepositSplError::ValueTooSmall {
-                balance: MINIMUM_DEPOSIT_AMOUNT - 1,
-                minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
+                balance: BALANCE_ABOVE_MINIMUM - 1,
+                minimum_deposit_amount: BALANCE_ABOVE_MINIMUM,
             })
         );
         let (caller_after, minter_after) = cycle_balances(&setup).await;

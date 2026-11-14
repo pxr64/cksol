@@ -57,7 +57,7 @@ mod balance_reading {
         address::{
             account_address, associated_token_address, get_spl_deposit_address, minter_address,
         },
-        constants::{GET_ACCOUNT_INFO_CYCLES, XRC_REQUEST_CYCLES},
+        constants::GET_ACCOUNT_INFO_CYCLES,
         deposit::spl::{deposit_spl, queue_deposit},
         guard::deposit_spl_guard,
         state::{
@@ -67,7 +67,7 @@ mod balance_reading {
         storage::total_event_count,
         test_fixtures::{
             DEPOSIT_SOL_FEE, deposit::DEPOSITOR_ACCOUNT, init_schnorr_master_key, init_state,
-            queued_spl_deposit, runtime::TestCanisterRuntime, spl_token, unit_xrc_rate, xrc_rate,
+            queued_spl_deposit, runtime::TestCanisterRuntime, spl_token,
         },
     };
     use assert_matches::assert_matches;
@@ -79,7 +79,7 @@ mod balance_reading {
     use spl_token_interface::state::{Account as TokenAccount, AccountState};
 
     pub(super) const MINIMUM_DEPOSIT_AMOUNT: u64 = 100;
-    /// The minimum plus the one unit that [`unit_xrc_rate`] quotes as the fee.
+    /// The minimum plus the configured one-unit deposit fee.
     pub(super) const MINIMUM_DEPOSIT_WITH_FEE: u64 = MINIMUM_DEPOSIT_AMOUNT + 1;
     const RPC_REFUND: u128 = GET_ACCOUNT_INFO_CYCLES / 2;
 
@@ -163,12 +163,9 @@ mod balance_reading {
     pub(super) fn runtime() -> TestCanisterRuntime {
         TestCanisterRuntime::new()
             .with_increasing_time()
-            .add_msg_cycles_available(
-                2 * GET_ACCOUNT_INFO_CYCLES + XRC_REQUEST_CYCLES + DEPOSIT_SOL_FEE,
-            )
+            .add_msg_cycles_available(2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_SOL_FEE)
             .add_msg_cycles_refunded(RPC_REFUND)
             .add_msg_cycles_refunded(RPC_REFUND)
-            .add_msg_cycles_refunded(XRC_REQUEST_CYCLES / 2)
             .expecting_charges()
     }
 
@@ -193,11 +190,10 @@ mod balance_reading {
             [
                 GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
                 GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
-                XRC_REQUEST_CYCLES / 2,
                 DEPOSIT_SOL_FEE
             ]
         );
-        assert_eq!(runtime.sent_update_calls().len(), 3);
+        assert_eq!(runtime.sent_update_calls().len(), 2);
         let master_key = read_state(|state| state.minter_public_key().cloned()).unwrap();
         let owner = account_address(&master_key, &DEPOSITOR_ACCOUNT);
         read_state(|state| {
@@ -242,9 +238,8 @@ mod balance_reading {
     #[tokio::test]
     async fn should_fail_before_rpc_if_insufficient_cycles_are_attached() {
         let token = init_token(false);
-        let runtime = TestCanisterRuntime::new().add_msg_cycles_available(
-            2 * GET_ACCOUNT_INFO_CYCLES + XRC_REQUEST_CYCLES + DEPOSIT_SOL_FEE - 1,
-        );
+        let runtime = TestCanisterRuntime::new()
+            .add_msg_cycles_available(2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_SOL_FEE - 1);
 
         let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
@@ -252,9 +247,8 @@ mod balance_reading {
             result,
             Err(DepositSplError::InsufficientCycles(
                 InsufficientCyclesError {
-                    expected: 2 * GET_ACCOUNT_INFO_CYCLES + XRC_REQUEST_CYCLES + DEPOSIT_SOL_FEE,
-                    received: 2 * GET_ACCOUNT_INFO_CYCLES + XRC_REQUEST_CYCLES + DEPOSIT_SOL_FEE
-                        - 1,
+                    expected: 2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_SOL_FEE,
+                    received: 2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_SOL_FEE - 1,
                 }
             ))
         );
@@ -264,16 +258,21 @@ mod balance_reading {
     }
 
     #[tokio::test]
-    async fn should_quote_transaction_cost_and_only_charge_rent_for_missing_destinations() {
+    async fn should_use_the_fixed_fee_regardless_of_token_program_or_destination_rent() {
         for (token_2022, missing_destination, fee) in [
-            (false, false, 1_800),
-            (false, true, 368_871),
+            (false, false, 0),
+            (false, true, 0),
             (true, false, 1_800),
-            (true, true, 375_135),
+            (true, true, 1_800),
         ] {
             crate::state::reset_state();
             crate::storage::reset_events();
-            let token = init_token(token_2022);
+            init_state();
+            init_schnorr_master_key();
+            let token = register(SupportedSplToken {
+                deposit_fee: fee,
+                ..token(token_2022)
+            });
             let destination = if missing_destination {
                 None
             } else {
@@ -283,8 +282,7 @@ mod balance_reading {
                 .add_stub_response(MultiRpcResult::Consistent(Ok(Some(token_account_info(
                     &token, 1_000_000,
                 )))))
-                .add_stub_response(MultiRpcResult::Consistent(Ok(destination)))
-                .add_stub_response(xrc_rate("USDC", 150_000_000_000));
+                .add_stub_response(MultiRpcResult::Consistent(Ok(destination)));
 
             assert_eq!(
                 deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await,
@@ -296,48 +294,26 @@ mod balance_reading {
                 assert_eq!(deposit.balance, 1_000_000);
                 assert_eq!(deposit.fee, fee);
             });
-            assert_eq!(runtime.sent_update_calls()[2].method, "get_exchange_rate");
+            assert!(
+                runtime
+                    .sent_update_calls()
+                    .iter()
+                    .all(|call| call.method == "getAccountInfo")
+            );
         }
     }
 
     #[tokio::test]
-    async fn should_charge_call_costs_without_queueing_when_the_oracle_fails() {
-        let token = init_token(false);
-        let runtime = runtime()
-            .add_stub_response(MultiRpcResult::Consistent(Ok(Some(token_account_info(
-                &token, 1_000_000,
-            )))))
-            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
-            .add_stub_error(IcError::CallPerformFailed);
-
-        assert_matches!(
-            deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await,
-            Err(DepositSplError::TemporarilyUnavailable(_))
-        );
-        assert_eq!(
-            runtime.msg_cycles_accepted(),
-            [
-                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
-                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
-                XRC_REQUEST_CYCLES / 2
-            ]
-        );
-        assert_eq!(total_event_count(), 1);
-        assert!(read_state(|state| state.spl_deposits().queued().is_empty()));
-        assert!(deposit_spl_guard(DEPOSITOR_ACCOUNT, token.mint).is_ok());
-    }
-
-    #[tokio::test]
-    async fn should_require_the_minimum_after_the_quoted_fee_without_charging_the_application_fee()
-    {
-        let token = init_token(false);
-        let runtime = runtime()
-            .add_stub_response(MultiRpcResult::Consistent(Ok(Some(token_account_info(
-                &token,
-                MINIMUM_DEPOSIT_WITH_FEE,
-            )))))
-            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
-            .add_stub_response(xrc_rate("USDC", 150_000_000_000));
+    async fn should_require_the_minimum_after_the_fixed_fee_before_the_destination_read() {
+        init_state();
+        init_schnorr_master_key();
+        let token = register(SupportedSplToken {
+            deposit_fee: 368_871,
+            ..token(false)
+        });
+        let runtime = runtime().add_stub_response(MultiRpcResult::Consistent(Ok(Some(
+            token_account_info(&token, MINIMUM_DEPOSIT_WITH_FEE),
+        ))));
 
         assert_eq!(
             deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await,
@@ -348,11 +324,7 @@ mod balance_reading {
         );
         assert_eq!(
             runtime.msg_cycles_accepted(),
-            [
-                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
-                GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
-                XRC_REQUEST_CYCLES / 2
-            ]
+            [GET_ACCOUNT_INFO_CYCLES - RPC_REFUND]
         );
         assert_eq!(total_event_count(), 1);
         assert!(read_state(|state| state.spl_deposits().queued().is_empty()));
@@ -364,8 +336,7 @@ mod balance_reading {
         let account = token_account_info(&token, MINIMUM_DEPOSIT_WITH_FEE);
         let runtime = runtime()
             .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))))
-            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
-            .add_stub_response(crate::test_fixtures::unit_xrc_rate());
+            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
 
         let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
@@ -379,8 +350,7 @@ mod balance_reading {
         let account = token_account_info(&token, MINIMUM_DEPOSIT_WITH_FEE);
         let runtime = runtime()
             .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))))
-            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
-            .add_stub_response(crate::test_fixtures::unit_xrc_rate());
+            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
 
         let mut call = Box::pin(deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()));
         // The call suspends in the source read.
@@ -401,10 +371,9 @@ mod balance_reading {
             [
                 GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
                 GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
-                XRC_REQUEST_CYCLES / 2
             ]
         );
-        assert_eq!(runtime.sent_update_calls().len(), 3);
+        assert_eq!(runtime.sent_update_calls().len(), 2);
         read_state(|state| {
             assert_eq!(state.spl_deposits().queued().len(), 1);
             assert_eq!(
@@ -418,19 +387,18 @@ mod balance_reading {
     }
 
     #[tokio::test]
-    async fn should_yield_to_a_scanned_deposit_when_the_fee_quote_fails() {
+    async fn should_yield_to_a_scanned_deposit_when_the_destination_read_fails() {
         let token = init_token(false);
         let runtime = runtime()
             .add_stub_response(MultiRpcResult::Consistent(Ok(Some(token_account_info(
                 &token,
                 MINIMUM_DEPOSIT_WITH_FEE,
             )))))
-            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
             .add_stub_error(IcError::CallPerformFailed);
 
         let mut call = Box::pin(deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()));
-        // The source read, the treasury read, then the XRC await.
-        for _ in 0..2 {
+        // Suspend in the source read before a scan queues the deposit.
+        for _ in 0..1 {
             assert!(futures::poll!(call.as_mut()).is_pending());
         }
         let scanned_id = mutate_state(|state| {
@@ -447,7 +415,6 @@ mod balance_reading {
             [
                 GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
                 GET_ACCOUNT_INFO_CYCLES - RPC_REFUND,
-                XRC_REQUEST_CYCLES / 2
             ]
         );
         assert_eq!(total_event_count(), 2);
@@ -518,8 +485,7 @@ mod balance_reading {
         let account = token_account_info(&token, MINIMUM_DEPOSIT_WITH_FEE);
         let runtime = runtime()
             .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))))
-            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
-            .add_stub_response(crate::test_fixtures::unit_xrc_rate());
+            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
 
         let result = deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
@@ -540,8 +506,7 @@ mod balance_reading {
                 )))))
                 .add_stub_response(MultiRpcResult::Consistent(Ok(Some(
                     destination_account_info(&token, AccountState::Initialized),
-                ))))
-                .add_stub_response(unit_xrc_rate());
+                ))));
             assert_eq!(
                 deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await,
                 Ok(0)
@@ -572,7 +537,7 @@ mod balance_reading {
             let runtime = runtime()
                 .add_stub_response(MultiRpcResult::Consistent(Ok(Some(token_account_info(
                     &token,
-                    MINIMUM_DEPOSIT_AMOUNT,
+                    MINIMUM_DEPOSIT_WITH_FEE,
                 )))))
                 .add_stub_response(MultiRpcResult::Consistent(Ok(Some(
                     destination_account_info(&token, AccountState::Frozen),
@@ -600,7 +565,7 @@ mod balance_reading {
         let runtime = runtime()
             .add_stub_response(MultiRpcResult::Consistent(Ok(Some(token_account_info(
                 &token,
-                MINIMUM_DEPOSIT_AMOUNT,
+                MINIMUM_DEPOSIT_WITH_FEE,
             )))))
             .add_stub_error(IcError::CallPerformFailed);
         assert_matches!(
@@ -631,8 +596,7 @@ mod balance_reading {
                 &token,
                 MINIMUM_DEPOSIT_WITH_FEE,
             )))))
-            .add_stub_response(MultiRpcResult::Consistent(Ok(Some(destination))))
-            .add_stub_response(unit_xrc_rate());
+            .add_stub_response(MultiRpcResult::Consistent(Ok(Some(destination))));
         assert_eq!(
             deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await,
             Ok(0)
@@ -643,7 +607,7 @@ mod balance_reading {
     #[tokio::test]
     async fn should_reject_balance_below_token_minimum_and_charge_rpc_cost() {
         let token = init_token(false);
-        let balance = MINIMUM_DEPOSIT_AMOUNT - 1;
+        let balance = MINIMUM_DEPOSIT_WITH_FEE - 1;
         let account = token_account_info(&token, balance);
         let runtime = runtime().add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))));
 
@@ -653,7 +617,7 @@ mod balance_reading {
             result,
             Err(DepositSplError::ValueTooSmall {
                 balance,
-                minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
+                minimum_deposit_amount: MINIMUM_DEPOSIT_WITH_FEE,
             })
         );
         assert_rpc_cost_charged_without_queueing(&runtime);
@@ -671,7 +635,7 @@ mod balance_reading {
             result,
             Err(DepositSplError::ValueTooSmall {
                 balance: 0,
-                minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
+                minimum_deposit_amount: MINIMUM_DEPOSIT_WITH_FEE,
             })
         );
         assert_rpc_cost_charged_without_queueing(&runtime);
@@ -746,15 +710,13 @@ mod balance_reading {
         let account = token_account_info(&token, MINIMUM_DEPOSIT_WITH_FEE);
         let first_runtime = runtime()
             .add_stub_response(MultiRpcResult::Consistent(Ok(Some(account))))
-            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
-            .add_stub_response(crate::test_fixtures::unit_xrc_rate());
+            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
         assert_eq!(
             deposit_spl(&first_runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await,
             Ok(0)
         );
-        let repeated_runtime = TestCanisterRuntime::new().add_msg_cycles_available(
-            2 * GET_ACCOUNT_INFO_CYCLES + XRC_REQUEST_CYCLES + DEPOSIT_SOL_FEE,
-        );
+        let repeated_runtime = TestCanisterRuntime::new()
+            .add_msg_cycles_available(2 * GET_ACCOUNT_INFO_CYCLES + DEPOSIT_SOL_FEE);
 
         let result = deposit_spl(&repeated_runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await;
 
@@ -836,7 +798,7 @@ mod lifecycle {
     };
     use crate::{
         address::{account_address, associated_token_address},
-        constants::{FEE_PER_SIGNATURE, GET_ACCOUNT_INFO_CYCLES, XRC_REQUEST_CYCLES},
+        constants::{FEE_PER_SIGNATURE, GET_ACCOUNT_INFO_CYCLES},
         deposit::spl::{
             deposit_spl, deposit_spl_status, process_pending_spl_mints, sweep_queued_spl_deposits,
         },
@@ -923,15 +885,14 @@ mod lifecycle {
         }
     }
 
-    /// Deposits the requested net amount plus the one-unit mocked oracle fee.
+    /// Deposits the requested net amount plus the one-unit configured fee.
     async fn deposit(token: &SupportedSplToken, account: Account, amount: u64) -> DepositSplId {
         let amount = amount + 1;
         let runtime = runtime()
             .add_stub_response(MultiRpcResult::Consistent(Ok(Some(source_account_info(
                 token, account, amount,
             )))))
-            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
-            .add_stub_response(crate::test_fixtures::unit_xrc_rate());
+            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
         deposit_spl(&runtime, account, token.mint.into())
             .await
             .unwrap()
@@ -1190,6 +1151,44 @@ mod lifecycle {
     }
 
     #[tokio::test]
+    async fn should_mint_the_full_deposit_without_a_fee_mint_when_configured_zero() {
+        setup();
+        let token = register(SupportedSplToken {
+            minimum_deposit_amount: MINIMUM_DEPOSIT_AMOUNT,
+            deposit_fee: 0,
+            ..spl_token([2; 32].into(), TokenProgram::Classic)
+        });
+        let runtime = runtime()
+            .add_stub_response(MultiRpcResult::Consistent(Ok(Some(source_account_info(
+                &token,
+                DEPOSITOR_ACCOUNT,
+                MINIMUM_DEPOSIT_AMOUNT,
+            )))))
+            .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
+        assert_eq!(
+            deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()).await,
+            Ok(0)
+        );
+        let sweep = sweep(&[DEPOSITOR_ACCOUNT]).await;
+        settle(&sweep).await;
+        let calls = mint(1).await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            deposit_spl_status(0),
+            DepositSplStatus::Minted {
+                block_index: BLOCK_INDEX,
+                minted_amount: MINIMUM_DEPOSIT_AMOUNT,
+                fee: SplFeeMintStatus::None,
+            }
+        );
+        read_state(|state| {
+            assert!(state.spl_deposits().pending_fee_mints().is_empty());
+            assert!(state.spl_deposits().minted_fees().is_empty());
+        });
+        assert_replay_matches();
+    }
+
+    #[tokio::test]
     async fn should_sweep_full_balance_and_deduct_recorded_fee_once() {
         const BALANCE: u64 = 1_000;
         const FEE: u64 = 25;
@@ -1197,8 +1196,7 @@ mod lifecycle {
             setup();
             let token = register_token(token_2022);
             let owner = account_address(&devnet_sweep::master_key(), &DEPOSITOR_ACCOUNT);
-            // The production estimator currently quotes zero. Record a nonzero quote to
-            // exercise the sweep, settlement and mint paths before enabling an oracle.
+            // Record a larger fee to exercise fee accounting through the full lifecycle.
             mutate_state(|state| {
                 process_event(
                     state,
@@ -1604,8 +1602,7 @@ mod lifecycle {
                         DEPOSITOR_ACCOUNT,
                         MINIMUM_DEPOSIT_WITH_FEE,
                     )))))
-                    .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)))
-                    .add_stub_response(crate::test_fixtures::unit_xrc_rate());
+                    .add_stub_response(MultiRpcResult::<Option<AccountInfo>>::Consistent(Ok(None)));
                 let mut call =
                     Box::pin(deposit_spl(&runtime, DEPOSITOR_ACCOUNT, token.mint.into()));
                 for _ in 0..suspended_call {
@@ -1661,14 +1658,10 @@ mod lifecycle {
                 };
                 assert_eq!(call.await, expected);
                 assert_eq!(total_event_count(), event_count);
-                assert_eq!(runtime.sent_update_calls().len(), 3);
+                assert_eq!(runtime.sent_update_calls().len(), 2);
                 assert_eq!(
                     runtime.msg_cycles_accepted(),
-                    [
-                        GET_ACCOUNT_INFO_CYCLES / 2,
-                        GET_ACCOUNT_INFO_CYCLES / 2,
-                        XRC_REQUEST_CYCLES / 2,
-                    ]
+                    [GET_ACCOUNT_INFO_CYCLES / 2, GET_ACCOUNT_INFO_CYCLES / 2,]
                 );
                 assert_replay_matches();
             }
@@ -1779,7 +1772,7 @@ mod lifecycle {
             );
         });
 
-        // A one-unit top-up also covers the next quoted fee.
+        // A one-unit top-up also covers the next configured fee.
         let second = deposit(&token, DEPOSITOR_ACCOUNT, leftover).await;
 
         assert_eq!(second, first + 1);

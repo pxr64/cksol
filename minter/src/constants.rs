@@ -104,9 +104,6 @@ pub const GET_SIGNATURE_STATUSES_CYCLES: u128 = 50_000_000_000;
 /// unused part is refunded.
 pub const GET_ACCOUNT_INFO_CYCLES: u128 = 10_000_000_000;
 
-/// Cycles to attach to an XRC exchange-rate request; unused cycles are refunded.
-pub const XRC_REQUEST_CYCLES: u128 = 1_000_000_000;
-
 /// Cost in lamports per signature included in a Solana transaction.
 ///
 /// See <https://solana.com/docs/core/fees#base-fee>.

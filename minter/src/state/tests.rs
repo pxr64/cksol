@@ -115,7 +115,8 @@ mod spl_orchestrator_configuration {
             ..UpgradeArgs::default()
         };
         let encoded = minicbor::to_vec(&upgrade).unwrap();
-        let decoded: UpgradeArgs = minicbor::decode(&without_last_field(&encoded)).unwrap();
+        let decoded: UpgradeArgs =
+            minicbor::decode(&without_last_field(&without_last_field(&encoded))).unwrap();
         upgrade.ledger_suite_orchestrator_id = None;
         assert_eq!(decoded, upgrade);
     }
@@ -1575,5 +1576,106 @@ mod withdrawal_transactions {
                 vec![&NONCE_ACCOUNT]
             )
         });
+    }
+}
+
+mod spl_deposit_fee_updates {
+    use super::*;
+    use crate::state::audit::replay_events;
+    use crate::test_fixtures::{deposit::DEPOSITOR_ACCOUNT, queued_spl_deposit, spl_token};
+    use cksol_types_internal::SplDepositFee;
+
+    fn update(mint: Address, deposit_fee: u64) -> SplDepositFee {
+        SplDepositFee {
+            mint: mint.to_string(),
+            deposit_fee,
+        }
+    }
+
+    #[test]
+    fn should_update_fees_replay_and_preserve_queued_deposit_fees() {
+        let init = valid_init_args();
+        let token = spl_token([2; 32].into(), TokenProgram::Classic);
+        let mut deposit = queued_spl_deposit(DEPOSITOR_ACCOUNT, token.mint, token.token_program);
+        deposit.fee = token.deposit_fee;
+        let mut state = State::try_from(init.clone()).unwrap();
+        state.process_added_spl_token(&token);
+        state.process_queued_spl_deposit(0, deposit.clone());
+        let mut events = vec![
+            Event {
+                timestamp: 0,
+                payload: EventType::Init(init),
+            },
+            Event {
+                timestamp: 1,
+                payload: EventType::AddedSplToken(token.clone()),
+            },
+            Event {
+                timestamp: 2,
+                payload: EventType::QueuedSplDeposit {
+                    deposit_id: 0,
+                    account: deposit.account,
+                    mint: deposit.mint,
+                    address: deposit.address,
+                    balance: deposit.balance,
+                    fee: deposit.fee,
+                },
+            },
+        ];
+        for fee in [25, 0] {
+            let args = UpgradeArgs {
+                spl_deposit_fees: Some(vec![update(token.mint, fee)]),
+                ..Default::default()
+            };
+            state.upgrade(args.clone()).unwrap();
+            events.push(Event {
+                timestamp: 3,
+                payload: EventType::Upgrade(args),
+            });
+            let replayed = replay_events(
+                events
+                    .iter()
+                    .map(|event| Event::from_bytes(event.to_bytes())),
+            );
+            assert_eq!(state, replayed);
+            assert_eq!(
+                state.supported_spl_token(&token.mint).unwrap().deposit_fee,
+                fee
+            );
+            assert_eq!(state.spl_deposits().queued()[&0].fee, deposit.fee);
+            state.upgrade(UpgradeArgs::default()).unwrap();
+            assert_eq!(
+                state.supported_spl_token(&token.mint).unwrap().deposit_fee,
+                fee
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_invalid_fee_update_lists_without_applying_any_fee() {
+        let token = spl_token([2; 32].into(), TokenProgram::Classic);
+        for updates in [
+            vec![update(token.mint, 25), update([3; 32].into(), 0)],
+            vec![update(token.mint, 25), update(token.mint, 0)],
+            vec![update(token.mint, u64::MAX)],
+            vec![
+                update(token.mint, 25),
+                SplDepositFee {
+                    mint: "invalid".into(),
+                    deposit_fee: 0,
+                },
+            ],
+        ] {
+            let mut state = State::try_from(valid_init_args()).unwrap();
+            state.process_added_spl_token(&token);
+            assert_matches!(
+                state.upgrade(UpgradeArgs {
+                    spl_deposit_fees: Some(updates),
+                    ..Default::default()
+                }),
+                Err(InvalidStateError::InvalidSplDepositFee(_))
+            );
+            assert_eq!(state.supported_spl_token(&token.mint).unwrap(), &token);
+        }
     }
 }

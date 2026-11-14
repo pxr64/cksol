@@ -355,43 +355,8 @@ pub fn spl_token(mint: Address, token_program: TokenProgram) -> SupportedSplToke
         ledger_id: Principal::from_slice(&mint.to_bytes()[..28]),
         minimum_deposit_amount: 1,
         paused: false,
-        xrc_symbol: "USDC".to_string(),
+        deposit_fee: 1,
         token_symbol: Some("solUSDC".to_string()),
-    }
-}
-
-/// A SOL/token rate low enough to quote every sweep at one token unit.
-pub fn unit_xrc_rate() -> ic_xrc_types::GetExchangeRateResult {
-    xrc_rate("USDC", 1)
-}
-
-/// A SOL/token rate for fee estimation in tests, scaled by 10^9 and dated at the epoch.
-pub fn xrc_rate(symbol: &str, rate: u64) -> ic_xrc_types::GetExchangeRateResult {
-    Ok(xrc_rate_at(symbol, rate, 0))
-}
-
-pub fn xrc_rate_at(symbol: &str, rate: u64, timestamp: u64) -> ic_xrc_types::ExchangeRate {
-    use ic_xrc_types::{Asset, AssetClass, ExchangeRate, ExchangeRateMetadata};
-    ExchangeRate {
-        base_asset: Asset {
-            symbol: "SOL".to_string(),
-            class: AssetClass::Cryptocurrency,
-        },
-        quote_asset: Asset {
-            symbol: symbol.to_string(),
-            class: AssetClass::Cryptocurrency,
-        },
-        timestamp,
-        rate,
-        metadata: ExchangeRateMetadata {
-            decimals: 9,
-            base_asset_num_queried_sources: 5,
-            base_asset_num_received_rates: 5,
-            quote_asset_num_queried_sources: 5,
-            quote_asset_num_received_rates: 5,
-            standard_deviation: 0,
-            forex_timestamp: None,
-        },
     }
 }
 
@@ -1736,6 +1701,7 @@ pub mod arb {
                     nonce_accounts_to_add,
                     automatic_deposit_fee,
                 )| UpgradeArgs {
+                    spl_deposit_fees: None,
                     ledger_suite_orchestrator_id: None,
                     sol_rpc_canister_id,
                     minimum_withdrawal_amount,
@@ -1904,7 +1870,7 @@ pub mod arb {
             arb_account(),
             any::<u64>(),
             any::<bool>(),
-            "[A-Z]{1,8}",
+            any::<u64>(),
         )
             .prop_map(
                 |(
@@ -1914,7 +1880,7 @@ pub mod arb {
                     ledger,
                     minimum_deposit_amount,
                     paused,
-                    xrc_symbol,
+                    deposit_fee,
                 )| {
                     SupportedSplToken {
                         mint,
@@ -1927,7 +1893,7 @@ pub mod arb {
                         ledger_id: ledger.owner,
                         minimum_deposit_amount,
                         paused,
-                        xrc_symbol,
+                        deposit_fee,
                         token_symbol: Some("solUSDC".to_string()),
                     }
                 },

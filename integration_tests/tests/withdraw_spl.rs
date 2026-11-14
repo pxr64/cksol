@@ -211,14 +211,45 @@ async fn withdraw_and_finalize(
         }
         WithdrawalOutcome::Failure => {
             assert_eq!(
+                setup.minter().withdraw_spl_status(id).await,
+                WithdrawSplStatus::Pending
+            );
+            assert_eq!(
                 setup.minter().get_minter_info().await.balance,
-                balance_before - FEE_PER_SIGNATURE
+                balance_before - 2 * FEE_PER_SIGNATURE - reserved_rent
+            );
+            setup.advance_time(WITHDRAWAL_PROCESSING_DELAY).await;
+            setup
+                .execute_http_mocks(
+                    MockBuilder::with_start_id(88)
+                        .submit_withdrawal_retry_transaction()
+                        .build(),
+                )
+                .await;
+            let retry_signature = match setup.minter().withdraw_spl_status(id).await {
+                WithdrawSplStatus::TxSent { transaction_id } => transaction_id,
+                other => panic!("expected TxSent, got {other:?}"),
+            };
+            assert_ne!(retry_signature, signature);
+            let retry = setup.minter().signed_transaction(&retry_signature).await;
+            setup.advance_time(FINALIZE_TRANSACTIONS_DELAY).await;
+            setup
+                .execute_http_mocks(
+                    MockBuilder::with_start_id(96)
+                        .get_retried_nonce_account()
+                        .get_transaction(&retry_signature, withdrawal_response(&retry, 0, true))
+                        .build(),
+                )
+                .await;
+            assert_eq!(
+                setup.minter().get_minter_info().await.balance,
+                balance_before - 2 * FEE_PER_SIGNATURE
             );
             assert_reimbursed_withdrawal(
                 &setup,
                 ledger_id,
                 id,
-                &signature,
+                &retry_signature,
                 sol_before - fee,
                 spl_before,
             )

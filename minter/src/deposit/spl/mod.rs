@@ -1,11 +1,10 @@
 use crate::{
     address::{account_address, associated_token_address, minter_address, minter_public_key},
-    constants::{FEE_PER_SIGNATURE, GET_ACCOUNT_INFO_CYCLES},
+    constants::GET_ACCOUNT_INFO_CYCLES,
     cycles::{RpcCallCharge, charge_caller_cycles, charge_rpc_call, check_caller_available_cycles},
     guard::deposit_spl_guard,
     rpc::{get_spl_token_account, get_spl_token_balance},
     runtime::CanisterRuntime,
-    spl_fee::{FeeEstimator, FixedFeeProvider, estimate_sol_cost},
     state::{
         InFlightSplDeposit, QueuedSplDeposit, SchnorrPublicKey, State, SupportedSplToken,
         audit::process_event, event::EventType, mutate_state, read_state,
@@ -13,7 +12,7 @@ use crate::{
     utils::{assert_valid_deposit_owner, assert_valid_deposit_token},
 };
 use canlog::log;
-use cksol_types::{DepositSplError, DepositSplId, DepositSplStatus, Lamport};
+use cksol_types::{DepositSplError, DepositSplId, DepositSplStatus};
 use cksol_types_internal::log::Priority;
 use icrc_ledger_types::icrc1::account::Account;
 use solana_address::Address;
@@ -52,7 +51,7 @@ pub async fn deposit_spl<R: CanisterRuntime>(
     let master_key =
         minter_public_key().map_err(|e| DepositSplError::TemporarilyUnavailable(e.to_string()))?;
     let latest_id_before = read_state(|state| state.spl_deposits().latest_id(&account, &mint));
-    let result = read_and_quote_deposit(runtime, &token, account, &master_key).await;
+    let result = read_deposit(runtime, &token, account, &master_key).await;
     if let Some(result) = deposit_queued_since(&account, &mint, latest_id_before) {
         return result;
     }
@@ -88,9 +87,9 @@ pub fn deposit_spl_status(deposit_id: DepositSplId) -> DepositSplStatus {
     read_state(|state| state.spl_deposits().status(deposit_id))
 }
 
-/// Reads the source account, then the treasury account, then quotes the fee. Each call
+/// Reads the source and treasury accounts and records the configured fee. Each call
 /// charges its own cost, and a failed step makes no further call.
-async fn read_and_quote_deposit<R: CanisterRuntime>(
+async fn read_deposit<R: CanisterRuntime>(
     runtime: &R,
     token: &SupportedSplToken,
     account: Account,
@@ -99,18 +98,17 @@ async fn read_and_quote_deposit<R: CanisterRuntime>(
     let owner = account_address(master_key, &account);
     let address = associated_token_address(&owner, &token.mint, &token.token_program.id());
     let balance = read_deposit_balance(runtime, token, address, owner).await?;
-    let rent = read_destination_rent(runtime, token, minter_address(master_key)).await?;
-    let fee = quote_deposit_fee(token, balance, rent).await?;
+    validate_destination(runtime, token, minter_address(master_key)).await?;
     Ok(QueuedSplDeposit {
         account,
         mint: token.mint,
         address,
         balance,
-        fee,
+        fee: token.deposit_fee,
     })
 }
 
-/// Reads and validates the source account and minimum amount, charging its RPC cost.
+/// Reads and validates the source account and the net minimum, charging its RPC cost.
 async fn read_deposit_balance<R: CanisterRuntime>(
     runtime: &R,
     token: &SupportedSplToken,
@@ -120,25 +118,26 @@ async fn read_deposit_balance<R: CanisterRuntime>(
     let result = get_spl_token_balance(runtime, address, owner, token.mint, token.token_program)
         .await
         .map_err(DepositSplError::from)
-        .and_then(|balance| balance_above_minimum(balance, token.minimum_deposit_amount, 0));
+        .and_then(|balance| {
+            balance_above_minimum(balance, token.minimum_deposit_amount, token.deposit_fee)
+        });
     charge_account_read(runtime, &result);
     result
 }
 
 /// Reads and validates the treasury account, charging the actual RPC cost.
-/// Returns the account-creation rent budget, or zero if the account already exists.
-async fn read_destination_rent<R: CanisterRuntime>(
+async fn validate_destination<R: CanisterRuntime>(
     runtime: &R,
     token: &SupportedSplToken,
     destination_owner: Address,
-) -> Result<Lamport, DepositSplError> {
+) -> Result<(), DepositSplError> {
     let destination =
         associated_token_address(&destination_owner, &token.mint, &token.token_program.id());
     let result = get_spl_token_account(runtime, destination, token.token_program)
         .await
         .and_then(|account| match account {
-            Some(account) => account.validate(destination_owner, token.mint).map(|()| 0),
-            None => Ok(token.token_program.account_rent_exemption()),
+            Some(account) => account.validate(destination_owner, token.mint),
+            None => Ok(()),
         })
         .map_err(DepositSplError::from);
     charge_account_read(runtime, &result);
@@ -155,25 +154,6 @@ fn charge_account_read<R: CanisterRuntime, T>(runtime: &R, result: &Result<T, De
         },
         result,
     );
-}
-
-/// Applies the configured fixed fee and checks the net minimum. No oracle call is made.
-async fn quote_deposit_fee(
-    token: &SupportedSplToken,
-    balance: u64,
-    rent: Lamport,
-) -> Result<u64, DepositSplError> {
-    // Keep the estimator interface; the fixed provider ignores the SOL cost.
-    let cost = estimate_sol_cost(2 * FEE_PER_SIGNATURE, rent);
-    let oracle = FixedFeeProvider::new(token.deposit_fee);
-    FeeEstimator::new(oracle)
-        .estimate_fee(token.mint, cost)
-        .await
-        .map_err(DepositSplError::TemporarilyUnavailable)
-        .and_then(|fee| {
-            balance_above_minimum(balance, token.minimum_deposit_amount, fee)?;
-            Ok(fee)
-        })
 }
 
 /// Queues the deposit under the next deposit id, which both `deposit_spl` and a balance

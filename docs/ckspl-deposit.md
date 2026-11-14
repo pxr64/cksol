@@ -72,9 +72,10 @@ sequenceDiagram
     User->>Minter: deposit_spl(owner, subaccount, mint) + cycles
     Minter->>RPC: getAccountInfo(A, finalized)
     RPC-->>Minter: Source token account and balance
+    Note over Minter: Check net minimum with configured fee
     Minter->>RPC: getAccountInfo(T, finalized)
     RPC-->>Minter: Destination token account, or absent
-    Note over Minter: Apply configured fee and check net minimum<br/>Record balance and fee
+    Note over Minter: Record balance and fee
     Minter-->>User: Ok(deposit_id)
 
     Note over Minter,Solana: Queued sweeps are processed asynchronously
@@ -102,10 +103,9 @@ sequenceDiagram
 3. If a deposit for the account and mint is in flight, the call makes no RPC call and no cycle charge. A deposit that is queued, swept, finalized or waiting for a mint makes the call return its ID. A quarantined deposit makes the call fail with `Quarantined` and its ID. The pair stays rejected until a minter upgrade resolves the deposit, so a new deposit needs a different subaccount. This step also applies when the token is paused.
 4. The mint must be registered (`UnsupportedToken`) and not paused (`TokenPaused`).
 5. The caller must attach cycles for two account reads and the consolidation fee (`InsufficientCycles`).
-6. The source account `A` must have the expected token program, mint and owner, and it must not be frozen. A Token-2022 account can have only the `ImmutableOwner` and `MemoTransfer` extensions. A missing account has a zero balance. The minter rejects a balance below the configured minimum before it makes more calls.
-7. If `T` exists, the minter validates it. The sweep creates `T` if it is absent, or if it is a prefunded system account without data.
-8. The minter uses the token's configured fixed deposit fee.
-9. The balance must be at least `minimum_deposit_amount + fee` (`ValueTooSmall`). Thus the net mint of the user is at least the configured minimum.
+6. The source account `A` must have the expected token program, mint and owner, and it must not be frozen. A Token-2022 account can have only the `ImmutableOwner` and `MemoTransfer` extensions. A missing account has a zero balance.
+7. The balance must be at least `minimum_deposit_amount + deposit_fee` (`ValueTooSmall`). Thus the net mint of the user is at least the configured minimum. The minter rejects a smaller balance before it makes more calls.
+8. If `T` exists, the minter validates it. The sweep creates `T` if it is absent, or if it is a prefunded system account without data.
 
 A failed check of a token account fails with `InvalidTokenAccount` and the reason. The minter charges the actual cost of each external call. It keeps the consolidation fee only when it queues the deposit.
 
@@ -149,7 +149,7 @@ The full accepted balance reaches `T`, which includes the fee part. While the fe
 
 ### Fixed deposit fee
 
-`FeeEstimator` keeps its `PriceOracle` abstraction. The active implementation is `FixedFeeProvider`, which returns the registered `deposit_fee` in the token's smallest units. The XRC provider remains available in the code but is not used for deposits or registration. A fee of zero is the no-op policy: the entire swept balance is minted to the user and no fee mint is queued. The fee is independent of exchange prices, token-account rent, and batching.
+The minter uses the registered `deposit_fee`, in the token's smallest units, without external calls. A fee of zero is the no-op policy: the entire swept balance is minted to the user and no fee mint is queued. The fee is independent of exchange prices, token-account rent, and batching.
 
 Set the fee at token registration. An upgrade can change fees with `spl_deposit_fees = opt vec { record { mint = "<base58 mint>"; deposit_fee = 0 : nat64 } }`. Omission preserves existing fees. Every mint must already be registered, appear only once, and have a fee whose sum with the minimum deposit fits in `u64`; invalid updates reject the upgrade.
 

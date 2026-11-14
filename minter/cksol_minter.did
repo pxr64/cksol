@@ -427,12 +427,21 @@ type MinterArg = variant {
     Init : InitArgs;
 };
 
+// A fixed SPL deposit fee update.
+type SplDepositFee = record {
+    // The base58 address of an already registered Solana mint.
+    mint: text;
+    // The new fee in the token's smallest units; zero disables it.
+    deposit_fee: nat64;
+};
+
 // The upgrade args for the ckSOL minter canister.
 //
 // *WARNING*: Backwards-compatibility is not guaranteed. Fields may be added,
 // removed, or renamed across releases.
-type SplDepositFee = record { mint: text; deposit_fee: nat64 };
 type UpgradeArgs = record {
+    // Updates fees for registered SPL mints. If absent, preserves all fees.
+    // Each mint may occur only once. Queued deposits retain their recorded fees.
     spl_deposit_fees: opt vec SplDepositFee;
     // Sets or replaces the orchestrator. If absent, preserves the current setting.
     ledger_suite_orchestrator_id: opt principal;
